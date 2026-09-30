@@ -1,0 +1,6 @@
+ARM_DECODE_OK: 1310 native-eligible table slots (operand restrictions checked by compiler)
+ORACLE_GENERATED: actual interpreter ALU/branch sources, dispatch-derived reference calls
+ORACLE_COMPILER: powerpc-linux-gnu-g++
+NATIVE_ORACLE_OK: 2371944 states; 32419 unique THUMB encodings; 36133 ARM candidates accepted
+CACHE_OK: hits=32637 misses=16563 compiled=16431 flushes=128 rejected=132
+ABI_OK: r14-r31, r2/r13 and full CR checked on every invocation

@@ -1,0 +1,5 @@
+80064c3c T Jit::compileArm(JitPpc::Writer&, unsigned int)
+800661dc T Jit::logMismatch(unsigned int, unsigned int, bool, bool, JitContext const&, JitContext const&)
+80065d54 T Jit::compileThumb(JitPpc::Writer&, unsigned short)
+800643f8 T Jit::execute(Interpreter&, unsigned int, bool, int&)
+80066d8c T jitEnter

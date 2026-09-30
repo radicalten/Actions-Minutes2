@@ -1,0 +1,2 @@
+arm: 4096 entries, 525 distinct handlers, 1237 ranges
+thumb: 1024 entries, 78 distinct handlers, 81 ranges

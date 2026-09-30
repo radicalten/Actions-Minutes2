@@ -1,0 +1,15 @@
+ORACLE_GENERATED: actual interpreter ALU/branch sources, dispatch-derived reference calls
+PIPELINE_SOURCE_OK: exact runOpcode/getOpcode/flushPipeline bodies and condition table; instrumented memory/fallbacks
+PIPELINE_MODE: native
+PIPELINE_OK: 84528 step comparisons; runtime toggle, condition checks, banked pointers, page crossings and prefetched stale bytes
+PIPELINE_MODE: diff
+DIFFTEST_FAULT_OK: injected mismatch logged; reference retained; native disabled
+PIPELINE_OK: 84528 step comparisons; runtime toggle, condition checks, banked pointers, page crossings and prefetched stale bytes
+PIPELINE_MODE: refill-fault
+REFILL_FAULT_OK: equal registers/flags/cycles, missing refill detected and native disabled
+PIPELINE_OK: 84528 step comparisons; runtime toggle, condition checks, banked pointers, page crossings and prefetched stale bytes
+PIPELINE_MODE: disabled
+PIPELINE_OK: 84528 step comparisons; runtime toggle, condition checks, banked pointers, page crossings and prefetched stale bytes
+PIPELINE_MODE: oom
+OOM_FALLBACK_OK: all native allocations denied; reference execution preserved
+PIPELINE_OK: 84528 step comparisons; runtime toggle, condition checks, banked pointers, page crossings and prefetched stale bytes

@@ -1,0 +1,9 @@
+80064f64 T Jit::compileArm(JitPpc::Writer&, unsigned int, bool, unsigned int)
+800673bc T Jit::logMismatch(unsigned int, unsigned int, bool, bool, JitContext const&, JitContext const&)
+80066eec T Jit::compileThumb(JitPpc::Writer&, unsigned short, bool, unsigned int)
+800669b8 T Jit::compileMultiply(JitPpc::Writer&, unsigned int, unsigned int, bool)
+80065564 T Jit::compileArmBranch(JitPpc::Writer&, unsigned int, unsigned int, bool, unsigned int)
+80065724 T Jit::compileThumbBranch(JitPpc::Writer&, unsigned short, bool, unsigned int)
+80066dac T Jit::compileThumbMultiply(JitPpc::Writer&, unsigned int, unsigned int, bool)
+800645dc T Jit::execute(Interpreter&, unsigned int, bool, int&)
+80068114 T jitEnter
