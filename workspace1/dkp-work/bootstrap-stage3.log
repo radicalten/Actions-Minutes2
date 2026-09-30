@@ -1,0 +1,7 @@
+Layer 59e22667830bf04fb35e15ed9c70023e9d121719bb87f0db7f3159ee7c7e0b8d 28230270
+/home/user/dkp-work/bootstrap.py:29: DeprecationWarning: Python 3.14 will, by default, filter extracted tar archives and reject files or modify their metadata. Use the filter argument to control this behavior.
+  tar.extractall(stage,members=members)
+Layer 74701f26999d7854982cfa51dafd83beeaf644031b943c4cbd0a245139a742a4 265076006
+Layer ea5d3216df1fb580c54c016ee13ff58eb965c0a0b0ef08afd8dfd5a1c03e95a8 28381973
+Layer 3727f0a7f966b9fae8b3cdbe70e976d2bd28a4c1409c525278ebd104577bc15a 336235051
+EXTRACT_OK
