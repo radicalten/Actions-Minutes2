@@ -1,0 +1,12 @@
+ORACLE_GENERATED: actual interpreter_alu.cpp, dispatch-derived reference calls
+PIPELINE_SOURCE_OK: exact runOpcode/getOpcode bodies and condition table; instrumented memory/fallbacks
+PIPELINE_MODE: native
+PIPELINE_OK: 43776 step comparisons; runtime toggle, condition checks, banked pointers, page crossings and prefetched stale bytes
+PIPELINE_MODE: diff
+DIFFTEST_FAULT_OK: injected mismatch logged; reference retained; native disabled
+PIPELINE_OK: 43776 step comparisons; runtime toggle, condition checks, banked pointers, page crossings and prefetched stale bytes
+PIPELINE_MODE: disabled
+PIPELINE_OK: 43776 step comparisons; runtime toggle, condition checks, banked pointers, page crossings and prefetched stale bytes
+PIPELINE_MODE: oom
+OOM_FALLBACK_OK: all native allocations denied; reference execution preserved
+PIPELINE_OK: 43776 step comparisons; runtime toggle, condition checks, banked pointers, page crossings and prefetched stale bytes

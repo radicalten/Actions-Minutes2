@@ -1,0 +1,21 @@
+WRITER_RANGE_OK
+ASM_ORACLE_OK: 121 independently assembled vectors
+ARM_DECODE_OK: 784 native-eligible table slots (PC operands still excluded)
+ORACLE_GENERATED: actual interpreter_alu.cpp, dispatch-derived reference calls
+ORACLE_COMPILER: powerpc-linux-gnu-g++
+NATIVE_ORACLE_OK: 1415296 states; 20323 THUMB encodings; 19726 ARM candidates accepted
+CACHE_OK: hits=31871 misses=16129 compiled=15999 flushes=124 rejected=130
+ABI_OK: r14-r31, r2/r13 and full CR checked on every invocation
+ORACLE_GENERATED: actual interpreter_alu.cpp, dispatch-derived reference calls
+PIPELINE_SOURCE_OK: exact runOpcode/getOpcode bodies and condition table; instrumented memory/fallbacks
+PIPELINE_MODE: native
+PIPELINE_OK: 43776 step comparisons; runtime toggle, condition checks, banked pointers, page crossings and prefetched stale bytes
+PIPELINE_MODE: diff
+DIFFTEST_FAULT_OK: injected mismatch logged; reference retained; native disabled
+PIPELINE_OK: 43776 step comparisons; runtime toggle, condition checks, banked pointers, page crossings and prefetched stale bytes
+PIPELINE_MODE: disabled
+PIPELINE_OK: 43776 step comparisons; runtime toggle, condition checks, banked pointers, page crossings and prefetched stale bytes
+PIPELINE_MODE: oom
+OOM_FALLBACK_OK: all native allocations denied; reference execution preserved
+PIPELINE_OK: 43776 step comparisons; runtime toggle, condition checks, banked pointers, page crossings and prefetched stale bytes
+PATCHES_OK: cumulative and incremental patches produce identical trees

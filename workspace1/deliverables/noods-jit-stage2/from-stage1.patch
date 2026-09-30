@@ -1,0 +1,2223 @@
+diff --git a/Makefile b/Makefile
+index 91fad18..39243dd 100644
+--- a/Makefile
++++ b/Makefile
+@@ -18,10 +18,14 @@ LDFLAGS += $(CXXFLAGS) \
+ TARGET  := NooDS-Wii
+ EXCLUDE :=
+ SRCDIR 	:= NooDS-Wii
+-# Build-time exclusion is usable before runtime integration exists.
++# Build-time exclusion removes the dispatcher as well as jit_*.cpp.
+ NOODS_JIT ?= 1
++JIT_DIFFTEST ?= 0
++ifeq ($(JIT_DIFFTEST),1)
++CXXFLAGS += -DJIT_DIFFTEST
++endif
+ ifeq ($(NOODS_JIT),0)
+-EXCLUDE += $(wildcard $(SRCDIR)/jit_*.cpp)
++EXCLUDE += $(SRCDIR)/jit.cpp $(wildcard $(SRCDIR)/jit_*.cpp)
+ CXXFLAGS += -DNOODS_NO_JIT
+ endif
+ C_SOURCES = $(foreach dir, $(SRCDIR), $(filter-out $(EXCLUDE), $(wildcard $(dir)/*.cpp)))
+@@ -37,5 +41,5 @@ $(TARGET).elf: $(OBJECTS)
+ %.o: %.cpp
+ 	$(CC) -c $< -o $@ $(CXXFLAGS)
+ clean:
+-	rm -f $(TARGET).elf $(TARGET).dol $(TARGET).map $(OBJECTS)
++	rm -f $(TARGET).elf $(TARGET).dol $(TARGET).map $(TARGET).elf.map $(wildcard $(SRCDIR)/*.o)
+ .PHONY: clean test
+diff --git a/NooDS-Wii/interpreter.cpp b/NooDS-Wii/interpreter.cpp
+index 17b33b9..fb2df0d 100644
+--- a/NooDS-Wii/interpreter.cpp
++++ b/NooDS-Wii/interpreter.cpp
+@@ -231,6 +231,12 @@ FORCE_INLINE int Interpreter::runOpcode() {
+         // Increment the program counter and fill the pipeline from pointer or fallback
+         pipeline[1] = (((*registers[15] += 2) & 0xFFE) && pcData) ? U8TO16(pcData += 2, 0) : getOpcode16();
+ 
++        // The pipeline is already advanced. Native leaves never touch PC/memory.
++#ifndef NOODS_NO_JIT
++        int nativeCycles;
++        if (Settings::jitEnabled && Jit::execute(*this, opcode, true, nativeCycles))
++            return nativeCycles;
++#endif
+         // Execute a THUMB instruction
+         return (this->*thumbInstrs[(opcode >> 6) & 0x3FF])(opcode);
+     }
+@@ -242,7 +248,13 @@ FORCE_INLINE int Interpreter::runOpcode() {
+         switch (condition[((opcode >> 24) & 0xF0) | (cpsr >> 28)]) {
+             case 0: return 1; // False
+             case 2: return handleReserved(opcode); // Reserved
+-            default: return (this->*armInstrs[((opcode >> 16) & 0xFF0) | ((opcode >> 4) & 0xF)])(opcode);
++            default:
++#ifndef NOODS_NO_JIT
++                int nativeCycles;
++                if (Settings::jitEnabled && Jit::execute(*this, opcode, false, nativeCycles))
++                    return nativeCycles;
++#endif
++                return (this->*armInstrs[((opcode >> 16) & 0xFF0) | ((opcode >> 4) & 0xF)])(opcode);
+         }
+     }
+ }
+diff --git a/NooDS-Wii/interpreter.h b/NooDS-Wii/interpreter.h
+index 72e965c..0a6d1e9 100644
+--- a/NooDS-Wii/interpreter.h
++++ b/NooDS-Wii/interpreter.h
+@@ -22,6 +22,9 @@
+ 
+ #include <cstdint>
+ #include "defines.h"
++#ifndef NOODS_NO_JIT
++#include "jit.h"
++#endif
+ 
+ class Core;
+ class HleBios;
+@@ -68,6 +71,9 @@ public:
+     void writePostFlg(uint8_t value);
+ 
+ private:
++#ifndef NOODS_NO_JIT
++    friend bool Jit::execute(Interpreter &, uint32_t, bool, int &);
++#endif
+     Core *core;
+     bool arm7;
+ 
+diff --git a/NooDS-Wii/jit.cpp b/NooDS-Wii/jit.cpp
+new file mode 100644
+index 0000000..f0e4810
+--- /dev/null
++++ b/NooDS-Wii/jit.cpp
+@@ -0,0 +1,45 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++#include "jit.h"
++#include "jit_cache.h"
++#include "interpreter.h"
++#include "settings.h"
++namespace Jit {
++namespace {
++// The emulator thread is the only caller. Neither translation nor execution
++// allocates a large stack buffer; the stage is deliberately non-reentrant.
++JitContext context;
++bool faulted=false;
++}
++bool execute(Interpreter &cpu,uint32_t opcode,bool thumb,int &cycles) {
++    if (!Settings::jitEnabled || faulted) return false;
++    JitEntry entry=lookup(opcode,thumb,cpu.arm7);
++    if (!entry) return false;
++    for (unsigned i=0;i<16;i++) context.regs[i]=*cpu.registers[i];
++    context.cpsr=cpu.cpsr; context.cycles=0; context.interpreter=&cpu;
++    jitEnter(entry,&context);
++#ifdef JIT_DIFFTEST
++    // Only pure non-PC ALU leaves can reach here. Execute the original handler
++    // ONCE on the unchanged real CPU. No MMIO/memory is duplicated and no
++    // pipeline fetch or condition check is repeated.
++    JitContext reference;
++    reference.cycles=thumb ? (cpu.*Interpreter::thumbInstrs[(opcode>>6)&0x3FF])(opcode)
++        : (cpu.*Interpreter::armInstrs[((opcode>>16)&0xFF0)|((opcode>>4)&15)])(opcode);
++    reference.cpsr=cpu.cpsr; reference.interpreter=&cpu;
++    bool equal=reference.cycles==context.cycles && reference.cpsr==context.cpsr;
++    for (unsigned i=0;i<16;i++) {
++        reference.regs[i]=*cpu.registers[i];
++        equal=equal && reference.regs[i]==context.regs[i];
++    }
++    if (!equal) {
++        faulted=true;
++        logMismatch(context.regs[15]-(thumb?4:8),opcode,cpu.arm7,thumb,context,reference);
++    }
++    cycles=reference.cycles; // Keep the known reference state even on failure.
++#else
++    for (unsigned i=0;i<15;i++) *cpu.registers[i]=context.regs[i];
++    cpu.cpsr=context.cpsr;
++    cycles=context.cycles;
++#endif
++    return true;
++}
++}
+diff --git a/NooDS-Wii/jit.h b/NooDS-Wii/jit.h
+new file mode 100644
+index 0000000..5820df0
+--- /dev/null
++++ b/NooDS-Wii/jit.h
+@@ -0,0 +1,37 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++#pragma once
++#include <cstddef>
++#include <cstdint>
++class Interpreter;
++
++// Handler-boundary snapshot. The interpreter, not native code, owns fetch/PC.
++// Only pure, non-PC ALU operations are accepted by the stage-2 compiler.
++#define JIT_CTX_REGS 0
++#define JIT_CTX_CPSR 64
++#define JIT_CTX_CYCLES 68
++#define JIT_CTX_INTERPRETER 72
++struct alignas(32) JitContext {
++    uint32_t regs[16];
++    uint32_t cpsr;
++    uint32_t cycles;
++    Interpreter *interpreter;
++};
++static_assert(offsetof(JitContext, regs)==JIT_CTX_REGS, "register offset");
++static_assert(offsetof(JitContext, cpsr)==JIT_CTX_CPSR, "CPSR offset");
++static_assert(offsetof(JitContext, cycles)==JIT_CTX_CYCLES, "cycle offset");
++static_assert(offsetof(JitContext, interpreter)==JIT_CTX_INTERPRETER, "interpreter offset");
++static_assert(alignof(JitContext)==32, "context alignment");
++#if UINTPTR_MAX == UINT32_MAX
++static_assert(sizeof(JitContext)==96, "32-bit context size");
++#endif
++using JitEntry = void (*)();
++extern "C" void jitEnter(JitEntry entry, JitContext *context);
++
++namespace Jit {
++// Called after pipeline advance, and after the ARM condition check. On false,
++// state is untouched and the caller executes the existing handler exactly once.
++bool execute(Interpreter &cpu, uint32_t opcode, bool thumb, int &cycles);
++// Log first mismatch, then permanently disable this session's native path.
++void logMismatch(uint32_t pc, uint32_t opcode, bool arm7, bool thumb,
++                 const JitContext &native, const JitContext &reference);
++}
+diff --git a/NooDS-Wii/jit_cache.cpp b/NooDS-Wii/jit_cache.cpp
+new file mode 100644
+index 0000000..1bfc754
+--- /dev/null
++++ b/NooDS-Wii/jit_cache.cpp
+@@ -0,0 +1,80 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++#include "jit_cache.h"
++#include "jit_compiler.h"
++#include <cstring>
++#if defined(JIT_TEST)
++#include <sys/mman.h>
++#else
++#include <ogc/cache.h>
++extern void *Noods_MEM2_Alloc(size_t size);
++#endif
++namespace Jit {
++namespace {
++#ifndef JIT_CACHE_BYTES
++#define JIT_CACHE_BYTES (4u*1024u*1024u)
++#endif
++constexpr size_t arenaBytes=JIT_CACHE_BYTES;
++static_assert(arenaBytes>=1024 && arenaBytes%32==0,"arena capacity/alignment");
++struct Slot { uint32_t opcode, tag; JitEntry entry; };
++Slot slots[4096] = {};
++uint8_t *arena=nullptr;
++size_t used=0;
++bool allocationTried=false;
++alignas(32) uint32_t staging[256]; // Never put the translation buffer on Wii stacks.
++CacheStats stats={};
++void publish(void *pointer,size_t length) {
++#if defined(JIT_TEST)
++    __builtin___clear_cache(static_cast<char*>(pointer),static_cast<char*>(pointer)+length);
++#else
++    DCFlushRange(pointer,length);
++    ICInvalidateRange(pointer,length);
++#endif
++}
++bool initialize() {
++    if (allocationTried) return arena!=nullptr;
++    allocationTried=true;
++#if defined(JIT_TEST)
++#ifdef JIT_TEST_ALLOC_FAIL
++    return false; // Test-only simulation of the real allocation-failure exit.
++#endif
++    void *p=mmap(nullptr,arenaBytes,PROT_READ|PROT_WRITE|PROT_EXEC,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
++    if (p==MAP_FAILED) return false;
++#else
++    // Allocate once for the emulator session. MEM2_Free is a no-op upstream.
++    void *p=Noods_MEM2_Alloc(arenaBytes);
++    if (!p || (reinterpret_cast<uintptr_t>(p)&31)) return false;
++#endif
++    arena=static_cast<uint8_t*>(p); return true;
++}
++}
++void clearCache() {
++    // Never patch executing code. There is no chaining or active native frame
++    // when called by lookup() after a prior instruction returned.
++    std::memset(slots,0,sizeof(slots)); used=0; ++stats.flushes;
++}
++CacheStats cacheStats() { return stats; }
++JitEntry lookup(uint32_t opcode,bool thumb,bool arm7) {
++    if (thumb && opcode>0xFFFF) return nullptr;
++    uint32_t tag=1u|(uint32_t(thumb)<<1)|(uint32_t(arm7)<<2);
++    size_t index=((opcode*0x9E3779B1u)^(opcode>>16)^(tag*0x85EBCA6Bu))&4095;
++    Slot &slot=slots[index];
++    if (slot.tag==tag && slot.opcode==opcode) { ++stats.hits; return slot.entry; }
++    ++stats.misses;
++    Writer w(staging,sizeof(staging)/sizeof(staging[0]));
++    bool ok=thumb ? compileThumb(w,static_cast<uint16_t>(opcode)) : compileArm(w,opcode);
++    if (!ok || !w.good()) {
++        slot={opcode,tag,nullptr}; ++stats.rejected; return nullptr;
++    }
++    if (!initialize()) return nullptr; // Exact interpreter fallback, including OOM.
++    size_t bytes=(w.size()*4+31)&~size_t(31);
++    if (bytes>arenaBytes) return nullptr;
++    if (used>arenaBytes-bytes) clearCache();
++    uint8_t *entry=arena+used;
++    std::memset(entry,0,bytes); std::memcpy(entry,staging,w.size()*4);
++    publish(entry,bytes); // Aligned D writeback BEFORE I invalidate.
++    used+=bytes;
++    slot={opcode,tag,reinterpret_cast<JitEntry>(entry)};
++    ++stats.compiles;
++    return slot.entry;
++}
++}
+diff --git a/NooDS-Wii/jit_cache.h b/NooDS-Wii/jit_cache.h
+new file mode 100644
+index 0000000..cc89346
+--- /dev/null
++++ b/NooDS-Wii/jit_cache.h
+@@ -0,0 +1,13 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++#pragma once
++#include "jit.h"
++namespace Jit {
++// Stage-2 content-addressed cache: exact already-fetched opcode + ISA + CPU.
++// Safe only because generated leaves have no PC, memory/map pointers, branches,
++// or embedded guest values. This is NOT an address-keyed block cache.
++// Returned pointers are ephemeral: execute before any subsequent lookup/clear.
++JitEntry lookup(uint32_t opcode, bool thumb, bool arm7);
++void clearCache(); // Call only on the emulation thread, outside native execution.
++struct CacheStats { uint32_t hits, misses, compiles, flushes, rejected; };
++CacheStats cacheStats();
++}
+diff --git a/NooDS-Wii/jit_compiler.h b/NooDS-Wii/jit_compiler.h
+new file mode 100644
+index 0000000..23824a4
+--- /dev/null
++++ b/NooDS-Wii/jit_compiler.h
+@@ -0,0 +1,19 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++#pragma once
++#include "jit_ppc_emitter.h"
++namespace Jit {
++using JitPpc::Writer;
++// No guest PC, host-memory pointers, or incoming register/flag values are
++// embedded in these leaf functions: their identity is the opcode itself.
++bool compileArm(Writer &w, uint32_t opcode);
++bool compileThumb(Writer &w, uint16_t opcode);
++unsigned armClass(uint32_t opcode);
++void constant(Writer &w, unsigned dest, uint32_t value);
++void flagsNZ(Writer &w, unsigned value);
++void shiftImmediate(Writer &w, unsigned type, unsigned src, unsigned amount, bool carry);
++void shiftRegister(Writer &w, unsigned type, unsigned src, unsigned count, bool carry);
++// ARM operation numbers. Operands live in r5/r4, result in r3. Writes r14+rd
++// except test/compare ops 8..11. This function does not handle guest PC.
++void dataProcessing(Writer &w, unsigned op, bool flags, unsigned rd);
++void finish(Writer &w, unsigned cycles);
++}
+diff --git a/NooDS-Wii/jit_compiler_arm.cpp b/NooDS-Wii/jit_compiler_arm.cpp
+new file mode 100644
+index 0000000..89981bf
+--- /dev/null
++++ b/NooDS-Wii/jit_compiler_arm.cpp
+@@ -0,0 +1,32 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++#include "jit_compiler.h"
++namespace Jit {
++using namespace JitPpc;
++#include "jit_decode_arm.inc"
++unsigned armClass(uint32_t opcode) {
++    return armAluClass[((opcode>>16)&0xFF0)|((opcode>>4)&15)];
++}
++bool compileArm(Writer &w,uint32_t opcode) {
++    unsigned kind=armClass(opcode);
++    // The interpreter handles conditions before entry; reserved never native.
++    if (!kind || (opcode>>28)==15) return false;
++    unsigned rd=(opcode>>12)&15, rn=(opcode>>16)&15, rm=opcode&15, rs=(opcode>>8)&15;
++    bool immediate=opcode&(1u<<25), byRegister=!immediate && (opcode&16);
++    // Conservative: exclude even unused PC fields in tests and MOV forms.
++    if (rd==15 || rn==15 || (!immediate && (rm==15 || (byRegister && rs==15)))) return false;
++    unsigned op=(kind-1)>>1; bool flags=(kind-1)&1;
++    bool shifterCarry=flags && (op==0 || op==1 || op==8 || op==9 || op>=12);
++    w.emit(bitOr(5,rn+14,rn+14));
++    if (immediate) {
++        unsigned rotation=(opcode>>7)&30;
++        uint32_t value=opcode&255;
++        if (rotation) value=(value>>rotation)|(value<<(32-rotation));
++        constant(w,4,value);
++        if (rotation && shifterCarry) w.emit(rlwimi(29,4,30,2,2));
++    } else if (byRegister) shiftRegister(w,(opcode>>5)&3,rm+14,rs+14,shifterCarry);
++    else shiftImmediate(w,(opcode>>5)&3,rm+14,(opcode>>7)&31,shifterCarry);
++    dataProcessing(w,op,flags,rd);
++    finish(w,byRegister ? 2 : 1);
++    return w.good();
++}
++}
+diff --git a/NooDS-Wii/jit_compiler_common.cpp b/NooDS-Wii/jit_compiler_common.cpp
+new file mode 100644
+index 0000000..ed89436
+--- /dev/null
++++ b/NooDS-Wii/jit_compiler_common.cpp
+@@ -0,0 +1,105 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++#include "jit_compiler.h"
++namespace Jit {
++using namespace JitPpc;
++void constant(Writer &w,unsigned d,uint32_t v) {
++    // Explicit halves avoid signed low-half adjustment mistakes.
++    w.emit(addis(d,0,static_cast<int16_t>(v>>16)));
++    w.emit(ori(d,d,static_cast<uint16_t>(v)));
++}
++void flagsNZ(Writer &w,unsigned value) {
++    w.emit(bitOr(value,value,value,true)); w.emit(mfcr(8));
++    w.emit(rlwimi(29,8,0,0,0)); w.emit(rlwimi(29,8,1,1,1));
++}
++static void carryBit(Writer &w,unsigned src,unsigned bit) {
++    w.emit(rlwimi(29,src,(29-bit)&31,2,2));
++}
++void shiftImmediate(Writer &w,unsigned type,unsigned src,unsigned n,bool carry) {
++    switch(type) {
++    case 0: // LSL (zero preserves C)
++        w.emit(rlwinm(4,src,n,0,31-n));
++        if (carry && n) carryBit(w,src,32-n);
++        break;
++    case 1: // LSR #0 means #32
++        w.emit(n ? rlwinm(4,src,32-n,n,31) : addi(4,0,0));
++        if (carry) carryBit(w,src,n ? n-1 : 31);
++        break;
++    case 2: // ASR #0 means #32
++        w.emit(srawi(4,src,n ? n : 31));
++        if (carry) carryBit(w,src,n ? n-1 : 31);
++        break;
++    case 3:
++        if (n) w.emit(rlwinm(4,src,32-n,0,31));
++        else { // RRX consumes the original CPSR.C before replacing it.
++            w.emit(rlwinm(6,29,2,0,0));
++            w.emit(rlwinm(4,src,31,1,31)); w.emit(bitOr(4,4,6));
++        }
++        if (carry) carryBit(w,src,n ? n-1 : 0);
++        break;
++    }
++}
++void shiftRegister(Writer &w,unsigned type,unsigned src,unsigned count,bool carry) {
++    w.emit(rlwinm(6,count,0,24,31)); // ARM uses the bottom BYTE, not 5/6 bits.
++    w.emit(bitOr(4,src,src));
++    w.emit(cmpwi(0,6,0)); size_t zero=w.size(); w.emit(0);
++    if (type==3) {
++        w.emit(rlwinm(7,6,0,27,31));
++        w.emit(addi(8,0,32)); w.emit(subf(7,7,8));
++        w.emit(rlwnm(4,src,7,0,31));
++        if (carry) carryBit(w,4,31);
++    } else {
++        w.emit(cmpwi(0,6,32)); size_t small=w.size(); w.emit(0);
++        size_t end=0;
++        if (type==2) w.emit(addi(6,0,32)); // ASR saturates at sign-fill.
++        else {
++            w.emit(addi(4,0,0)); if (carry) carryBit(w,4,0);
++            end=w.size(); w.emit(0);
++        }
++        w.patchBranchCond(small,w.size(),4,1); // not GT => count <= 32
++        if (carry) {
++            if (type==0) { w.emit(addi(7,0,32)); w.emit(subf(7,6,7)); }
++            else w.emit(addi(7,6,-1));
++            w.emit(srw(8,src,7)); carryBit(w,8,0);
++        }
++        w.emit(type==0 ? slw(4,src,6) : type==1 ? srw(4,src,6) : sraw(4,src,6));
++        if (end) w.patchBranch(end,w.size());
++    }
++    w.patchBranchCond(zero,w.size(),12,2); // EQ => unchanged value and carry
++}
++void dataProcessing(Writer &w,unsigned op,bool flags,unsigned rd) {
++    bool arithmetic=(op>=2 && op<=7) || op==10 || op==11;
++    if (op>=5 && op<=7) {
++        w.emit(rlwinm(6,29,0,2,2)); w.emit(mtspr(1,6));
++    }
++    switch(op) {
++    case 0: case 8: w.emit(bitAnd(3,5,4)); break;
++    case 1: case 9: w.emit(bitXor(3,5,4)); break;
++    case 2: case 10: w.emit(subfc(3,4,5,flags)); break;
++    case 3: w.emit(subfc(3,5,4,flags)); break;
++    case 4: case 11: w.emit(addc(3,5,4,flags)); break;
++    case 5: w.emit(adde(3,5,4,flags)); break;
++    case 6: w.emit(subfe(3,4,5,flags)); break;
++    case 7: w.emit(subfe(3,5,4,flags)); break;
++    case 12: w.emit(bitOr(3,5,4)); break;
++    case 13: w.emit(bitOr(3,4,4)); break;
++    case 14: w.emit(andc(3,5,4)); break;
++    case 15: w.emit(nor(3,4,4)); break;
++    }
++    if (flags) {
++        if (arithmetic) {
++            w.emit(mfspr(7,1));
++            if (op==7) { // Preserve pinned interpreter RSCS old-C/V OR quirk.
++                w.emit(rlwinm(6,7,0,2,2)); w.emit(bitOr(29,29,6));
++                w.emit(rlwinm(6,7,30,3,3)); w.emit(bitOr(29,29,6));
++            } else {
++                w.emit(rlwimi(29,7,0,2,2)); w.emit(rlwimi(29,7,30,3,3));
++            }
++        }
++        flagsNZ(w,3);
++    }
++    if (op<8 || op>11) w.emit(bitOr(rd+14,3,3));
++}
++void finish(Writer &w,unsigned cycles) {
++    w.emit(addi(3,0,static_cast<int16_t>(cycles))); w.emit(bclr());
++}
++}
+diff --git a/NooDS-Wii/jit_compiler_thumb.cpp b/NooDS-Wii/jit_compiler_thumb.cpp
+new file mode 100644
+index 0000000..fd827c3
+--- /dev/null
++++ b/NooDS-Wii/jit_compiler_thumb.cpp
+@@ -0,0 +1,52 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++#include "jit_compiler.h"
++namespace Jit {
++using namespace JitPpc;
++bool compileThumb(Writer &w,uint16_t opcode) {
++    // Ranges follow interpreter_lookup.cpp's 1024-entry THUMB dispatch.
++    unsigned index=opcode>>6, rd=opcode&7, rs=(opcode>>3)&7;
++    if (index<0x60) {
++        shiftImmediate(w,index>>5,rs+14,(opcode>>6)&31,true);
++        w.emit(bitOr(rd+14,4,4)); flagsNZ(w,4);
++    } else if (index<0x80) {
++        w.emit(bitOr(5,rs+14,rs+14));
++        if (index<0x70) w.emit(bitOr(4,((opcode>>6)&7)+14,((opcode>>6)&7)+14));
++        else constant(w,4,(opcode>>6)&7);
++        dataProcessing(w,(opcode&0x200)?2:4,true,rd);
++    } else if (index<0x100) {
++        rd=(opcode>>8)&7;
++        w.emit(bitOr(5,rd+14,rd+14)); constant(w,4,opcode&255);
++        const unsigned ops[4]={13,10,4,2};
++        dataProcessing(w,ops[(opcode>>11)&3],true,rd);
++    } else if (index<0x110) {
++        unsigned sub=index-0x100;
++        if (sub==13) return false; // MUL: CPU-specific timing not implemented yet.
++        if (sub==2 || sub==3 || sub==4 || sub==7) {
++            unsigned type=sub==2?0:sub==3?1:sub==4?2:3;
++            shiftRegister(w,type,rd+14,rs+14,true);
++            w.emit(bitOr(rd+14,4,4)); flagsNZ(w,4);
++        } else {
++            w.emit(bitOr(5,rd+14,rd+14)); w.emit(bitOr(4,rs+14,rs+14));
++            const unsigned ops[16]={0,1,0,0,0,5,6,0,8,2,10,11,12,0,14,15};
++            if (sub==9) w.emit(addi(5,0,0)); // NEG = 0 - source
++            dataProcessing(w,ops[sub],true,rd);
++            if (sub==9) { // The reference NEG handler always clears V.
++                w.emit(addi(6,0,0)); w.emit(rlwimi(29,6,0,3,3));
++            }
++        }
++    } else if (index<0x11C) {
++        rd=((opcode>>4)&8)|(opcode&7); rs=(opcode>>3)&15;
++        if (rd==15 || rs==15) return false;
++        unsigned type=(opcode>>8)&3;
++        w.emit(bitOr(5,rd+14,rd+14)); w.emit(bitOr(4,rs+14,rs+14));
++        dataProcessing(w,type==0?4:type==1?10:13,type==1,rd);
++    } else if (index>=0x2A0 && index<=0x2BF) { // ADD Rd,SP,#imm
++        w.emit(addi(((opcode>>8)&7)+14,27,(opcode&255)<<2));
++    } else if (index>=0x2C0 && index<=0x2C3) { // ADD/SUB SP,#imm
++        int offset=(opcode&127)<<2; if (opcode&128) offset=-offset;
++        w.emit(addi(27,27,static_cast<int16_t>(offset)));
++    } else return false;
++    finish(w,1);
++    return w.good();
++}
++}
+diff --git a/NooDS-Wii/jit_debug.cpp b/NooDS-Wii/jit_debug.cpp
+new file mode 100644
+index 0000000..2a7196e
+--- /dev/null
++++ b/NooDS-Wii/jit_debug.cpp
+@@ -0,0 +1,19 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++#include "jit.h"
++#include <cstdio>
++namespace Jit {
++void logMismatch(uint32_t pc,uint32_t opcode,bool arm7,bool thumb,
++                 const JitContext &native,const JitContext &reference) {
++    FILE *file=std::fopen("sd:/noods/jit_log.txt","a");
++    if (!file) return;
++    std::fprintf(file,"JIT_DIFFTEST first mismatch: ARM%d %s pc=%08lx opcode=%08lx; native disabled\n",
++        arm7?7:9,thumb?"THUMB":"ARM",static_cast<unsigned long>(pc),static_cast<unsigned long>(opcode));
++    for (unsigned i=0;i<16;i++)
++        std::fprintf(file,"r%u native=%08lx reference=%08lx\n",i,
++            static_cast<unsigned long>(native.regs[i]),static_cast<unsigned long>(reference.regs[i]));
++    std::fprintf(file,"CPSR native=%08lx reference=%08lx cycles native=%lu reference=%lu\n",
++        static_cast<unsigned long>(native.cpsr),static_cast<unsigned long>(reference.cpsr),
++        static_cast<unsigned long>(native.cycles),static_cast<unsigned long>(reference.cycles));
++    std::fflush(file); std::fclose(file);
++}
++}
+diff --git a/NooDS-Wii/jit_decode_arm.inc b/NooDS-Wii/jit_decode_arm.inc
+new file mode 100644
+index 0000000..501e4f1
+--- /dev/null
++++ b/NooDS-Wii/jit_decode_arm.inc
+@@ -0,0 +1,261 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++// Generated by tools/jit_generate_decode.py; do not edit.
++// Dispatch-name SHA256: b6a190ff7a1a37d3648764c761db09bb7b2c0ac8bc4cad50168ecc520515805c
++static const uint8_t armAluClass[4096] = {
++    1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 0, 1, 0, 1, 0,
++    2, 2, 2, 2, 2, 2, 2, 2, 2, 0, 2, 0, 2, 0, 2, 0,
++    3, 3, 3, 3, 3, 3, 3, 3, 3, 0, 3, 0, 3, 0, 3, 0,
++    4, 4, 4, 4, 4, 4, 4, 4, 4, 0, 4, 0, 4, 0, 4, 0,
++    5, 5, 5, 5, 5, 5, 5, 5, 5, 0, 5, 0, 5, 0, 5, 0,
++    6, 6, 6, 6, 6, 6, 6, 6, 6, 0, 6, 0, 6, 0, 6, 0,
++    7, 7, 7, 7, 7, 7, 7, 7, 7, 0, 7, 0, 7, 0, 7, 0,
++    8, 8, 8, 8, 8, 8, 8, 8, 8, 0, 8, 0, 8, 0, 8, 0,
++    9, 9, 9, 9, 9, 9, 9, 9, 9, 0, 9, 0, 9, 0, 9, 0,
++    10, 10, 10, 10, 10, 10, 10, 10, 10, 0, 10, 0, 10, 0, 10, 0,
++    11, 11, 11, 11, 11, 11, 11, 11, 11, 0, 11, 0, 11, 0, 11, 0,
++    12, 12, 12, 12, 12, 12, 12, 12, 12, 0, 12, 0, 12, 0, 12, 0,
++    13, 13, 13, 13, 13, 13, 13, 13, 13, 0, 13, 0, 13, 0, 13, 0,
++    14, 14, 14, 14, 14, 14, 14, 14, 14, 0, 14, 0, 14, 0, 14, 0,
++    15, 15, 15, 15, 15, 15, 15, 15, 15, 0, 15, 0, 15, 0, 15, 0,
++    16, 16, 16, 16, 16, 16, 16, 16, 16, 0, 16, 0, 16, 0, 16, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    18, 18, 18, 18, 18, 18, 18, 18, 18, 0, 18, 0, 18, 0, 18, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    20, 20, 20, 20, 20, 20, 20, 20, 20, 0, 20, 0, 20, 0, 20, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    22, 22, 22, 22, 22, 22, 22, 22, 22, 0, 22, 0, 22, 0, 22, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    24, 24, 24, 24, 24, 24, 24, 24, 24, 0, 24, 0, 24, 0, 24, 0,
++    25, 25, 25, 25, 25, 25, 25, 25, 25, 0, 25, 0, 25, 0, 25, 0,
++    26, 26, 26, 26, 26, 26, 26, 26, 26, 0, 26, 0, 26, 0, 26, 0,
++    27, 27, 27, 27, 27, 27, 27, 27, 27, 0, 27, 0, 27, 0, 27, 0,
++    28, 28, 28, 28, 28, 28, 28, 28, 28, 0, 28, 0, 28, 0, 28, 0,
++    29, 29, 29, 29, 29, 29, 29, 29, 29, 0, 29, 0, 29, 0, 29, 0,
++    30, 30, 30, 30, 30, 30, 30, 30, 30, 0, 30, 0, 30, 0, 30, 0,
++    31, 31, 31, 31, 31, 31, 31, 31, 31, 0, 31, 0, 31, 0, 31, 0,
++    32, 32, 32, 32, 32, 32, 32, 32, 32, 0, 32, 0, 32, 0, 32, 0,
++    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
++    2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
++    3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
++    4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
++    5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
++    6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
++    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
++    8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
++    9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9,
++    10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10,
++    11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11,
++    12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12,
++    13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13,
++    14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14,
++    15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
++    16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24,
++    25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25,
++    26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26,
++    27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27,
++    28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28,
++    29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29,
++    30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30,
++    31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31,
++    32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++};
+diff --git a/NooDS-Wii/jit_ppc_emitter.h b/NooDS-Wii/jit_ppc_emitter.h
+index 30def05..48132db 100644
+--- a/NooDS-Wii/jit_ppc_emitter.h
++++ b/NooDS-Wii/jit_ppc_emitter.h
+@@ -1,5 +1,5 @@
+ // SPDX-License-Identifier: GPL-3.0-or-later
+-// PowerPC 750 instruction encoder. No runtime JIT integration yet.
++// PowerPC 750 instruction encoder for the native ALU path.
+ #pragma once
+ #include <cstddef>
+ #include <cstdint>
+diff --git a/NooDS-Wii/jit_trampoline.cpp b/NooDS-Wii/jit_trampoline.cpp
+new file mode 100644
+index 0000000..75236cf
+--- /dev/null
++++ b/NooDS-Wii/jit_trampoline.cpp
+@@ -0,0 +1,103 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++#include "jit.h"
++#if (!defined(__powerpc__) && !defined(__PPC__)) || defined(__powerpc64__)
++#error "JIT trampoline requires 32-bit PowerPC"
++#endif
++static_assert(sizeof(void*)==4, "32-bit ABI required");
++#define STR_I(x) #x
++#define STR(x) STR_I(x)
++// No .S rule is needed. Frame is 16-byte aligned and contains linkage space.
++// Preserve all r14-r31, LR and the full CR. r1/r2/r13 are never repurposed.
++// A native leaf returns with blr; it may not make helper calls in this stage.
++__asm__(
++    ".text\n"
++    ".align 2\n"
++    ".globl jitEnter\n"
++    ".type jitEnter,@function\n"
++    "jitEnter:\n"
++    "stwu 1,-112(1)\n"
++    "mflr 0\n"
++    "stw 0,92(1)\n"
++    "mfcr 0\n"
++    "stw 0,88(1)\n"
++    "stw 14,16(1)\n"
++    "stw 15,20(1)\n"
++    "stw 16,24(1)\n"
++    "stw 17,28(1)\n"
++    "stw 18,32(1)\n"
++    "stw 19,36(1)\n"
++    "stw 20,40(1)\n"
++    "stw 21,44(1)\n"
++    "stw 22,48(1)\n"
++    "stw 23,52(1)\n"
++    "stw 24,56(1)\n"
++    "stw 25,60(1)\n"
++    "stw 26,64(1)\n"
++    "stw 27,68(1)\n"
++    "stw 28,72(1)\n"
++    "stw 29,76(1)\n"
++    "stw 30,80(1)\n"
++    "stw 31,84(1)\n"
++    "mtctr 3\n"
++    "mr 30,4\n"
++    "lwz 31," STR(JIT_CTX_INTERPRETER) "(30)\n"
++    "lwz 14," STR(JIT_CTX_REGS) "+0(30)\n"
++    "lwz 15," STR(JIT_CTX_REGS) "+4(30)\n"
++    "lwz 16," STR(JIT_CTX_REGS) "+8(30)\n"
++    "lwz 17," STR(JIT_CTX_REGS) "+12(30)\n"
++    "lwz 18," STR(JIT_CTX_REGS) "+16(30)\n"
++    "lwz 19," STR(JIT_CTX_REGS) "+20(30)\n"
++    "lwz 20," STR(JIT_CTX_REGS) "+24(30)\n"
++    "lwz 21," STR(JIT_CTX_REGS) "+28(30)\n"
++    "lwz 22," STR(JIT_CTX_REGS) "+32(30)\n"
++    "lwz 23," STR(JIT_CTX_REGS) "+36(30)\n"
++    "lwz 24," STR(JIT_CTX_REGS) "+40(30)\n"
++    "lwz 25," STR(JIT_CTX_REGS) "+44(30)\n"
++    "lwz 26," STR(JIT_CTX_REGS) "+48(30)\n"
++    "lwz 27," STR(JIT_CTX_REGS) "+52(30)\n"
++    "lwz 28," STR(JIT_CTX_REGS) "+56(30)\n"
++    "lwz 29," STR(JIT_CTX_CPSR) "(30)\n"
++    "bctrl\n"
++    "stw 14," STR(JIT_CTX_REGS) "+0(30)\n"
++    "stw 15," STR(JIT_CTX_REGS) "+4(30)\n"
++    "stw 16," STR(JIT_CTX_REGS) "+8(30)\n"
++    "stw 17," STR(JIT_CTX_REGS) "+12(30)\n"
++    "stw 18," STR(JIT_CTX_REGS) "+16(30)\n"
++    "stw 19," STR(JIT_CTX_REGS) "+20(30)\n"
++    "stw 20," STR(JIT_CTX_REGS) "+24(30)\n"
++    "stw 21," STR(JIT_CTX_REGS) "+28(30)\n"
++    "stw 22," STR(JIT_CTX_REGS) "+32(30)\n"
++    "stw 23," STR(JIT_CTX_REGS) "+36(30)\n"
++    "stw 24," STR(JIT_CTX_REGS) "+40(30)\n"
++    "stw 25," STR(JIT_CTX_REGS) "+44(30)\n"
++    "stw 26," STR(JIT_CTX_REGS) "+48(30)\n"
++    "stw 27," STR(JIT_CTX_REGS) "+52(30)\n"
++    "stw 28," STR(JIT_CTX_REGS) "+56(30)\n"
++    "stw 29," STR(JIT_CTX_CPSR) "(30)\n"
++    "stw 3," STR(JIT_CTX_CYCLES) "(30)\n"
++    "lwz 14,16(1)\n"
++    "lwz 15,20(1)\n"
++    "lwz 16,24(1)\n"
++    "lwz 17,28(1)\n"
++    "lwz 18,32(1)\n"
++    "lwz 19,36(1)\n"
++    "lwz 20,40(1)\n"
++    "lwz 21,44(1)\n"
++    "lwz 22,48(1)\n"
++    "lwz 23,52(1)\n"
++    "lwz 24,56(1)\n"
++    "lwz 25,60(1)\n"
++    "lwz 26,64(1)\n"
++    "lwz 27,68(1)\n"
++    "lwz 28,72(1)\n"
++    "lwz 29,76(1)\n"
++    "lwz 30,80(1)\n"
++    "lwz 31,84(1)\n"
++    "lwz 0,88(1)\n"
++    "mtcr 0\n"
++    "lwz 0,92(1)\n"
++    "mtlr 0\n"
++    "addi 1,1,112\n"
++    "blr\n"
++    ".size jitEnter,.-jitEnter\n"
++);
+diff --git a/NooDS-Wii/settings.cpp b/NooDS-Wii/settings.cpp
+index a529ce7..d79a216 100644
+--- a/NooDS-Wii/settings.cpp
++++ b/NooDS-Wii/settings.cpp
+@@ -21,6 +21,7 @@
+ #include <sys/stat.h>
+ #include "core.h"
+ 
++int Settings::jitEnabled  = 0;
+ int Settings::directBoot  = 1;
+ int Settings::romInRam    = 0;
+ int Settings::fpsLimiter  = 0;
+@@ -47,6 +48,7 @@ std::string Settings::sdImagePath  = "sd.img";
+ std::string Settings::basePath     = ".";
+ 
+ std::vector<Setting> Settings::settings = {
++    Setting("jitEnabled",   &jitEnabled,   false),
+     Setting("directBoot",   &directBoot,   false),
+     Setting("romInRam",     &romInRam,     false),
+     Setting("fpsLimiter",   &fpsLimiter,   false),
+diff --git a/NooDS-Wii/settings.h b/NooDS-Wii/settings.h
+index 419c2b8..4b48c48 100644
+--- a/NooDS-Wii/settings.h
++++ b/NooDS-Wii/settings.h
+@@ -34,6 +34,7 @@ struct Setting {
+ 
+ class Settings {
+ public:
++    static int jitEnabled; // Experimental single-op JIT; default off.
+     static int directBoot;
+     static int romInRam;
+     static int fpsLimiter;
+diff --git a/docs/jit/SEMANTICS.md b/docs/jit/SEMANTICS.md
+index 2381c31..c6ef6f8 100644
+--- a/docs/jit/SEMANTICS.md
++++ b/docs/jit/SEMANTICS.md
+@@ -1,5 +1,8 @@
+ # Interpreter semantics review — pinned source, not a finished specification
+ 
++> Historical stage-1 review. Stage 2 implements the non-PC ALU execution path,
++> trampoline and content-addressed leaf cache. See WORK_REPORT.md for current status.
++
+ Target: radicalten/NooDS-Wii commit `1c995b48c37ebf3645646968c416958f79264137`.
+ Comparison: dborth/vbagx commit `5db68c4e1c908b0c79b5f589b7a82e88a3dff1b2`.
+ 
+diff --git a/docs/jit/WORK_REPORT.md b/docs/jit/WORK_REPORT.md
+index b9265ee..5cecb22 100644
+--- a/docs/jit/WORK_REPORT.md
++++ b/docs/jit/WORK_REPORT.md
+@@ -1,124 +1,175 @@
+-# NooDS-Wii ARM/THUMB → PPC JIT: foundation delivery
++# NooDS-Wii JIT — stage 2: native single-instruction ALU path
+ 
+-## Status: partial — NOT the requested finished recompiler
++## Status
+ 
+-This package does **not** add a functioning JIT to NooDS-Wii. It provides the first verification layer: a PPC encoder, bounded staging writer, independent assembler oracle, executable PPC flag probes, dispatch extraction, source review, and a build-time source exclusion switch. It has no translated guest instruction blocks, no runtime JIT dispatcher and no speedup. It does not yet meet or exceed VBA-GX functionality.
++**An experimental ARM/THUMB → PPC execution path is now integrated. It is default-off and is not the finished VBA-GX-parity-plus-ARM recompiler.**
+ 
+-Do not deploy or describe this as a completed ARMv4/v5 recompiler. The emulator still runs its original interpreter. A source build passing is not a JIT correctness result.
++Unlike stage 1, this version emits guest-operation-specific native PPC code, caches it, and executes it from `Interpreter::runOpcode`. It does not merely call interpreter handlers from generated code. Unsupported instructions take the existing interpreter path. No game-performance improvement or hardware correctness is claimed.
+ 
+-## Sources and authorization
++Base repository: radicalten/NooDS-Wii `1c995b48c37ebf3645646968c416958f79264137`.
++Stage-1 continuation point: local commit `0738f72` (full hash recorded in the bundle's patch base metadata).
++Comparison reference remains dborth/vbagx `5db68c4e1c908b0c79b5f589b7a82e88a3dff1b2`.
++The user authorized direct implementation in the prior turn and requested continuation in the preferred order. No delegated agent, API credential, remote push or PR was used.
+ 
+-- NooDS-Wii base: `1c995b48c37ebf3645646968c416958f79264137`.
+-- VBA-GX comparison base: `5db68c4e1c908b0c79b5f589b7a82e88a3dff1b2`.
+-- Read the supplied AGENTS.md and SKILL.md before changes.
+-- The user explicitly authorized direct implementation in place of delegated coding; no agent CLI was installed and no API credentials were requested or used.
+-- Local feature branch: `feature/arm-ppc-jit`. No remote push or PR was made.
+-- No VBA-GX implementation was vendored. Interpreter arithmetic expressions in the probe come from the pinned GPL-licensed NooDS-Wii source. New source carries GPL-3.0-or-later identifiers; the original LICENSE accompanies the bundle.
++## What changed
+ 
+-## Files
++### Native translators
+ 
+-### Additive production-source foundation
++- `jit_compiler_arm.cpp`: non-PC ARM data processing, using an allowlist generated from the actual dispatch table. Supports AND/EOR/SUB/RSB/ADD/ADC/SBC/RSC, TST/TEQ/CMP/CMN, ORR/MOV/BIC/MVN, applicable S variants, rotated immediates, immediate shifts and register-specified shifts. PC operands and reserved conditions are excluded. Even unused PC-encoded Rn/Rd fields are conservatively rejected.
++- `jit_compiler_thumb.cpp`: immediate LSL/LSR/ASR; ADD/SUB register and immediate; MOV/CMP/ADD/SUB imm8; logical ALU, ADC/SBC, TST/CMP/CMN, NEG, register LSL/LSR/ASR/ROR; non-PC high-register ADD/CMP/MOV; SP-relative address addition and SP adjustment.
++- `jit_compiler_common.cpp`: operand shifts including zero/32/>32 cases, immediate constants, PPC arithmetic and flag materialization, exact 1/2-cycle leaf returns. This is original code, not vendored VBA-GX code.
++- `jit_decode_arm.inc`: 4,096-entry generated allowlist, of which 784 table slots are ALU-eligible before PC rejection. `tools/jit_generate_decode.py --check` detects drift in the generated classification.
+ 
+-- `NooDS-Wii/jit_ppc_emitter.h`
+-- `NooDS-Wii/jit_ppc_emitter.cpp`
++Interpreter-equivalence quirks are preserved: ARM RSCS ORs newly computed C/V into the old C/V bits, and THUMB NEG clears V even for the architectural overflow case. No interpreter semantics were silently corrected.
+ 
+-The encoder supports 32-bit 750-family arithmetic, carry/overflow variants, logical operations, shifts/rotates, comparisons, D-form and byte-reversed memory accesses, CR/SPR moves and relative/indirect branches. It has no AltiVec, isel, popcntb or 64-bit host instructions. The bounded Writer refuses overflow and invalid branch ranges, uses instruction-relative offsets, leaves invalid branch outputs untouched, and latches write failure. This is a staging buffer, not an executable code allocator.
++The native compiler accepts **20,323 of all 65,536 THUMB encodings** in the exhaustive acceptance sweep. That number describes this limited ALU subset, not overall CPU compatibility. MUL and all memory/branch/exception instructions remain interpreter operations.
+ 
+-### Tests and analysis
++### Execution/ABI
+ 
+-- `tools/jit_asm_oracle.cpp`: encoder vectors and writer boundary checks.
+-- `tools/run_jit_asm_oracle.sh`: assemble with GNU PPC binutils, extract raw .text and compare big-endian words. Does not parse objdump text.
+-- `tests/jit_flag_probe.cpp`: builds small functions from the emitter and actually executes them in a PPC Linux process under QEMU.
+-- `tools/run_jit_flag_probe.sh`: static PPC build and qemu-ppc 750 execution.
+-- `tools/jit_extract_semantics.py`: checks dispatch-table sizes and generates name ranges, JSON and a return-expression inventory.
+-- `tools/jit_validate_dol.py`: basic DOL section/entry validation; not a runtime test.
+-- `docs/jit/SEMANTICS.md`: reviewed pipeline, flags, timing, scheduling, memory/alias and ABI issues.
+-- `docs/jit/*dispatch*`, `source-return-index.md`: generated review aids.
+-- `verification/`: exact build/test logs and ELF/DOL check outputs.
++- `jit.h`: fixed-offset, 32-byte-aligned context with compile-time layout assertions. 96 bytes on PPC32.
++- `jit_trampoline.cpp`: top-level assembly in a `.cpp`, so no Makefile .S rule is required. Saves/restores LR, the full CR and r14-r31. Uses the requested register contract: guest r0-r14 in host r14-r28, CPSR r29, context r30, interpreter r31. r2/r13 remain untouched; r1 is used only as the ABI stack pointer. Guest PC is not cached in a host register.
++- `jit.cpp`: snapshots current banked register values, invokes a native leaf, then commits r0-r14/CPSR and returns its exact cycle count. No guest fetch, PC update, memory access or mode change occurs in a native leaf.
+ 
+-### Existing-file change
++**Boundary:** native dispatch is inserted after the existing pipeline advance and, for ARM, after the existing condition check. Failure to compile executes the already-selected interpreter handler once at that same boundary. It does not call runOpcode a second time. False ARM conditions and reserved/HLE paths remain ahead of the JIT hook.
+ 
+-`Makefile`: adds `NOODS_JIT ?= 1`. `make NOODS_JIT=0` excludes `NooDS-Wii/jit_*.cpp` and adds `-DNOODS_NO_JIT`. It does not add a runtime setting. Both modes currently use only the interpreter.
++Each call performs exactly one guest instruction. Existing scheduler loops and their CPU/global cycle conversions are unchanged. This avoids introducing multi-instruction overshoot or different ARM7/ARM9 interleaving at this stage. It is not a completed block scheduler or chaining implementation.
+ 
+-## Verified
++### Cache and self-modification policy
+ 
+-1. Installed devkitPPC via the official `devkitpro/devkitppc` Docker Hub image using SHA-256-checked layers. Compiler reported **16.1.0**. Installed Debian PPC Linux binutils/compiler and qemu-user-static for independent probes.
+-2. Built the **unmodified baseline** successfully.
+-3. Encoder oracle: **121 independently assembled vectors passed**. Writer overflow/patch/range checks passed.
+-4. Generated PPC arithmetic/flag functions: **324,576 cases passed** against copied interpreter expressions. Cases include all pairs of 16 boundary operands with all 16 old NZCV combinations for each of six operations, plus 50,000 deterministic random cases per operation. Entire result words and CPSR words were compared.
+-5. Extracted 4,096 ARM dispatch entries / 525 distinct handlers and 1,024 THUMB entries / 78 distinct handlers.
+-6. Clean build with the new encoder included as an input object: compile, link and elf2dol succeeded.
+-7. Clean `make NOODS_JIT=0` build succeeded, with no encoder object produced and no JitPpc symbols in the executable.
+-8. Both resulting DOLs passed basic structural validation; ELF and DOL entry were **0x80003f00**. The Makefile names its artifact `NooDS-Wii.dol`, not `boot.dol`; it can be renamed for the Homebrew Channel. No binary is included in this source-only bundle.
++`jit_cache.cpp` supplies a fixed **4 MiB**, 32-byte-aligned MEM2 arena allocated once, a 4,096-slot direct-mapped table and a static 256-word staging buffer. Arena exhaustion clears all entries and restarts at the beginning; it never grows. Allocation failure returns to the interpreter. Runtime-off does not allocate the arena.
+ 
+-The linker garbage-collects unused encoder functions in the default build because no runtime JIT calls them yet. Equal binary sizes for enabled/disabled foundation builds are therefore expected, not evidence that a runtime JIT switch works.
++After writing native code, it calls `DCFlushRange` followed by `ICInvalidateRange` over the aligned written range. Those calls compile on Wii; physical cache coherence still needs hardware validation.
+ 
+-The initial oracle invocation used a GNU assembler target flag (`-m750`) unsupported by the installed assembler. It was corrected to `-mgekko`; the reported passing result is from the corrected script. The initial enabled-symbol check also stopped when the linker discarded unused encoder code; verification was corrected to inspect the input object and document the lack of runtime references.
++**This cache is keyed by exact already-prefetched opcode, THUMB/ARM state and CPU identity—not guest PC.** Leaves embed no guest addresses, fetched memory pointers, mapping assumptions, register values or flag values. Consequently:
+ 
+-## Source-level findings, not full emulator verification
++- A modified instruction selects code for its new opcode when fetched.
++- Already-prefetched old bytes execute their old semantics, like the interpreter.
++- Mirrored writes and remaps cannot make these pure, location-independent ALU leaves stale.
++- No invalidation hook has been added to Memory/DMA/remapping in this stage.
+ 
+-See SEMANTICS.md for details:
++This narrow content-addressed design must **not** be generalized to address-specialized blocks without adding mapping/alias-aware invalidation. There is no page-bucket cache, no native store path, and no claim that the final requested SMC framework is complete. Cached entry pointers are ephemeral and must be executed before another lookup can recycle the arena.
+ 
+-- Handler-time `pipeline[0]` contains the next prefetched instruction, not the current opcode saved by runOpcode.
+-- Native execution must respect already-prefetched bytes when stores modify upcoming instructions; invalidating blocks alone does not settle pipeline equivalence.
+-- Timing differs from several shortcuts in the briefing. ARM9 THUMB MUL returns 4, while ARM MUL returns 2. ARM7 multiply timing uses the source's significance tests.
+-- Stored ARM7 deadlines are already in the global scheduling domain after the run loop applies `<< 1`.
+-- The pinned RSCS handler preserves old C/V before OR-ing computed C/V. The probe deliberately preserves this interpreter quirk.
+-- Several load families differ in whether a PC load updates T; a single universal PC-load rule is unsafe.
+-- Physical memory mirrors and cross-CPU aliases must be invalidated, not only the virtual address used by a write.
+-- The repo is a Wii build. Gekko-compatible instruction words alone do not establish GameCube platform support.
++### Off-switches and diagnostics
+ 
+-## Written but not verified on target hardware
++- Runtime: `Settings::jitEnabled`, serialized as `jitEnabled=0` or `jitEnabled=1` in `noods.ini`. Default is **0**. No GUI toggle is added.
++- Build-time: `make NOODS_JIT=0` excludes **both `jit.cpp` and `jit_*.cpp`**, defines `NOODS_NO_JIT`, and removes runtime hooks at preprocessing time. The setting may still exist in the ini but has no effect in this build.
++- `make JIT_DIFFTEST=1`: for accepted pure ALU instructions, execute native code on a snapshot and the original handler once on the real CPU. Compare r0-r15, all CPSR bits and returned cycles. Keep the reference result. First mismatch logs PC/opcode/state to `sd:/noods/jit_log.txt`, flushes/closes the log, and latches native execution off for the session. Failure to open the log does not prevent disabling native execution.
+ 
+-- All encoder code is compiled for PPC and checked against GNU assembly, but Wii/GCN execution and actual D-cache/I-cache publication have not been tested.
+-- The source review identifies integration requirements; it is not a complete handler-by-handler cycle specification or proof of SMC correctness.
+-- DOL structure and entry checks do not prove the emulator boots or runs a ROM correctly.
++Differential mode does not duplicate MMIO: memory instructions cannot enter the native path. The mode is a bring-up diagnostic, not a general memory-replay lockstep engine.
+ 
+-## Not started / remaining acceptance criteria
++The Makefile clean rule now removes all source objects independent of the selected switch. Still run `make clean` after header edits or when switching build flags: automatic header/flag dependency tracking remains absent upstream.
+ 
+-| Requirement | Current status |
++## Verification actually performed
++
++### 1. Encoder/flag foundation rerun
++
++- **121** independent GNU assembler comparisons: passed.
++- Bounded writer/range tests: passed.
++- **324,576** emitted arithmetic/flag expression probes under qemu-ppc 750: passed.
++
++### 2. Actual interpreter ALU oracle
++
++`tools/jit_make_test_oracle.py` takes the **actual unchanged interpreter_alu.cpp**, substitutes only its `core.h` include for the minimal test include, and generates reference calls from the real dispatch tables. Handler bodies and macros are not reimplemented. PC/mode-change calls in this isolated harness abort if unexpectedly reached.
++
++`tools/run_jit_native_tests.sh` executes native translator output through the production trampoline, with an assembly ABI checker around every call. Tests include:
++
++- Every THUMB encoding, either accepted and compared or rejected without emitted code.
++- Every ARM dispatch slot with varied register/immediate fields, plus 60,000 random ARM words.
++- ARM7/ARM9 identities, old NZCV combinations, operand aliases and boundary values.
++- Shift-count boundaries including 0, 31, 32, 33, 63, 64, 255, 256/257 and randomized values.
++- r0-r15, all CPSR bits and cycles.
++- Preservation of r14-r31, r2/r13 and the full CR on every native invocation; normal return also exercises LR restoration.
++- A deliberately tiny 4 KiB test arena to force cache recycling, key collisions, repeated hits and negative-cache entries.
++
++Result per run: **1,415,296 state comparisons passed**; 20,323 distinct THUMB encodings and 19,726 generated ARM candidates accepted in that sweep. Cache test observed 31,871 hits, 16,129 misses, 15,999 compilations, 124 arena flushes and 130 rejections.
++
++Ran this twice: once with the interpreter oracle compiled by PPC Linux GCC, and again with the oracle compiled by **devkitPPC 16.1.0 using the port's optimization/ABI flags**, linked into the Linux/QEMU harness. Both passed the same cases. These are two oracle builds of the same corpus, not twice as many unique test states.
++
++### 3. Pipeline and integration harness
++
++`tools/jit_make_pipeline_test.py` extracts the exact current runOpcode/getOpcode16/getOpcode32 bodies and condition table. It uses a small instrumented memory backend and instrumented non-ALU fallback/reserved handlers. This is **not** the complete Core, scheduler, MMIO, BIOS or DMA implementation.
++
++Each of four modes passed **43,776 step comparisons**:
++
++1. Native included, runtime switched between off/on.
++2. `JIT_DIFFTEST=1`.
++3. `NOODS_NO_JIT` with no JIT implementation linked.
++4. Simulated allocation failure, forcing every supported native attempt back to the interpreter.
++
++Checks include condition true/false/reserved routing, fallback invocation counts, native and fallback adjacency, banked register pointers, page-boundary fetches, mapped/unmapped fetches, r15, both pipeline slots, fetch-side-effect counts, pcData, scheduler fields and memory bytes differing from already-prefetched opcodes.
++
++An intentional reference-dispatch corruption verified that mismatch logging occurs, reference register results/cycles are retained, and later native attempts are disabled. This was a test fault injection, not an observed translator mismatch.
++
++### 4. Clean Wii builds
++
++Compile + link + elf2dol succeeded in all three configurations:
++
++| Build | DOL entry | Result |
++|---|---|---|
++| Default, JIT included but ini default off | `0x80003f00` | Passed |
++| `JIT_DIFFTEST=1` | `0x80003f00` | Passed |
++| `NOODS_JIT=0` | `0x80003f00` | Passed |
++
++DOL section/file-bound checks passed. Symbol inspection confirms native translator/dispatcher/trampoline symbols in the included build and **no Jit/JitPpc/jitEnter symbols or JIT objects** in the excluded build. Artifacts are named `NooDS-Wii.dol` by the upstream Makefile; a user may rename the result to `boot.dol` for HBC. This deliverable remains source-only.
++
++During bring-up, the architecture guard was corrected to accept devkitPPC's `__PPC__` macro as well as Linux GCC's `__powerpc__`. The build-time exclusion was extended to include `jit.cpp`, whose name does not match `jit_*.cpp`. A test-only include needed correction for the compiled-out harness. Reported passes are from the corrected sources.
++
++Exact outputs and build logs are in `verification/stage2/`. Stage-1 logs remain historical.
++
++## Written but not verified on Wii/GCN hardware
++
++- Wii execution of the native path, cache publication and long-running stability.
++- Full emulator JIT_DIFFTEST ROM runs, peripheral behavior and frame scheduling.
++- User-facing boot/loading and runtime ini toggling on a real console.
++- Performance, FPS, compile overhead and code-cache pressure in games.
++
++No Dolphin session, hardware run or GameCube build was performed. The instruction set is Gekko-compatible, but the surrounding port and allocator are still Wii-specific.
++
++## Remaining work / deviations from the final design
++
++| Final requirement | Stage-2 status |
+ |---|---|
+-| ARM native translator: ALU/shifter, branches, transfers, LDM/STM, multiplies | Not implemented |
+-| THUMB native translator at VBA-GX parity | Not implemented |
+-| Runtime dispatcher, interpreter fallback boundary and HLE exits | Not implemented |
+-| ABI trampoline, context offsets, shared epilogue, register contract | Not implemented |
+-| Fixed 2/4 MB executable arena and PPC cache publication | Not implemented |
+-| Page buckets, alias-aware SMC invalidation, remap/reset/state-load hooks | Not implemented |
+-| Native memory accesses and slow-path side-effect exits | Not implemented |
+-| Exact block-cycle accounting, dual-CPU scheduling and budget exits | Not implemented |
+-| Runtime `Settings::jitEnabled` / noods.ini switch | Not implemented |
+-| Build-time `NOODS_JIT=0` exclusion | Implemented and build-tested |
+-| Emulator lockstep r0-r15/CPSR/cycles/memory differential tests | Not implemented |
+-| Wii hardware / Dolphin / GameCube tests | Not run |
+-| Before/after FPS / comparison against VBA-GX | Not measured |
+-
+-No empty `jit_compiler_arm.cpp`, `jit_compiler_thumb.cpp`, `jit_cache.cpp` or trampoline stubs are supplied: those names would suggest an implementation that does not exist.
+-
+-## Reproduce
+-
+-From the pinned repository with the overlay applied:
++| Native non-PC ARM ALU/shifters | Implemented and isolated-differential-tested |
++| Native THUMB ALU/shifters except MUL/PC uses | Implemented and isolated-differential-tested |
++| Branches/BX/BLX/BL pairs and PC-writing exits | Interpreter fallback only |
++| Native loads/stores, PUSH/POP, LDM/STM, doubleword transfers | Interpreter fallback only |
++| Native multiply families and exact CPU-specific ramps | Interpreter fallback only |
++| Multi-instruction blocks, block budgets and native chaining | Not implemented |
++| Shared resume-state epilogue using r11/r12 | Not implemented; pure leaves return cycles in r3 to the trampoline |
++| Address-keyed page buckets / mirrored-write invalidation hooks | Not implemented; current content-keyed ALU leaves do not depend on memory locations |
++| 2 MiB GBA / 4 MiB NDS arena policy | Currently fixed 4 MiB for either mode; mode-specific sizing deferred |
++| Two off-switches | Implemented; mock integration and clean Wii builds passed |
++| Native/reference mismatch diagnostic | Implemented for accepted pure leaves; general memory lockstep deferred |
++| VBA-GX native coverage parity and performance superiority | **Not achieved** |
++| GameCube platform build | Not implemented |
++
++A one-instruction native call snapshots 15 registers and saves/restores the ABI context. **It may be slower than the interpreter.** The point of this stage is a tested execution contract, not a speed claim. Keep the default off for normal use until target validation and multi-instruction amortization work are done.
++
++## Apply and reproduce
++
++The bundle includes an overlay, a patch from the pinned upstream base, and an incremental patch from stage 1. Choose one method; do not apply multiple alternatives. Headers and `jit_decode_arm.inc` are required alongside the `.cpp` files. Do not put standalone test mains into the emulator source directory.
+ 
+ ```sh
+ bash tools/run_jit_asm_oracle.sh
+ bash tools/run_jit_flag_probe.sh
+-python3 tools/jit_extract_semantics.py
++bash tools/run_jit_native_tests.sh
++bash tools/run_jit_pipeline_tests.sh
++
+ source /home/user/wii-env.sh
++JIT_ORACLE_DEVKIT=1 bash tools/run_jit_native_tests.sh
+ make clean && make -j4
+ python3 tools/jit_validate_dol.py NooDS-Wii.dol
++make clean && make JIT_DIFFTEST=1 -j4
+ make clean && make NOODS_JIT=0 -j4
+-python3 tools/jit_validate_dol.py NooDS-Wii.dol
+ ```
+ 
+-The host tests require g++, Python 3, powerpc-linux-gnu-as/objcopy/g++, and qemu-ppc-static. Wii builds require devkitPPC/libogc and the port libraries used by the original repo. The supplied environment script exports paths; this repo already defines platform flags in its Makefile. `/opt/devkitpro` is not a persisted workspace deliverable: the bootstrap script and layer manifest are included separately for reproducibility. Re-running the bootstrap's `latest` tag can select newer toolchain versions; the archived manifest identifies the layers used for this run.
++For **experimental console testing**, use a JIT-included build and set `jitEnabled=1` on its own newline-terminated line in `noods.ini`. Start with `JIT_DIFFTEST=1`; inspect `sd:/noods/jit_log.txt`. To disable: set `jitEnabled=0`, or clean-build `NOODS_JIT=0`. This is a recommendation for future testing, not a claim that console testing has happened.
+ 
+-Always clean when switching NOODS_JIT or editing headers: the upstream Makefile does not track header dependencies or flag changes. No claim is made for a no-clean toggle.
++## Next preferred order
+ 
+-## Recommended continuation order
++1. Add differential-tested multiply families and conservative PC/branch exits while retaining one-instruction scheduling. Preserve interpreter quirks or use fallback; do not silently change the reference.
++2. Design multi-instruction pipeline maintenance and scheduler interleaving, then implement budgeted short ALU blocks with trace-level lockstep. This is needed to amortize the current entry cost.
++3. Before address-specialized caching or native memory operations, implement alias-aware invalidation and robust remap/reset/state-load hooks. Add memory/MMIO differential replay or isolation; never execute side-effectful MMIO twice.
++4. Complete THUMB memory/stack/branch families and ARM transfer/block/multiply coverage, then target hardware/Dolphin validation and profiling.
+ 
+-1. Finish the handler-specific semantics/cycle inventory and define pipeline-preserving native/fallback boundaries, including self-modifying prefetched code.
+-2. Freeze JitContext offsets, register/spill contract, CPU identity and global-domain budget contract. Preserve the interpreter untouched behind an off-switch.
+-3. Implement the fixed arena, coherent publication, trampoline and a one-instruction native path; compare that path against the actual interpreter before extending blocks.
+-4. Add alias-aware invalidation before enabling native stores. Validate mirrored RAM writes, ARM7-to-ARM9 writes, DMA, TCM, VRAM remaps and save-state reloads.
+-5. Implement all required THUMB families and ARM families incrementally, deriving legality from the pinned dispatch tables. Use interpreter exits for unresolved corner cases.
+-6. Add lockstep with isolated/replayable memory effects and first-mismatch logging. Do not run MMIO twice against one live Core.
+-7. Verify both off-switches, Wii/Dolphin ROM tests, then GameCube platform support and hardware cache coherency. Measure performance only after correctness gates pass.
++The original interpreter ALU/transfer/branch implementations were not changed. GPL license and attributions are retained. The historical stage-1 report is `WORK_REPORT_STAGE1.md`.
+diff --git a/docs/jit/WORK_REPORT_STAGE1.md b/docs/jit/WORK_REPORT_STAGE1.md
+new file mode 100644
+index 0000000..b9265ee
+--- /dev/null
++++ b/docs/jit/WORK_REPORT_STAGE1.md
+@@ -0,0 +1,124 @@
++# NooDS-Wii ARM/THUMB → PPC JIT: foundation delivery
++
++## Status: partial — NOT the requested finished recompiler
++
++This package does **not** add a functioning JIT to NooDS-Wii. It provides the first verification layer: a PPC encoder, bounded staging writer, independent assembler oracle, executable PPC flag probes, dispatch extraction, source review, and a build-time source exclusion switch. It has no translated guest instruction blocks, no runtime JIT dispatcher and no speedup. It does not yet meet or exceed VBA-GX functionality.
++
++Do not deploy or describe this as a completed ARMv4/v5 recompiler. The emulator still runs its original interpreter. A source build passing is not a JIT correctness result.
++
++## Sources and authorization
++
++- NooDS-Wii base: `1c995b48c37ebf3645646968c416958f79264137`.
++- VBA-GX comparison base: `5db68c4e1c908b0c79b5f589b7a82e88a3dff1b2`.
++- Read the supplied AGENTS.md and SKILL.md before changes.
++- The user explicitly authorized direct implementation in place of delegated coding; no agent CLI was installed and no API credentials were requested or used.
++- Local feature branch: `feature/arm-ppc-jit`. No remote push or PR was made.
++- No VBA-GX implementation was vendored. Interpreter arithmetic expressions in the probe come from the pinned GPL-licensed NooDS-Wii source. New source carries GPL-3.0-or-later identifiers; the original LICENSE accompanies the bundle.
++
++## Files
++
++### Additive production-source foundation
++
++- `NooDS-Wii/jit_ppc_emitter.h`
++- `NooDS-Wii/jit_ppc_emitter.cpp`
++
++The encoder supports 32-bit 750-family arithmetic, carry/overflow variants, logical operations, shifts/rotates, comparisons, D-form and byte-reversed memory accesses, CR/SPR moves and relative/indirect branches. It has no AltiVec, isel, popcntb or 64-bit host instructions. The bounded Writer refuses overflow and invalid branch ranges, uses instruction-relative offsets, leaves invalid branch outputs untouched, and latches write failure. This is a staging buffer, not an executable code allocator.
++
++### Tests and analysis
++
++- `tools/jit_asm_oracle.cpp`: encoder vectors and writer boundary checks.
++- `tools/run_jit_asm_oracle.sh`: assemble with GNU PPC binutils, extract raw .text and compare big-endian words. Does not parse objdump text.
++- `tests/jit_flag_probe.cpp`: builds small functions from the emitter and actually executes them in a PPC Linux process under QEMU.
++- `tools/run_jit_flag_probe.sh`: static PPC build and qemu-ppc 750 execution.
++- `tools/jit_extract_semantics.py`: checks dispatch-table sizes and generates name ranges, JSON and a return-expression inventory.
++- `tools/jit_validate_dol.py`: basic DOL section/entry validation; not a runtime test.
++- `docs/jit/SEMANTICS.md`: reviewed pipeline, flags, timing, scheduling, memory/alias and ABI issues.
++- `docs/jit/*dispatch*`, `source-return-index.md`: generated review aids.
++- `verification/`: exact build/test logs and ELF/DOL check outputs.
++
++### Existing-file change
++
++`Makefile`: adds `NOODS_JIT ?= 1`. `make NOODS_JIT=0` excludes `NooDS-Wii/jit_*.cpp` and adds `-DNOODS_NO_JIT`. It does not add a runtime setting. Both modes currently use only the interpreter.
++
++## Verified
++
++1. Installed devkitPPC via the official `devkitpro/devkitppc` Docker Hub image using SHA-256-checked layers. Compiler reported **16.1.0**. Installed Debian PPC Linux binutils/compiler and qemu-user-static for independent probes.
++2. Built the **unmodified baseline** successfully.
++3. Encoder oracle: **121 independently assembled vectors passed**. Writer overflow/patch/range checks passed.
++4. Generated PPC arithmetic/flag functions: **324,576 cases passed** against copied interpreter expressions. Cases include all pairs of 16 boundary operands with all 16 old NZCV combinations for each of six operations, plus 50,000 deterministic random cases per operation. Entire result words and CPSR words were compared.
++5. Extracted 4,096 ARM dispatch entries / 525 distinct handlers and 1,024 THUMB entries / 78 distinct handlers.
++6. Clean build with the new encoder included as an input object: compile, link and elf2dol succeeded.
++7. Clean `make NOODS_JIT=0` build succeeded, with no encoder object produced and no JitPpc symbols in the executable.
++8. Both resulting DOLs passed basic structural validation; ELF and DOL entry were **0x80003f00**. The Makefile names its artifact `NooDS-Wii.dol`, not `boot.dol`; it can be renamed for the Homebrew Channel. No binary is included in this source-only bundle.
++
++The linker garbage-collects unused encoder functions in the default build because no runtime JIT calls them yet. Equal binary sizes for enabled/disabled foundation builds are therefore expected, not evidence that a runtime JIT switch works.
++
++The initial oracle invocation used a GNU assembler target flag (`-m750`) unsupported by the installed assembler. It was corrected to `-mgekko`; the reported passing result is from the corrected script. The initial enabled-symbol check also stopped when the linker discarded unused encoder code; verification was corrected to inspect the input object and document the lack of runtime references.
++
++## Source-level findings, not full emulator verification
++
++See SEMANTICS.md for details:
++
++- Handler-time `pipeline[0]` contains the next prefetched instruction, not the current opcode saved by runOpcode.
++- Native execution must respect already-prefetched bytes when stores modify upcoming instructions; invalidating blocks alone does not settle pipeline equivalence.
++- Timing differs from several shortcuts in the briefing. ARM9 THUMB MUL returns 4, while ARM MUL returns 2. ARM7 multiply timing uses the source's significance tests.
++- Stored ARM7 deadlines are already in the global scheduling domain after the run loop applies `<< 1`.
++- The pinned RSCS handler preserves old C/V before OR-ing computed C/V. The probe deliberately preserves this interpreter quirk.
++- Several load families differ in whether a PC load updates T; a single universal PC-load rule is unsafe.
++- Physical memory mirrors and cross-CPU aliases must be invalidated, not only the virtual address used by a write.
++- The repo is a Wii build. Gekko-compatible instruction words alone do not establish GameCube platform support.
++
++## Written but not verified on target hardware
++
++- All encoder code is compiled for PPC and checked against GNU assembly, but Wii/GCN execution and actual D-cache/I-cache publication have not been tested.
++- The source review identifies integration requirements; it is not a complete handler-by-handler cycle specification or proof of SMC correctness.
++- DOL structure and entry checks do not prove the emulator boots or runs a ROM correctly.
++
++## Not started / remaining acceptance criteria
++
++| Requirement | Current status |
++|---|---|
++| ARM native translator: ALU/shifter, branches, transfers, LDM/STM, multiplies | Not implemented |
++| THUMB native translator at VBA-GX parity | Not implemented |
++| Runtime dispatcher, interpreter fallback boundary and HLE exits | Not implemented |
++| ABI trampoline, context offsets, shared epilogue, register contract | Not implemented |
++| Fixed 2/4 MB executable arena and PPC cache publication | Not implemented |
++| Page buckets, alias-aware SMC invalidation, remap/reset/state-load hooks | Not implemented |
++| Native memory accesses and slow-path side-effect exits | Not implemented |
++| Exact block-cycle accounting, dual-CPU scheduling and budget exits | Not implemented |
++| Runtime `Settings::jitEnabled` / noods.ini switch | Not implemented |
++| Build-time `NOODS_JIT=0` exclusion | Implemented and build-tested |
++| Emulator lockstep r0-r15/CPSR/cycles/memory differential tests | Not implemented |
++| Wii hardware / Dolphin / GameCube tests | Not run |
++| Before/after FPS / comparison against VBA-GX | Not measured |
++
++No empty `jit_compiler_arm.cpp`, `jit_compiler_thumb.cpp`, `jit_cache.cpp` or trampoline stubs are supplied: those names would suggest an implementation that does not exist.
++
++## Reproduce
++
++From the pinned repository with the overlay applied:
++
++```sh
++bash tools/run_jit_asm_oracle.sh
++bash tools/run_jit_flag_probe.sh
++python3 tools/jit_extract_semantics.py
++source /home/user/wii-env.sh
++make clean && make -j4
++python3 tools/jit_validate_dol.py NooDS-Wii.dol
++make clean && make NOODS_JIT=0 -j4
++python3 tools/jit_validate_dol.py NooDS-Wii.dol
++```
++
++The host tests require g++, Python 3, powerpc-linux-gnu-as/objcopy/g++, and qemu-ppc-static. Wii builds require devkitPPC/libogc and the port libraries used by the original repo. The supplied environment script exports paths; this repo already defines platform flags in its Makefile. `/opt/devkitpro` is not a persisted workspace deliverable: the bootstrap script and layer manifest are included separately for reproducibility. Re-running the bootstrap's `latest` tag can select newer toolchain versions; the archived manifest identifies the layers used for this run.
++
++Always clean when switching NOODS_JIT or editing headers: the upstream Makefile does not track header dependencies or flag changes. No claim is made for a no-clean toggle.
++
++## Recommended continuation order
++
++1. Finish the handler-specific semantics/cycle inventory and define pipeline-preserving native/fallback boundaries, including self-modifying prefetched code.
++2. Freeze JitContext offsets, register/spill contract, CPU identity and global-domain budget contract. Preserve the interpreter untouched behind an off-switch.
++3. Implement the fixed arena, coherent publication, trampoline and a one-instruction native path; compare that path against the actual interpreter before extending blocks.
++4. Add alias-aware invalidation before enabling native stores. Validate mirrored RAM writes, ARM7-to-ARM9 writes, DMA, TCM, VRAM remaps and save-state reloads.
++5. Implement all required THUMB families and ARM families incrementally, deriving legality from the pinned dispatch tables. Use interpreter exits for unresolved corner cases.
++6. Add lockstep with isolated/replayable memory effects and first-mismatch logging. Do not run MMIO twice against one live Core.
++7. Verify both off-switches, Wii/Dolphin ROM tests, then GameCube platform support and hardware cache coherency. Measure performance only after correctness gates pass.
+diff --git a/tests/jit_abi_probe.s b/tests/jit_abi_probe.s
+new file mode 100644
+index 0000000..7d15143
+--- /dev/null
++++ b/tests/jit_abi_probe.s
+@@ -0,0 +1,129 @@
++# SPDX-License-Identifier: GPL-3.0-or-later
++.text
++.align 2
++.globl jitAbiProbe
++.type jitAbiProbe,@function
++jitAbiProbe:
++ stwu 1,-112(1)
++ mflr 0
++ stw 0,92(1)
++ mfcr 0
++ stw 0,88(1)
++ stw 2,96(1)
++ stw 13,100(1)
++ stw 14,16(1)
++ li 14,4622
++ stw 15,20(1)
++ li 15,4623
++ stw 16,24(1)
++ li 16,4624
++ stw 17,28(1)
++ li 17,4625
++ stw 18,32(1)
++ li 18,4626
++ stw 19,36(1)
++ li 19,4627
++ stw 20,40(1)
++ li 20,4628
++ stw 21,44(1)
++ li 21,4629
++ stw 22,48(1)
++ li 22,4630
++ stw 23,52(1)
++ li 23,4631
++ stw 24,56(1)
++ li 24,4632
++ stw 25,60(1)
++ li 25,4633
++ stw 26,64(1)
++ li 26,4634
++ stw 27,68(1)
++ li 27,4635
++ stw 28,72(1)
++ li 28,4636
++ stw 29,76(1)
++ li 29,4637
++ stw 30,80(1)
++ li 30,4638
++ stw 31,84(1)
++ li 31,4639
++ lis 0,0xA5A5
++ ori 0,0,0x5A5A
++ mtcr 0
++ bl jitEnter
++ mfcr 5
++ lis 6,0xA5A5
++ ori 6,6,0x5A5A
++ li 3,1
++ cmpw 5,6
++ bne 1f
++ lwz 5,96(1)
++ cmpw 2,5
++ bne 1f
++ lwz 5,100(1)
++ cmpw 13,5
++ bne 1f
++ cmpwi 14,4622
++ bne 1f
++ cmpwi 15,4623
++ bne 1f
++ cmpwi 16,4624
++ bne 1f
++ cmpwi 17,4625
++ bne 1f
++ cmpwi 18,4626
++ bne 1f
++ cmpwi 19,4627
++ bne 1f
++ cmpwi 20,4628
++ bne 1f
++ cmpwi 21,4629
++ bne 1f
++ cmpwi 22,4630
++ bne 1f
++ cmpwi 23,4631
++ bne 1f
++ cmpwi 24,4632
++ bne 1f
++ cmpwi 25,4633
++ bne 1f
++ cmpwi 26,4634
++ bne 1f
++ cmpwi 27,4635
++ bne 1f
++ cmpwi 28,4636
++ bne 1f
++ cmpwi 29,4637
++ bne 1f
++ cmpwi 30,4638
++ bne 1f
++ cmpwi 31,4639
++ bne 1f
++ li 3,0
++1:
++ lwz 14,16(1)
++ lwz 15,20(1)
++ lwz 16,24(1)
++ lwz 17,28(1)
++ lwz 18,32(1)
++ lwz 19,36(1)
++ lwz 20,40(1)
++ lwz 21,44(1)
++ lwz 22,48(1)
++ lwz 23,52(1)
++ lwz 24,56(1)
++ lwz 25,60(1)
++ lwz 26,64(1)
++ lwz 27,68(1)
++ lwz 28,72(1)
++ lwz 29,76(1)
++ lwz 30,80(1)
++ lwz 31,84(1)
++ lwz 0,88(1)
++ mtcr 0
++ lwz 0,92(1)
++ mtlr 0
++ addi 1,1,112
++ blr
++.size jitAbiProbe,.-jitAbiProbe
++.section .note.GNU-stack,"",@progbits
+diff --git a/tests/jit_native_test.cpp b/tests/jit_native_test.cpp
+new file mode 100644
+index 0000000..9fc14d6
+--- /dev/null
++++ b/tests/jit_native_test.cpp
+@@ -0,0 +1,77 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++#include "../NooDS-Wii/jit.h"
++#include "../NooDS-Wii/jit_compiler.h"
++#include "../NooDS-Wii/jit_cache.h"
++#include <sys/mman.h>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++extern "C" int jitReference(JitContext *,uint32_t,bool,bool);
++extern "C" int jitAbiProbe(JitEntry,JitContext *);
++static uint32_t rng=0x517493A7;
++static uint32_t randomWord() { rng^=rng<<13; rng^=rng>>17; rng^=rng<<5; return rng; }
++static const uint32_t edge[]={0,1,2,31,32,33,63,64,127,128,255,256,257,0x7FFFFFFF,0x80000000,0xFFFFFFFF};
++static unsigned long cases=0,armAccepted=0,thumbAccepted=0;
++static void run(JitEntry entry,uint32_t opcode,bool thumb,unsigned samples) {
++    for (unsigned sample=0;sample<samples;sample++) for (unsigned arm7=0;arm7<2;arm7++) {
++        JitContext native{};
++        for (unsigned r=0;r<16;r++) native.regs[r]=sample<16?edge[(sample+r)%16]:randomWord();
++        // Exercise every old-NZCV combination and deliberately varied low CPSR bits.
++        native.cpsr=(sample<16 ? sample<<28 : randomWord()&0xF0000000)|0x080000DF|(thumb?32:0);
++        JitContext reference=native;
++        if (jitReference(&reference,opcode,thumb,arm7)<0) {
++            std::printf("BAD_ALLOWLIST opcode=%08x thumb=%u\n",opcode,thumb); std::exit(1);
++        }
++        if (jitAbiProbe(entry,&native)) { std::puts("ABI_FAILURE"); std::exit(1); }
++        bool equal=native.cpsr==reference.cpsr && native.cycles==reference.cycles;
++        for (unsigned r=0;r<16;r++) equal &= native.regs[r]==reference.regs[r];
++        if (!equal) {
++            std::printf("NATIVE_FAIL op=%08x thumb=%u arm7=%u sample=%u cpsr=%08x/%08x cycles=%u/%u\n",
++                opcode,thumb,arm7,sample,native.cpsr,reference.cpsr,native.cycles,reference.cycles);
++            for(unsigned r=0;r<16;r++) std::printf("r%u=%08x/%08x\n",r,native.regs[r],reference.regs[r]);
++            std::exit(1);
++        }
++        cases++;
++    }
++}
++int main() {
++    void *memory=mmap(nullptr,4096,PROT_READ|PROT_WRITE|PROT_EXEC,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
++    if(memory==MAP_FAILED) { std::perror("mmap"); return 1; }
++    uint32_t *code=static_cast<uint32_t*>(memory);
++    auto check=[&](uint32_t op,bool thumb,unsigned samples) {
++        JitPpc::Writer w(code,1024);
++        bool accepted=thumb?Jit::compileThumb(w,op):Jit::compileArm(w,op);
++        if(!accepted) { if(w.size()) { std::puts("REJECT_EMITTED_CODE"); std::exit(1); } return; }
++        if(!w.good()) std::abort();
++        if(thumb) thumbAccepted++; else armAccepted++;
++        __builtin___clear_cache(static_cast<char*>(memory),static_cast<char*>(memory)+w.size()*4);
++        run(reinterpret_cast<JitEntry>(memory),op,thumb,samples);
++    };
++    // Every THUMB encoding, including rejection of all unknown/branch/memory ops.
++    for(unsigned op=0;op<65536;op++) check(op,true,20);
++    // Every ARM dispatch slot with independent register/immediate low fields.
++    for(unsigned slot=0;slot<4096;slot++) for(unsigned sample=0;sample<16;sample++) {
++        uint32_t op=0xE0000000u|((slot&0xFF0)<<16)|((slot&15)<<4);
++        op|=randomWord()&0x000FFF0Fu;
++        check(op,false,20);
++    }
++    // Broader randomized ARM fields, conditions and shift amounts.
++    for(unsigned i=0;i<60000;i++) check(randomWord(),false,8);
++    // Content-addressed cache: exact opcode changes, CPU/ISA keys, negatives,
++    // collisions and arena wrap are exercised with a tiny arena in this test.
++    for(unsigned i=0;i<16000;i++) {
++        uint32_t op=0xE2800000u|(randomWord()&0x000EEFFFu);
++        JitEntry entry=Jit::lookup(op,false,i&1);
++        if(!entry) continue;
++        if(Jit::lookup(op,false,i&1)!=entry) std::abort();
++        run(entry,op,false,1);
++        if(Jit::lookup(0xE12FFF1Eu,false,false)) std::abort(); // BX must fall back.
++        if(Jit::lookup(0x10000u,true,false)) std::abort();
++    }
++    auto stats=Jit::cacheStats();
++    if(!stats.hits || !stats.flushes || !stats.rejected) std::abort();
++    std::printf("NATIVE_ORACLE_OK: %lu states; %lu THUMB encodings; %lu ARM candidates accepted\n",cases,thumbAccepted,armAccepted);
++    std::printf("CACHE_OK: hits=%u misses=%u compiled=%u flushes=%u rejected=%u\n",stats.hits,stats.misses,stats.compiles,stats.flushes,stats.rejected);
++    std::puts("ABI_OK: r14-r31, r2/r13 and full CR checked on every invocation");
++    munmap(memory,4096);
++}
+diff --git a/tests/jit_pipeline_test.inc b/tests/jit_pipeline_test.inc
+new file mode 100644
+index 0000000..89dc127
+--- /dev/null
++++ b/tests/jit_pipeline_test.inc
+@@ -0,0 +1,84 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++// Appended by jit_make_pipeline_test.py to the extracted execution code.
++static void fail(const char *text,uint32_t op) {
++    std::printf("PIPELINE_FAIL %s opcode=%08x\n",text,op); std::exit(1);
++}
++static void prepare(Interpreter &cpu,Core &core,uint32_t op,bool thumb,unsigned flags,bool unmapped,bool banked) {
++    unsigned width=thumb?2:4, address=4096-2*width;
++    if(banked) for(unsigned i=8;i<15;i++) cpu.registers[i]=&cpu.registersFiq[i-8];
++    for(unsigned i=0;i<15;i++) *cpu.registers[i]=0x78123456u+i*0x234567u;
++    cpu.cpsr=(flags<<28)|0xDF|(thumb?32:0);
++    cpu.cycles=0x123456; cpu.halted=0; cpu.dsiCycle=true;
++    *cpu.registers[15]=address+width;
++    cpu.pipeline[0]=op;
++    cpu.pipeline[1]=thumb ? 0x2112 : 0xE3A01012; // Prefetched MOV r1,#18.
++    // Memory deliberately differs from both prefetched instructions.
++    std::memset(core.memory.bytes,0xA5,sizeof(core.memory.bytes));
++    cpu.pcData=core.memory.bytes+address+width;
++    if(unmapped) {
++        core.memory.readMap9A[1]=nullptr; core.memory.readMap7[1]=nullptr;
++    }
++}
++int main() {
++    const uint32_t armOps[]={0xE3A02037,0xE2911001,0xE0812413,0xE1A002E3,0xE1A00263,
++        0xE2F11001,0xE0202391,0xE08000AF,0xE12FFF1E,0xFF000000};
++    const uint32_t thumbOps[]={0x2000,0x3101,0x1C89,0x4088,0x41C8,0x4248,0xB081,0x4508,
++        0x4348,0xDE00,0x4770};
++    unsigned checks=0;
++    for(unsigned thumb=0;thumb<2;thumb++) for(unsigned arm7=0;arm7<2;arm7++)
++    for(unsigned mapping=0;mapping<2;mapping++) for(unsigned banked=0;banked<2;banked++)
++    for(unsigned nzcv=0;nzcv<16;nzcv++) for(unsigned cond=0;cond<(thumb?1:16);cond++) {
++        unsigned count=thumb?sizeof(thumbOps)/4:sizeof(armOps)/4;
++        for(unsigned i=0;i<count;i++) {
++            uint32_t opcode=thumb?thumbOps[i]:((armOps[i]&0x0FFFFFFF)|(cond<<28));
++            Core ca,cb;
++            Interpreter reference(&ca,arm7),native(&cb,arm7);
++            prepare(reference,ca,opcode,thumb,nzcv,mapping,banked);
++            prepare(native,cb,opcode,thumb,nzcv,mapping,banked);
++            for(unsigned step=0;step<2;step++) {
++                unsigned f=fallbackCalls,h=reservedCalls;
++                Settings::jitEnabled=0; int expected=reference.runOpcode();
++                unsigned expectedFallback=fallbackCalls-f,expectedReserved=reservedCalls-h;
++                f=fallbackCalls;h=reservedCalls;
++                Settings::jitEnabled=1; int actual=native.runOpcode();
++                if(actual!=expected || native.cpsr!=reference.cpsr) fail("cycles/flags",opcode);
++                for(unsigned r=0;r<16;r++) if(*native.registers[r]!=*reference.registers[r]) fail("register",opcode);
++                if(std::memcmp(native.pipeline,reference.pipeline,sizeof(native.pipeline))) fail("prefetch",opcode);
++                if(ca.memory.reads!=cb.memory.reads) fail("read side effect",opcode);
++                if((native.pcData==nullptr)!=(reference.pcData==nullptr)) fail("pointer null",opcode);
++                if(native.pcData && native.pcData-cb.memory.bytes!=reference.pcData-ca.memory.bytes) fail("pointer offset",opcode);
++                if(native.cycles!=reference.cycles || native.halted!=reference.halted || native.dsiCycle!=reference.dsiCycle) fail("scheduler fields",opcode);
++                if(fallbackCalls-f!=expectedFallback || reservedCalls-h!=expectedReserved) fail("fallback count",opcode);
++                checks++;
++            }
++        }
++    }
++#ifndef NOODS_NO_JIT
++    auto stats=Jit::cacheStats();
++#ifdef JIT_TEST_ALLOC_FAIL
++    if(stats.compiles || !stats.misses) fail("OOM cache state",0);
++    std::puts("OOM_FALLBACK_OK: all native allocations denied; reference execution preserved");
++#else
++    if(!stats.compiles || !stats.hits || !stats.rejected) fail("no cache activity",0);
++#endif
++#ifdef JIT_DIFFTEST
++    // Intentionally corrupt a REFERENCE dispatch slot to test first-mismatch
++    // reporting, reference-state retention and permanent native disablement.
++    Core core; Interpreter cpu(&core,false);
++    prepare(cpu,core,0xE3A02037,false,0,false,false);
++    Interpreter::armInstrs[0x3A3]=&Interpreter::unkArm; // MOV immediate index for 0x37
++    uint32_t savedR0=*cpu.registers[0],savedR2=*cpu.registers[2];
++    int cycles=-1;
++    if(!Jit::execute(cpu,0xE3A02037,false,cycles) || cycles!=3) fail("fault result",0);
++    if(*cpu.registers[0]!=(savedR0^0xE3A02037u) || *cpu.registers[2]!=savedR2) fail("reference state not retained",0);
++    int unused=99;
++    if(Jit::execute(cpu,0xE3A01012,false,unused) || unused!=99) fail("fault not latched",0);
++    FILE *log=std::fopen("sd:/noods/jit_log.txt","r");
++    if(!log) fail("no mismatch log",0);
++    char text[512]={};std::fread(text,1,sizeof(text)-1,log);std::fclose(log);
++    if(!std::strstr(text,"opcode=e3a02037")) fail("mismatch log content",0);
++    std::puts("DIFFTEST_FAULT_OK: injected mismatch logged; reference retained; native disabled");
++#endif
++#endif
++    std::printf("PIPELINE_OK: %u step comparisons; runtime toggle, condition checks, banked pointers, page crossings and prefetched stale bytes\n",checks);
++}
+diff --git a/tools/jit_generate_decode.py b/tools/jit_generate_decode.py
+new file mode 100755
+index 0000000..74f7d93
+--- /dev/null
++++ b/tools/jit_generate_decode.py
+@@ -0,0 +1,29 @@
++#!/usr/bin/env python3
++"""Generate the native ALU allowlist from the real ARM dispatch table.
++Check this file into source control; run with --check to reject table drift.
++"""
++import pathlib,re,sys,hashlib
++root=pathlib.Path(__file__).resolve().parent.parent
++raw=(root/'NooDS-Wii/interpreter_lookup.cpp').read_text()
++body=re.search(r'Interpreter::armInstrs\[\]\)\(uint32_t\)\s*=\s*\{(.*?)\};',raw,re.S).group(1)
++body=re.sub(r'//[^\n]*','',body)
++names=re.findall(r'&Interpreter::(\w+)',body)
++assert len(names)==4096
++pairs=[('_and','ands'),('eor','eors'),('sub','subs'),('rsb','rsbs'),('add','adds'),('adc','adcs'),('sbc','sbcs'),('rsc','rscs'),(None,'tst'),(None,'teq'),(None,'cmp'),(None,'cmn'),('orr','orrs'),('mov','movs'),('bic','bics'),('mvn','mvns')]
++classes={}
++for op,pair in enumerate(pairs):
++ for flag,base in enumerate(pair):
++  if base:
++   for suffix in ['Lli','Llr','Lri','Lrr','Ari','Arr','Rri','Rrr','Imm']:
++    classes[base+suffix]=op*2+flag+1
++values=[classes.get(n,0) for n in names]
++text='// SPDX-License-Identifier: GPL-3.0-or-later\n// Generated by tools/jit_generate_decode.py; do not edit.\n'
++text+='// Dispatch-name SHA256: '+hashlib.sha256('\n'.join(names).encode()).hexdigest()+'\n'
++text+='static const uint8_t armAluClass[4096] = {\n'
++text+=''.join('    '+', '.join(str(x) for x in values[i:i+16])+',\n' for i in range(0,len(values),16))
++text+='};\n'
++path=root/'NooDS-Wii/jit_decode_arm.inc'
++if '--check' in sys.argv:
++ if not path.exists() or path.read_text()!=text: raise SystemExit('ARM decode table drift; regenerate/review')
++else:path.write_text(text)
++print('ARM_DECODE_OK:',sum(x!=0 for x in values),'native-eligible table slots (PC operands still excluded)')
+diff --git a/tools/jit_make_pipeline_test.py b/tools/jit_make_pipeline_test.py
+new file mode 100755
+index 0000000..899efb3
+--- /dev/null
++++ b/tools/jit_make_pipeline_test.py
+@@ -0,0 +1,56 @@
++#!/usr/bin/env python3
++"""Use exact runOpcode/getOpcode source with a small test memory backend.
++This tests integration boundaries, NOT the full Core/event queue/MMIO system.
++"""
++import pathlib,re,sys
++root=pathlib.Path(__file__).resolve().parent.parent
++out=pathlib.Path(sys.argv[1])
++lookup=(root/'NooDS-Wii/interpreter_lookup.cpp').read_text()
++interpreter=(root/'NooDS-Wii/interpreter.cpp').read_text()
++alu=(root/'NooDS-Wii/interpreter_alu.cpp').read_text()
++methods=set(re.findall(r'int Interpreter::(\w+)\(uint(?:16|32)_t opcode',alu))
++for name in re.findall(r'^ALU_FUNCS\((\w+),',alu,re.M):
++ for suffix in ['Lli','Llr','Lri','Lrr','Ari','Arr','Rri','Rrr','Imm']:methods.add(name+suffix)
++s='#include "'+str(root/'NooDS-Wii/jit.h')+'"\n'
++s+='#define private public\n#include "'+str(root/'NooDS-Wii/interpreter.h')+'"\n#undef private\n'
++s+='#include "'+str(root/'NooDS-Wii/settings.h')+'"\n'
++s+='#include "'+str(root/'NooDS-Wii/jit_cache.h')+'"\n'
++s+='''#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <cstddef>
++struct TestMemory {
++ alignas(32) uint8_t bytes[8192] = {};
++ uint8_t *readMap9A[2] = {bytes,bytes+4096};
++ uint8_t *readMap7[2] = {bytes,bytes+4096};
++ unsigned reads=0;
++ template<typename T> T read(bool,uint32_t address) {
++  ++reads; if(address+sizeof(T)>sizeof(bytes)) std::abort();
++  T v=0; for(unsigned i=0;i<sizeof(T);i++) v|=uint32_t(bytes[address+i])<<(8*i);
++  return v;
++ }
++};
++class Core { public: TestMemory memory; };
++int Settings::jitEnabled=0;
++static unsigned fallbackCalls=0,reservedCalls=0;
++int Interpreter::unkArm(uint32_t opcode) { ++fallbackCalls; *registers[0]^=opcode; return 3; }
++int Interpreter::unkThumb(uint16_t opcode) { ++fallbackCalls; *registers[0]^=opcode; return 3; }
++int Interpreter::handleReserved(uint32_t) { ++reservedCalls; return 7; }
++'''
++for mode,bits,length in [('arm',32,4096),('thumb',16,1024)]:
++ body=re.search(r'Interpreter::'+mode+r'Instrs\[\]\)\(uint'+str(bits)+r'_t\)\s*=\s*\{(.*?)\};',lookup,re.S).group(1)
++ names=re.findall(r'&Interpreter::(\w+)',re.sub(r'//[^\n]*','',body));assert len(names)==length
++ fallback='unkArm' if mode=='arm' else 'unkThumb'
++ s+=f'int (Interpreter::*Interpreter::{mode}Instrs[{length}])(uint{bits}_t) = {{\n'
++ s+=''.join('&Interpreter::'+(name if name in methods else fallback)+',\n' for name in names)+'};\n'
++m=re.search(r'const uint8_t Interpreter::condition\[256\]\s*=\s*\{.*?\};',lookup,re.S);s+=m.group(0)+'\n'
++for prefix in ['FORCE_INLINE int Interpreter::runOpcode()', 'uint16_t Interpreter::getOpcode16()', 'uint32_t Interpreter::getOpcode32()']:
++ start=interpreter.index(prefix);brace=interpreter.index('{',start);depth=1;end=brace+1
++ while depth:
++  if interpreter[end]=='{':depth+=1
++  elif interpreter[end]=='}':depth-=1
++  end+=1
++ s+=interpreter[start:end]+'\n'
++s+=(root/'tests/jit_pipeline_test.inc').read_text()
++(out/'pipeline.cpp').write_text(s)
++print('PIPELINE_SOURCE_OK: exact runOpcode/getOpcode bodies and condition table; instrumented memory/fallbacks')
+diff --git a/tools/jit_make_test_oracle.py b/tools/jit_make_test_oracle.py
+new file mode 100755
+index 0000000..c9fc862
+--- /dev/null
++++ b/tools/jit_make_test_oracle.py
+@@ -0,0 +1,44 @@
++#!/usr/bin/env python3
++"""Build a test-only oracle from the ACTUAL interpreter ALU translation unit.
++Only its core.h include is substituted. Handler bodies/macros remain unchanged.
++PC/mode-change methods abort if a supposed pure leaf unexpectedly calls them.
++"""
++import pathlib,re,sys,json
++root=pathlib.Path(__file__).resolve().parent.parent
++out=pathlib.Path(sys.argv[1]); out.mkdir(parents=True,exist_ok=True)
++alu=(root/'NooDS-Wii/interpreter_alu.cpp').read_text()
++header='#include "'+str(root/'NooDS-Wii/jit.h')+'"\n#define private public\n#include "'+str(root/'NooDS-Wii/interpreter.h')+'"\n#undef private\n'
++(out/'actual_alu.cpp').write_text(alu.replace('#include "core.h"',header))
++lookup=(root/'NooDS-Wii/interpreter_lookup.cpp').read_text()
++explicit=set(re.findall(r'int Interpreter::(\w+)\(uint(?:16|32)_t opcode',alu))
++for name in re.findall(r'^ALU_FUNCS\((\w+),',alu,re.M):
++ for suffix in ['Lli','Llr','Lri','Lrr','Ari','Arr','Rri','Rrr','Imm']:explicit.add(name+suffix)
++s=header+'''#include <cstdlib>
++Interpreter::Interpreter(Core *core, bool arm7): core(core), arm7(arm7) {
++    for (unsigned i=0;i<32;i++) registers[i]=&registersUsr[i&15];
++}
++void Interpreter::flushPipeline() { std::abort(); }
++void Interpreter::setCpsr(uint32_t,bool) { std::abort(); }
++'''
++for mode,bits,mask in [('arm',32,'((op>>16)&0xFF0)|((op>>4)&15)'),('thumb',16,'(op>>6)&1023')]:
++ body=re.search(r'Interpreter::'+mode+r'Instrs\[\]\)\(uint'+str(bits)+r'_t\)\s*=\s*\{(.*?)\};',lookup,re.S).group(1)
++ names=re.findall(r'&Interpreter::(\w+)',re.sub(r'//[^\n]*','',body))
++ groups={}
++ for i,name in enumerate(names):
++  if name in explicit:groups.setdefault(name,[]).append(i)
++ s+=f'static int {mode}Reference(Interpreter &cpu,uint32_t op) {{\n switch ({mask}) {{\n'
++ for name,indices in groups.items():
++  s+=' '.join(f'case {i}:' for i in indices)+f' return cpu.{name}(op);\n'
++ s+='default: return -1;\n }\n}\n'
++s+='''extern "C" int jitReference(JitContext *context,uint32_t opcode,bool thumb,bool arm7) {
++    Interpreter cpu(nullptr,arm7);
++    for(unsigned i=0;i<16;i++) *cpu.registers[i]=context->regs[i];
++    cpu.cpsr=context->cpsr;
++    int result=thumb?thumbReference(cpu,opcode):armReference(cpu,opcode);
++    for(unsigned i=0;i<16;i++) context->regs[i]=*cpu.registers[i];
++    context->cpsr=cpu.cpsr; context->cycles=result;
++    return result;
++}
++'''
++(out/'reference.cpp').write_text(s)
++print('ORACLE_GENERATED: actual interpreter_alu.cpp, dispatch-derived reference calls')
+diff --git a/tools/run_jit_native_tests.sh b/tools/run_jit_native_tests.sh
+new file mode 100755
+index 0000000..3ef8b2d
+--- /dev/null
++++ b/tools/run_jit_native_tests.sh
+@@ -0,0 +1,22 @@
++#!/usr/bin/env bash
++set -euo pipefail
++cd "$(dirname "$0")/.."
++work=$(mktemp -d)
++trap 'rm -rf "$work"' EXIT
++python3 tools/jit_generate_decode.py --check
++python3 tools/jit_make_test_oracle.py "$work"
++oracle=powerpc-linux-gnu-g++
++oracle_flags=(-O2 -mcpu=750 -DENDIAN_BIG -ffunction-sections -fdata-sections)
++if [ "${JIT_ORACLE_DEVKIT:-0}" = 1 ]; then
++    oracle=powerpc-eabi-g++
++    oracle_flags+=(-meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions)
++fi
++echo "ORACLE_COMPILER: $oracle"
++"$oracle" "${oracle_flags[@]}" -c "$work/actual_alu.cpp" -o "$work/actual_alu.o"
++powerpc-linux-gnu-g++ -std=c++11 -O2 -static -mcpu=750 -DENDIAN_BIG -DJIT_TEST -DJIT_CACHE_BYTES=4096 \
++    -ffunction-sections -fdata-sections -Wl,--gc-sections \
++    tests/jit_native_test.cpp tests/jit_abi_probe.s "$work/actual_alu.o" "$work/reference.cpp" \
++    NooDS-Wii/jit_ppc_emitter.cpp NooDS-Wii/jit_compiler_common.cpp \
++    NooDS-Wii/jit_compiler_arm.cpp NooDS-Wii/jit_compiler_thumb.cpp \
++    NooDS-Wii/jit_trampoline.cpp NooDS-Wii/jit_cache.cpp -o "$work/native"
++qemu-ppc-static -cpu 750 "$work/native"
+diff --git a/tools/run_jit_pipeline_tests.sh b/tools/run_jit_pipeline_tests.sh
+new file mode 100755
+index 0000000..0108cb5
+--- /dev/null
++++ b/tools/run_jit_pipeline_tests.sh
+@@ -0,0 +1,27 @@
++#!/usr/bin/env bash
++set -euo pipefail
++cd "$(dirname "$0")/.."
++root=$PWD
++work=$(mktemp -d)
++trap 'rm -rf "$work"' EXIT
++python3 tools/jit_make_test_oracle.py "$work"
++python3 tools/jit_make_pipeline_test.py "$work"
++mkdir -p "$work/sd:/noods"
++for mode in native diff disabled oom; do
++    flags=()
++    sources=()
++    if [ "$mode" = disabled ]; then
++        flags+=(-DNOODS_NO_JIT)
++    else
++        sources+=(NooDS-Wii/jit.cpp NooDS-Wii/jit_cache.cpp NooDS-Wii/jit_debug.cpp
++            NooDS-Wii/jit_ppc_emitter.cpp NooDS-Wii/jit_trampoline.cpp
++            NooDS-Wii/jit_compiler_common.cpp NooDS-Wii/jit_compiler_arm.cpp NooDS-Wii/jit_compiler_thumb.cpp)
++    fi
++    if [ "$mode" = diff ]; then flags+=(-DJIT_DIFFTEST); fi
++    if [ "$mode" = oom ]; then flags+=(-DJIT_TEST_ALLOC_FAIL); fi
++    powerpc-linux-gnu-g++ -std=c++11 -O2 -static -mcpu=750 -DENDIAN_BIG -DJIT_TEST \
++        -ffunction-sections -fdata-sections -Wl,--gc-sections "${flags[@]}" \
++        "$work/pipeline.cpp" "$work/actual_alu.cpp" "$work/reference.cpp" "${sources[@]}" -o "$work/$mode"
++    echo "PIPELINE_MODE: $mode"
++    (cd "$work"; qemu-ppc-static -cpu 750 "./$mode")
++done
+diff --git a/verification/stage2/devkit-oracle.log b/verification/stage2/devkit-oracle.log
+new file mode 100644
+index 0000000..391e752
+--- /dev/null
++++ b/verification/stage2/devkit-oracle.log
+@@ -0,0 +1,6 @@
++ARM_DECODE_OK: 784 native-eligible table slots (PC operands still excluded)
++ORACLE_GENERATED: actual interpreter_alu.cpp, dispatch-derived reference calls
++ORACLE_COMPILER: powerpc-eabi-g++
++NATIVE_ORACLE_OK: 1415296 states; 20323 THUMB encodings; 19726 ARM candidates accepted
++CACHE_OK: hits=31871 misses=16129 compiled=15999 flushes=124 rejected=130
++ABI_OK: r14-r31, r2/r13 and full CR checked on every invocation
+diff --git a/verification/stage2/diff-build.log b/verification/stage2/diff-build.log
+new file mode 100644
+index 0000000..eff6456
+--- /dev/null
++++ b/verification/stage2/diff-build.log
+@@ -0,0 +1,46 @@
++rm -f NooDS-Wii.elf NooDS-Wii.dol NooDS-Wii.map NooDS-Wii.elf.map NooDS-Wii/action_replay.o NooDS-Wii/cartridge.o NooDS-Wii/console_ui.o NooDS-Wii/core.o NooDS-Wii/cp15.o NooDS-Wii/div_sqrt.o NooDS-Wii/dldi.o NooDS-Wii/dma.o NooDS-Wii/gpu.o NooDS-Wii/gpu_2d.o NooDS-Wii/gpu_3d.o NooDS-Wii/gpu_3d_renderer.o NooDS-Wii/hle_arm7.o NooDS-Wii/hle_bios.o NooDS-Wii/input.o NooDS-Wii/interpreter.o NooDS-Wii/interpreter_alu.o NooDS-Wii/interpreter_branch.o NooDS-Wii/interpreter_lookup.o NooDS-Wii/interpreter_transfer.o NooDS-Wii/ipc.o NooDS-Wii/jit.o NooDS-Wii/jit_cache.o NooDS-Wii/jit_compiler_arm.o NooDS-Wii/jit_compiler_common.o NooDS-Wii/jit_compiler_thumb.o NooDS-Wii/jit_debug.o NooDS-Wii/jit_ppc_emitter.o NooDS-Wii/jit_trampoline.o NooDS-Wii/main.o NooDS-Wii/memory.o NooDS-Wii/nds_icon.o NooDS-Wii/rtc.o NooDS-Wii/save_states.o NooDS-Wii/screen_layout.o NooDS-Wii/settings.o NooDS-Wii/spi.o NooDS-Wii/spu.o NooDS-Wii/timers.o NooDS-Wii/wifi.o NooDS-Wii/wii_video.o
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/action_replay.cpp -o NooDS-Wii/action_replay.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DJIT_DIFFTEST
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/cartridge.cpp -o NooDS-Wii/cartridge.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DJIT_DIFFTEST
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/console_ui.cpp -o NooDS-Wii/console_ui.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DJIT_DIFFTEST
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/core.cpp -o NooDS-Wii/core.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DJIT_DIFFTEST
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/cp15.cpp -o NooDS-Wii/cp15.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DJIT_DIFFTEST
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/div_sqrt.cpp -o NooDS-Wii/div_sqrt.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DJIT_DIFFTEST
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/dldi.cpp -o NooDS-Wii/dldi.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DJIT_DIFFTEST
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/dma.cpp -o NooDS-Wii/dma.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DJIT_DIFFTEST
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/gpu.cpp -o NooDS-Wii/gpu.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DJIT_DIFFTEST
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/gpu_2d.cpp -o NooDS-Wii/gpu_2d.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DJIT_DIFFTEST
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/gpu_3d.cpp -o NooDS-Wii/gpu_3d.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DJIT_DIFFTEST
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/gpu_3d_renderer.cpp -o NooDS-Wii/gpu_3d_renderer.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DJIT_DIFFTEST
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/hle_arm7.cpp -o NooDS-Wii/hle_arm7.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DJIT_DIFFTEST
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/hle_bios.cpp -o NooDS-Wii/hle_bios.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DJIT_DIFFTEST
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/input.cpp -o NooDS-Wii/input.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DJIT_DIFFTEST
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/interpreter.cpp -o NooDS-Wii/interpreter.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DJIT_DIFFTEST
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/interpreter_alu.cpp -o NooDS-Wii/interpreter_alu.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DJIT_DIFFTEST
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/interpreter_branch.cpp -o NooDS-Wii/interpreter_branch.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DJIT_DIFFTEST
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/interpreter_lookup.cpp -o NooDS-Wii/interpreter_lookup.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DJIT_DIFFTEST
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/interpreter_transfer.cpp -o NooDS-Wii/interpreter_transfer.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DJIT_DIFFTEST
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/ipc.cpp -o NooDS-Wii/ipc.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DJIT_DIFFTEST
++/tmp/cc5vdqRe.s: Assembler messages:
++/tmp/cc5vdqRe.s:241: Warning: setting incorrect section attributes for .rodata
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/jit.cpp -o NooDS-Wii/jit.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DJIT_DIFFTEST
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/jit_cache.cpp -o NooDS-Wii/jit_cache.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DJIT_DIFFTEST
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/jit_compiler_arm.cpp -o NooDS-Wii/jit_compiler_arm.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DJIT_DIFFTEST
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/jit_compiler_common.cpp -o NooDS-Wii/jit_compiler_common.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DJIT_DIFFTEST
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/jit_compiler_thumb.cpp -o NooDS-Wii/jit_compiler_thumb.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DJIT_DIFFTEST
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/jit_debug.cpp -o NooDS-Wii/jit_debug.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DJIT_DIFFTEST
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/jit_ppc_emitter.cpp -o NooDS-Wii/jit_ppc_emitter.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DJIT_DIFFTEST
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/jit_trampoline.cpp -o NooDS-Wii/jit_trampoline.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DJIT_DIFFTEST
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/main.cpp -o NooDS-Wii/main.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DJIT_DIFFTEST
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/memory.cpp -o NooDS-Wii/memory.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DJIT_DIFFTEST
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/nds_icon.cpp -o NooDS-Wii/nds_icon.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DJIT_DIFFTEST
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/rtc.cpp -o NooDS-Wii/rtc.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DJIT_DIFFTEST
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/save_states.cpp -o NooDS-Wii/save_states.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DJIT_DIFFTEST
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/screen_layout.cpp -o NooDS-Wii/screen_layout.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DJIT_DIFFTEST
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/settings.cpp -o NooDS-Wii/settings.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DJIT_DIFFTEST
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/spi.cpp -o NooDS-Wii/spi.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DJIT_DIFFTEST
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/spu.cpp -o NooDS-Wii/spu.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DJIT_DIFFTEST
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/timers.cpp -o NooDS-Wii/timers.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DJIT_DIFFTEST
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/wifi.cpp -o NooDS-Wii/wifi.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DJIT_DIFFTEST
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/wii_video.cpp -o NooDS-Wii/wii_video.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DJIT_DIFFTEST
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ NooDS-Wii/action_replay.o NooDS-Wii/cartridge.o NooDS-Wii/console_ui.o NooDS-Wii/core.o NooDS-Wii/cp15.o NooDS-Wii/div_sqrt.o NooDS-Wii/dldi.o NooDS-Wii/dma.o NooDS-Wii/gpu.o NooDS-Wii/gpu_2d.o NooDS-Wii/gpu_3d.o NooDS-Wii/gpu_3d_renderer.o NooDS-Wii/hle_arm7.o NooDS-Wii/hle_bios.o NooDS-Wii/input.o NooDS-Wii/interpreter.o NooDS-Wii/interpreter_alu.o NooDS-Wii/interpreter_branch.o NooDS-Wii/interpreter_lookup.o NooDS-Wii/interpreter_transfer.o NooDS-Wii/ipc.o NooDS-Wii/jit.o NooDS-Wii/jit_cache.o NooDS-Wii/jit_compiler_arm.o NooDS-Wii/jit_compiler_common.o NooDS-Wii/jit_compiler_thumb.o NooDS-Wii/jit_debug.o NooDS-Wii/jit_ppc_emitter.o NooDS-Wii/jit_trampoline.o NooDS-Wii/main.o NooDS-Wii/memory.o NooDS-Wii/nds_icon.o NooDS-Wii/rtc.o NooDS-Wii/save_states.o NooDS-Wii/screen_layout.o NooDS-Wii/settings.o NooDS-Wii/spi.o NooDS-Wii/spu.o NooDS-Wii/timers.o NooDS-Wii/wifi.o NooDS-Wii/wii_video.o -o NooDS-Wii.elf -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DJIT_DIFFTEST -Wl,-Map,NooDS-Wii.elf.map -L/opt/devkitpro/portlibs/wii/lib -L/opt/devkitpro/portlibs/ppc/lib -L/opt/devkitpro/libogc/lib -L/opt/devkitpro/libogc/lib/wii -lasnd -lwiikeyboard -lfat -lwiiuse -lbte -logc -lm
++elf2dol NooDS-Wii.elf NooDS-Wii.dol
+diff --git a/verification/stage2/diff-dol.txt b/verification/stage2/diff-dol.txt
+new file mode 100644
+index 0000000..5aa60d4
+--- /dev/null
++++ b/verification/stage2/diff-dol.txt
+@@ -0,0 +1 @@
++DOL_STRUCTURE_OK: 2 sections; entry=0x80003f00; size=1337352 bytes
+diff --git a/verification/stage2/diff-elf.txt b/verification/stage2/diff-elf.txt
+new file mode 100644
+index 0000000..ef107c1
+--- /dev/null
++++ b/verification/stage2/diff-elf.txt
+@@ -0,0 +1,20 @@
++ELF Header:
++  Magic:   7f 45 4c 46 01 02 01 00 00 00 00 00 00 00 00 00 
++  Class:                             ELF32
++  Data:                              2's complement, big endian
++  Version:                           1 (current)
++  OS/ABI:                            UNIX - System V
++  ABI Version:                       0
++  Type:                              EXEC (Executable file)
++  Machine:                           PowerPC
++  Version:                           0x1
++  Entry point address:               0x80003f00
++  Start of program headers:          52 (bytes into file)
++  Start of section headers:          3420964 (bytes into file)
++  Flags:                             0x80000000, emb
++  Size of this header:               52 (bytes)
++  Size of program headers:           32 (bytes)
++  Number of program headers:         4
++  Size of section headers:           40 (bytes)
++  Number of section headers:         28
++  Section header string table index: 27
+diff --git a/verification/stage2/diff-symbols.txt b/verification/stage2/diff-symbols.txt
+new file mode 100644
+index 0000000..13174a1
+--- /dev/null
++++ b/verification/stage2/diff-symbols.txt
+@@ -0,0 +1,5 @@
++80064c3c T Jit::compileArm(JitPpc::Writer&, unsigned int)
++800661dc T Jit::logMismatch(unsigned int, unsigned int, bool, bool, JitContext const&, JitContext const&)
++80065d54 T Jit::compileThumb(JitPpc::Writer&, unsigned short)
++800643f8 T Jit::execute(Interpreter&, unsigned int, bool, int&)
++80066d8c T jitEnter
+diff --git a/verification/stage2/disabled-build.log b/verification/stage2/disabled-build.log
+new file mode 100644
+index 0000000..9686ac1
+--- /dev/null
++++ b/verification/stage2/disabled-build.log
+@@ -0,0 +1,38 @@
++rm -f NooDS-Wii.elf NooDS-Wii.dol NooDS-Wii.map NooDS-Wii.elf.map NooDS-Wii/action_replay.o NooDS-Wii/cartridge.o NooDS-Wii/console_ui.o NooDS-Wii/core.o NooDS-Wii/cp15.o NooDS-Wii/div_sqrt.o NooDS-Wii/dldi.o NooDS-Wii/dma.o NooDS-Wii/gpu.o NooDS-Wii/gpu_2d.o NooDS-Wii/gpu_3d.o NooDS-Wii/gpu_3d_renderer.o NooDS-Wii/hle_arm7.o NooDS-Wii/hle_bios.o NooDS-Wii/input.o NooDS-Wii/interpreter.o NooDS-Wii/interpreter_alu.o NooDS-Wii/interpreter_branch.o NooDS-Wii/interpreter_lookup.o NooDS-Wii/interpreter_transfer.o NooDS-Wii/ipc.o NooDS-Wii/jit.o NooDS-Wii/jit_cache.o NooDS-Wii/jit_compiler_arm.o NooDS-Wii/jit_compiler_common.o NooDS-Wii/jit_compiler_thumb.o NooDS-Wii/jit_debug.o NooDS-Wii/jit_ppc_emitter.o NooDS-Wii/jit_trampoline.o NooDS-Wii/main.o NooDS-Wii/memory.o NooDS-Wii/nds_icon.o NooDS-Wii/rtc.o NooDS-Wii/save_states.o NooDS-Wii/screen_layout.o NooDS-Wii/settings.o NooDS-Wii/spi.o NooDS-Wii/spu.o NooDS-Wii/timers.o NooDS-Wii/wifi.o NooDS-Wii/wii_video.o
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/action_replay.cpp -o NooDS-Wii/action_replay.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DNOODS_NO_JIT
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/cartridge.cpp -o NooDS-Wii/cartridge.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DNOODS_NO_JIT
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/console_ui.cpp -o NooDS-Wii/console_ui.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DNOODS_NO_JIT
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/core.cpp -o NooDS-Wii/core.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DNOODS_NO_JIT
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/cp15.cpp -o NooDS-Wii/cp15.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DNOODS_NO_JIT
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/div_sqrt.cpp -o NooDS-Wii/div_sqrt.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DNOODS_NO_JIT
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/dldi.cpp -o NooDS-Wii/dldi.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DNOODS_NO_JIT
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/dma.cpp -o NooDS-Wii/dma.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DNOODS_NO_JIT
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/gpu.cpp -o NooDS-Wii/gpu.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DNOODS_NO_JIT
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/gpu_2d.cpp -o NooDS-Wii/gpu_2d.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DNOODS_NO_JIT
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/gpu_3d.cpp -o NooDS-Wii/gpu_3d.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DNOODS_NO_JIT
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/gpu_3d_renderer.cpp -o NooDS-Wii/gpu_3d_renderer.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DNOODS_NO_JIT
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/hle_arm7.cpp -o NooDS-Wii/hle_arm7.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DNOODS_NO_JIT
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/hle_bios.cpp -o NooDS-Wii/hle_bios.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DNOODS_NO_JIT
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/input.cpp -o NooDS-Wii/input.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DNOODS_NO_JIT
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/interpreter.cpp -o NooDS-Wii/interpreter.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DNOODS_NO_JIT
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/interpreter_alu.cpp -o NooDS-Wii/interpreter_alu.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DNOODS_NO_JIT
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/interpreter_branch.cpp -o NooDS-Wii/interpreter_branch.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DNOODS_NO_JIT
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/interpreter_lookup.cpp -o NooDS-Wii/interpreter_lookup.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DNOODS_NO_JIT
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/interpreter_transfer.cpp -o NooDS-Wii/interpreter_transfer.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DNOODS_NO_JIT
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/ipc.cpp -o NooDS-Wii/ipc.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DNOODS_NO_JIT
++/tmp/ccKSnuZ9.s: Assembler messages:
++/tmp/ccKSnuZ9.s:241: Warning: setting incorrect section attributes for .rodata
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/main.cpp -o NooDS-Wii/main.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DNOODS_NO_JIT
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/memory.cpp -o NooDS-Wii/memory.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DNOODS_NO_JIT
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/nds_icon.cpp -o NooDS-Wii/nds_icon.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DNOODS_NO_JIT
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/rtc.cpp -o NooDS-Wii/rtc.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DNOODS_NO_JIT
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/save_states.cpp -o NooDS-Wii/save_states.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DNOODS_NO_JIT
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/screen_layout.cpp -o NooDS-Wii/screen_layout.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DNOODS_NO_JIT
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/settings.cpp -o NooDS-Wii/settings.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DNOODS_NO_JIT
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/spi.cpp -o NooDS-Wii/spi.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DNOODS_NO_JIT
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/spu.cpp -o NooDS-Wii/spu.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DNOODS_NO_JIT
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/timers.cpp -o NooDS-Wii/timers.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DNOODS_NO_JIT
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/wifi.cpp -o NooDS-Wii/wifi.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DNOODS_NO_JIT
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/wii_video.cpp -o NooDS-Wii/wii_video.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DNOODS_NO_JIT
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ NooDS-Wii/action_replay.o NooDS-Wii/cartridge.o NooDS-Wii/console_ui.o NooDS-Wii/core.o NooDS-Wii/cp15.o NooDS-Wii/div_sqrt.o NooDS-Wii/dldi.o NooDS-Wii/dma.o NooDS-Wii/gpu.o NooDS-Wii/gpu_2d.o NooDS-Wii/gpu_3d.o NooDS-Wii/gpu_3d_renderer.o NooDS-Wii/hle_arm7.o NooDS-Wii/hle_bios.o NooDS-Wii/input.o NooDS-Wii/interpreter.o NooDS-Wii/interpreter_alu.o NooDS-Wii/interpreter_branch.o NooDS-Wii/interpreter_lookup.o NooDS-Wii/interpreter_transfer.o NooDS-Wii/ipc.o NooDS-Wii/main.o NooDS-Wii/memory.o NooDS-Wii/nds_icon.o NooDS-Wii/rtc.o NooDS-Wii/save_states.o NooDS-Wii/screen_layout.o NooDS-Wii/settings.o NooDS-Wii/spi.o NooDS-Wii/spu.o NooDS-Wii/timers.o NooDS-Wii/wifi.o NooDS-Wii/wii_video.o -o NooDS-Wii.elf -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -DNOODS_NO_JIT -Wl,-Map,NooDS-Wii.elf.map -L/opt/devkitpro/portlibs/wii/lib -L/opt/devkitpro/portlibs/ppc/lib -L/opt/devkitpro/libogc/lib -L/opt/devkitpro/libogc/lib/wii -lasnd -lwiikeyboard -lfat -lwiiuse -lbte -logc -lm
++elf2dol NooDS-Wii.elf NooDS-Wii.dol
+diff --git a/verification/stage2/disabled-dol.txt b/verification/stage2/disabled-dol.txt
+new file mode 100644
+index 0000000..b0eb67c
+--- /dev/null
++++ b/verification/stage2/disabled-dol.txt
+@@ -0,0 +1 @@
++DOL_STRUCTURE_OK: 2 sections; entry=0x80003f00; size=1318216 bytes
+diff --git a/verification/stage2/disabled-elf.txt b/verification/stage2/disabled-elf.txt
+new file mode 100644
+index 0000000..8b3f625
+--- /dev/null
++++ b/verification/stage2/disabled-elf.txt
+@@ -0,0 +1,20 @@
++ELF Header:
++  Magic:   7f 45 4c 46 01 02 01 00 00 00 00 00 00 00 00 00 
++  Class:                             ELF32
++  Data:                              2's complement, big endian
++  Version:                           1 (current)
++  OS/ABI:                            UNIX - System V
++  ABI Version:                       0
++  Type:                              EXEC (Executable file)
++  Machine:                           PowerPC
++  Version:                           0x1
++  Entry point address:               0x80003f00
++  Start of program headers:          52 (bytes into file)
++  Start of section headers:          3399284 (bytes into file)
++  Flags:                             0x80000000, emb
++  Size of this header:               52 (bytes)
++  Size of program headers:           32 (bytes)
++  Number of program headers:         4
++  Size of section headers:           40 (bytes)
++  Number of section headers:         28
++  Section header string table index: 27
+diff --git a/verification/stage2/disabled-symbols.txt b/verification/stage2/disabled-symbols.txt
+new file mode 100644
+index 0000000..6f35341
+--- /dev/null
++++ b/verification/stage2/disabled-symbols.txt
+@@ -0,0 +1 @@
++NO_JIT_OBJECTS_OR_SYMBOLS_OK
+diff --git a/verification/stage2/encoder.log b/verification/stage2/encoder.log
+new file mode 100644
+index 0000000..4ada349
+--- /dev/null
++++ b/verification/stage2/encoder.log
+@@ -0,0 +1,2 @@
++WRITER_RANGE_OK
++ASM_ORACLE_OK: 121 independently assembled vectors
+diff --git a/verification/stage2/flags.log b/verification/stage2/flags.log
+new file mode 100644
+index 0000000..12c2e18
+--- /dev/null
++++ b/verification/stage2/flags.log
+@@ -0,0 +1 @@
++FLAG_PROBE_OK: 324576 emitted-code cases against interpreter expressions
+diff --git a/verification/stage2/native-build.log b/verification/stage2/native-build.log
+new file mode 100644
+index 0000000..9389486
+--- /dev/null
++++ b/verification/stage2/native-build.log
+@@ -0,0 +1,46 @@
++rm -f NooDS-Wii.elf NooDS-Wii.dol NooDS-Wii.map NooDS-Wii.elf.map NooDS-Wii/action_replay.o NooDS-Wii/cartridge.o NooDS-Wii/console_ui.o NooDS-Wii/core.o NooDS-Wii/cp15.o NooDS-Wii/div_sqrt.o NooDS-Wii/dldi.o NooDS-Wii/dma.o NooDS-Wii/gpu.o NooDS-Wii/gpu_2d.o NooDS-Wii/gpu_3d.o NooDS-Wii/gpu_3d_renderer.o NooDS-Wii/hle_arm7.o NooDS-Wii/hle_bios.o NooDS-Wii/input.o NooDS-Wii/interpreter.o NooDS-Wii/interpreter_alu.o NooDS-Wii/interpreter_branch.o NooDS-Wii/interpreter_lookup.o NooDS-Wii/interpreter_transfer.o NooDS-Wii/ipc.o NooDS-Wii/main.o NooDS-Wii/memory.o NooDS-Wii/nds_icon.o NooDS-Wii/rtc.o NooDS-Wii/save_states.o NooDS-Wii/screen_layout.o NooDS-Wii/settings.o NooDS-Wii/spi.o NooDS-Wii/spu.o NooDS-Wii/timers.o NooDS-Wii/wifi.o NooDS-Wii/wii_video.o
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/action_replay.cpp -o NooDS-Wii/action_replay.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions 
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/cartridge.cpp -o NooDS-Wii/cartridge.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions 
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/console_ui.cpp -o NooDS-Wii/console_ui.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions 
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/core.cpp -o NooDS-Wii/core.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions 
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/cp15.cpp -o NooDS-Wii/cp15.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions 
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/div_sqrt.cpp -o NooDS-Wii/div_sqrt.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions 
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/dldi.cpp -o NooDS-Wii/dldi.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions 
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/dma.cpp -o NooDS-Wii/dma.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions 
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/gpu.cpp -o NooDS-Wii/gpu.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions 
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/gpu_2d.cpp -o NooDS-Wii/gpu_2d.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions 
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/gpu_3d.cpp -o NooDS-Wii/gpu_3d.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions 
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/gpu_3d_renderer.cpp -o NooDS-Wii/gpu_3d_renderer.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions 
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/hle_arm7.cpp -o NooDS-Wii/hle_arm7.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions 
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/hle_bios.cpp -o NooDS-Wii/hle_bios.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions 
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/input.cpp -o NooDS-Wii/input.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions 
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/interpreter.cpp -o NooDS-Wii/interpreter.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions 
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/interpreter_alu.cpp -o NooDS-Wii/interpreter_alu.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions 
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/interpreter_branch.cpp -o NooDS-Wii/interpreter_branch.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions 
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/interpreter_lookup.cpp -o NooDS-Wii/interpreter_lookup.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions 
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/interpreter_transfer.cpp -o NooDS-Wii/interpreter_transfer.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions 
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/ipc.cpp -o NooDS-Wii/ipc.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions 
++/tmp/ccOSJsj4.s: Assembler messages:
++/tmp/ccOSJsj4.s:241: Warning: setting incorrect section attributes for .rodata
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/jit.cpp -o NooDS-Wii/jit.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions 
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/jit_cache.cpp -o NooDS-Wii/jit_cache.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions 
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/jit_compiler_arm.cpp -o NooDS-Wii/jit_compiler_arm.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions 
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/jit_compiler_common.cpp -o NooDS-Wii/jit_compiler_common.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions 
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/jit_compiler_thumb.cpp -o NooDS-Wii/jit_compiler_thumb.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions 
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/jit_debug.cpp -o NooDS-Wii/jit_debug.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions 
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/jit_ppc_emitter.cpp -o NooDS-Wii/jit_ppc_emitter.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions 
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/jit_trampoline.cpp -o NooDS-Wii/jit_trampoline.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions 
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/main.cpp -o NooDS-Wii/main.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions 
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/memory.cpp -o NooDS-Wii/memory.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions 
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/nds_icon.cpp -o NooDS-Wii/nds_icon.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions 
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/rtc.cpp -o NooDS-Wii/rtc.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions 
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/save_states.cpp -o NooDS-Wii/save_states.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions 
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/screen_layout.cpp -o NooDS-Wii/screen_layout.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions 
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/settings.cpp -o NooDS-Wii/settings.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions 
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/spi.cpp -o NooDS-Wii/spi.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions 
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/spu.cpp -o NooDS-Wii/spu.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions 
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/timers.cpp -o NooDS-Wii/timers.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions 
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/wifi.cpp -o NooDS-Wii/wifi.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions 
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ -c NooDS-Wii/wii_video.cpp -o NooDS-Wii/wii_video.o -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions 
++/opt/devkitpro/devkitPPC/bin/powerpc-eabi-g++ NooDS-Wii/action_replay.o NooDS-Wii/cartridge.o NooDS-Wii/console_ui.o NooDS-Wii/core.o NooDS-Wii/cp15.o NooDS-Wii/div_sqrt.o NooDS-Wii/dldi.o NooDS-Wii/dma.o NooDS-Wii/gpu.o NooDS-Wii/gpu_2d.o NooDS-Wii/gpu_3d.o NooDS-Wii/gpu_3d_renderer.o NooDS-Wii/hle_arm7.o NooDS-Wii/hle_bios.o NooDS-Wii/input.o NooDS-Wii/interpreter.o NooDS-Wii/interpreter_alu.o NooDS-Wii/interpreter_branch.o NooDS-Wii/interpreter_lookup.o NooDS-Wii/interpreter_transfer.o NooDS-Wii/ipc.o NooDS-Wii/jit.o NooDS-Wii/jit_cache.o NooDS-Wii/jit_compiler_arm.o NooDS-Wii/jit_compiler_common.o NooDS-Wii/jit_compiler_thumb.o NooDS-Wii/jit_debug.o NooDS-Wii/jit_ppc_emitter.o NooDS-Wii/jit_trampoline.o NooDS-Wii/main.o NooDS-Wii/memory.o NooDS-Wii/nds_icon.o NooDS-Wii/rtc.o NooDS-Wii/save_states.o NooDS-Wii/screen_layout.o NooDS-Wii/settings.o NooDS-Wii/spi.o NooDS-Wii/spu.o NooDS-Wii/timers.o NooDS-Wii/wifi.o NooDS-Wii/wii_video.o -o NooDS-Wii.elf -O2 -DENDIAN_BIG -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions  -Wl,-Map,NooDS-Wii.elf.map -L/opt/devkitpro/portlibs/wii/lib -L/opt/devkitpro/portlibs/ppc/lib -L/opt/devkitpro/libogc/lib -L/opt/devkitpro/libogc/lib/wii -lasnd -lwiikeyboard -lfat -lwiiuse -lbte -logc -lm
++elf2dol NooDS-Wii.elf NooDS-Wii.dol
+diff --git a/verification/stage2/native-dol.txt b/verification/stage2/native-dol.txt
+new file mode 100644
+index 0000000..8a52c17
+--- /dev/null
++++ b/verification/stage2/native-dol.txt
+@@ -0,0 +1 @@
++DOL_STRUCTURE_OK: 2 sections; entry=0x80003f00; size=1335560 bytes
+diff --git a/verification/stage2/native-elf.txt b/verification/stage2/native-elf.txt
+new file mode 100644
+index 0000000..29a4b1f
+--- /dev/null
++++ b/verification/stage2/native-elf.txt
+@@ -0,0 +1,20 @@
++ELF Header:
++  Magic:   7f 45 4c 46 01 02 01 00 00 00 00 00 00 00 00 00 
++  Class:                             ELF32
++  Data:                              2's complement, big endian
++  Version:                           1 (current)
++  OS/ABI:                            UNIX - System V
++  ABI Version:                       0
++  Type:                              EXEC (Executable file)
++  Machine:                           PowerPC
++  Version:                           0x1
++  Entry point address:               0x80003f00
++  Start of program headers:          52 (bytes into file)
++  Start of section headers:          3419044 (bytes into file)
++  Flags:                             0x80000000, emb
++  Size of this header:               52 (bytes)
++  Size of program headers:           32 (bytes)
++  Number of program headers:         4
++  Size of section headers:           40 (bytes)
++  Number of section headers:         28
++  Section header string table index: 27
+diff --git a/verification/stage2/native-oracle.log b/verification/stage2/native-oracle.log
+new file mode 100644
+index 0000000..6eaf8d5
+--- /dev/null
++++ b/verification/stage2/native-oracle.log
+@@ -0,0 +1,6 @@
++ARM_DECODE_OK: 784 native-eligible table slots (PC operands still excluded)
++ORACLE_GENERATED: actual interpreter_alu.cpp, dispatch-derived reference calls
++ORACLE_COMPILER: powerpc-linux-gnu-g++
++NATIVE_ORACLE_OK: 1415296 states; 20323 THUMB encodings; 19726 ARM candidates accepted
++CACHE_OK: hits=31871 misses=16129 compiled=15999 flushes=124 rejected=130
++ABI_OK: r14-r31, r2/r13 and full CR checked on every invocation
+diff --git a/verification/stage2/native-symbols.txt b/verification/stage2/native-symbols.txt
+new file mode 100644
+index 0000000..94e95c8
+--- /dev/null
++++ b/verification/stage2/native-symbols.txt
+@@ -0,0 +1,4 @@
++80064958 T Jit::compileArm(JitPpc::Writer&, unsigned int)
++80065a70 T Jit::compileThumb(JitPpc::Writer&, unsigned short)
++800643f8 T Jit::execute(Interpreter&, unsigned int, bool, int&)
++8006686c T jitEnter
+diff --git a/verification/stage2/pipeline.log b/verification/stage2/pipeline.log
+new file mode 100644
+index 0000000..7344792
+--- /dev/null
++++ b/verification/stage2/pipeline.log
+@@ -0,0 +1,12 @@
++ORACLE_GENERATED: actual interpreter_alu.cpp, dispatch-derived reference calls
++PIPELINE_SOURCE_OK: exact runOpcode/getOpcode bodies and condition table; instrumented memory/fallbacks
++PIPELINE_MODE: native
++PIPELINE_OK: 43776 step comparisons; runtime toggle, condition checks, banked pointers, page crossings and prefetched stale bytes
++PIPELINE_MODE: diff
++DIFFTEST_FAULT_OK: injected mismatch logged; reference retained; native disabled
++PIPELINE_OK: 43776 step comparisons; runtime toggle, condition checks, banked pointers, page crossings and prefetched stale bytes
++PIPELINE_MODE: disabled
++PIPELINE_OK: 43776 step comparisons; runtime toggle, condition checks, banked pointers, page crossings and prefetched stale bytes
++PIPELINE_MODE: oom
++OOM_FALLBACK_OK: all native allocations denied; reference execution preserved
++PIPELINE_OK: 43776 step comparisons; runtime toggle, condition checks, banked pointers, page crossings and prefetched stale bytes
+diff --git a/verification/stage2/syntax.log b/verification/stage2/syntax.log
+new file mode 100644
+index 0000000..9c8df1a
+--- /dev/null
++++ b/verification/stage2/syntax.log
+@@ -0,0 +1 @@
++PPC_SYNTAX_OK

@@ -1,0 +1,4 @@
+80064958 T Jit::compileArm(JitPpc::Writer&, unsigned int)
+80065a70 T Jit::compileThumb(JitPpc::Writer&, unsigned short)
+800643f8 T Jit::execute(Interpreter&, unsigned int, bool, int&)
+8006686c T jitEnter

@@ -1,0 +1,6 @@
+3403f20 Record stage-2 coverage, reproducible verification and remaining JIT work
+588fafa Integrate default-off opcode-keyed JIT with exact fallback and differential tests
+13f1290 Compile non-PC ARM and THUMB ALU leaves with a PPC ABI trampoline
+0738f72 Document partial JIT foundation and verify build-time exclusion
+ea53933 Verify emitted PPC flags against pinned interpreter expressions
+bf0ec74 Add bounded PPC 750 encoder and independent assembler oracle
