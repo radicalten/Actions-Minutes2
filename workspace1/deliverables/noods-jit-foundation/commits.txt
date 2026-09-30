@@ -1,0 +1,3 @@
+0738f72 Document partial JIT foundation and verify build-time exclusion
+ea53933 Verify emitted PPC flags against pinned interpreter expressions
+bf0ec74 Add bounded PPC 750 encoder and independent assembler oracle
