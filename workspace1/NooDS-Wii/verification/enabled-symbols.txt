@@ -1,1 +1,0 @@
-Emitter compiled and linked as input; unused code garbage-collected (no runtime integration).

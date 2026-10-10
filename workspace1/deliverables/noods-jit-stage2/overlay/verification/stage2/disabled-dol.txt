@@ -1,1 +1,0 @@
-DOL_STRUCTURE_OK: 2 sections; entry=0x80003f00; size=1318216 bytes
