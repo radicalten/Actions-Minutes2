@@ -1,5 +1,5 @@
 /*
-    Copyright (C) 2026 NooDS-Wii Contributors
+    Copyright (C) 2026 radicalten
 
     This file is part of NooDS-Wii.
 
