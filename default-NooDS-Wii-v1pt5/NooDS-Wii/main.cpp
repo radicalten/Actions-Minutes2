@@ -570,27 +570,6 @@ struct NoodsTestHarness {
             }
         }
 
-        if (chosen.empty() || !fileExists(chosen.c_str())) {
-            chosen.clear();
-            const char* fallbacks[] = {
-                "sd:/noods/suite.gba",
-                "sd:/noods/gba/suite.gba",
-                "sd:/gba/suite.gba",
-                "sd:/suite.gba",
-                "sd:/noods/suite-auto.gba",
-                "sd:/nds/rockwrestler.nds",
-                "sd:/noods/rockwrestler.nds",
-                "sd:/rockwrestler.nds",
-                "sd:/noods/nds/rockwrestler.nds"
-            };
-            for (const char* cand : fallbacks) {
-                if (fileExists(cand)) {
-                    chosen = cand;
-                    break;
-                }
-            }
-        }
-
         if (!chosen.empty()) {
             if (!checkpoints.empty() || maxFrames > 0) {
                 if (FILE* f = fopen("sd:/g2_state.log", "wb")) fclose(f);
