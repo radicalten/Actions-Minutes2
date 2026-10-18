@@ -1,0 +1,22 @@
+name: NooDS-Wii
+on:
+  push:
+    branches:
+    - master
+jobs:
+  build-wii:
+    runs-on: ubuntu-latest
+    container: devkitpro/devkitppc:latest
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v6
+    - name: Compile
+      run: |
+        cd default-NooDS-Wii-v1pt5
+        make -f Makefile
+    - name: Upload
+      uses: actions/upload-artifact@v6
+      with:
+        name: NooDS-Wii
+        path: |
+          *.dol
