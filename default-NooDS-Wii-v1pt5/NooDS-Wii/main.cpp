@@ -41,6 +41,18 @@
 #include "settings.h"
 #include "console_ui.h"
 
+// Browser build: ignore test-harness autoboot files and ROM fallbacks on SD.
+// Regular regression builds leave this off so G2/G3 continue to auto-run.
+#ifndef NOODS_FORCE_BROWSER
+#define NOODS_FORCE_BROWSER 0
+#endif
+#ifndef NOODS_G2_SCRIPTED_INPUT
+#define NOODS_G2_SCRIPTED_INPUT 0
+#endif
+#ifndef NOODS_FULL_RAM_DUMP
+#define NOODS_FULL_RAM_DUMP 0
+#endif
+
 extern "C" {
     #include <tuxedo/thread.h>
     #include <tuxedo/ppc/intrinsics.h>
@@ -145,7 +157,7 @@ struct BrowserItem {
     bool isDirectory;
 };
 
-static std::string currentDir = "sd:/noods/";
+static std::string currentDir = NOODS_FORCE_BROWSER ? "sd:/" : "sd:/noods/";
 static std::vector<BrowserItem> dirContents;
 static int selectedItemIndex = 0;
 static int displayOffset     = 0;
@@ -161,6 +173,7 @@ static const int SCROLL_DELAY_REPEATED = 3;
 // Settings menu state
 // ---------------------------------------------------------------------------
 static bool showSettingsMenu      = false;
+static volatile bool frameskipUserSet = false;
 static int  settingsMenuIndex     = 0;
 static int  settingsDisplayOffset = 0;
 
@@ -221,6 +234,7 @@ static void ActivateSettingsEntry(int idx) {
     const SettingsEntry& e = s_settingsTable[idx];
     if (!e.value) return;
     *e.value = (*e.value + 1) % e.maxValue;
+    if (e.value == &Settings::frameskip) frameskipUserSet = true;
 }
 
 #define NDS_KEY_A      0
@@ -247,6 +261,11 @@ struct PerformanceState {
     time_t   startTime;
 };
 static PerformanceState perf = {};
+
+// Presentation-side timing for the test harness (not guest CPU emulation time).
+static uint64_t videoRenderTicks = 0, videoFlushTicks = 0, videoVsyncTicks = 0;
+static uint32_t videoLoopCount = 0;
+static uint32_t framesProduced = 0, framesOverwritten = 0;
 
 #define AUDIO_SPU_FRAMES  WIIAUD_NDS_FRAMES
 
@@ -377,7 +396,7 @@ static void InitializeSettings() {
     Settings::sdImagePath  = "";
     Settings::basePath     = "sd:/";
     Settings::fpsLimiter   = 1;
-    Settings::frameskip    = 2;
+    Settings::frameskip    = 2; // DS default; GBA defaults to no skipping when loaded.
     Settings::threaded2D   = 0;
     Settings::threaded3D   = 0;
     Settings::highRes3D    = 0;
@@ -442,6 +461,317 @@ static void UpdateFileBrowser(const std::string& path) {
 
 alignas(32) static uint32_t tempBuffer[NDS_SCREEN_WIDTH * NDS_SCREEN_HEIGHT * 2];
 
+#if NOODS_JIT
+#include "arm_jit.h"
+#endif
+
+struct NoodsTestHarness {
+    static uint32_t maxFrames;
+    static std::vector<uint32_t> checkpoints;
+    static uint32_t poolLimitWords;
+#if NOODS_G2_SCRIPTED_INPUT
+    // Explicit test-build-only input windows; never compiled into the browser DOL.
+    static uint32_t inputAFrom, inputATo, inputA2From, inputA2To;
+    static uint32_t inputRightFrom, inputRightTo;
+    static uint32_t inputRight2From, inputRight2To, inputRight3From, inputRight3To;
+#endif
+    static uint32_t currentFrame;
+    static uint64_t startTick;
+    static uint64_t accumFrameUs;
+
+    static uint64_t fnv1a64(const void* data, size_t len, uint64_t h = 14695981039346656037ULL) {
+        const uint8_t* p = (const uint8_t*)data;
+        for (size_t i = 0; i < len; i++) {
+            h ^= (uint64_t)p[i];
+            h *= 1099511628211ULL;
+        }
+        return h;
+    }
+
+    static std::string trimLine(const std::string& s) {
+        size_t a = 0;
+        while (a < s.size() && (s[a] == ' ' || s[a] == '\t' || s[a] == '\r' || s[a] == '\n')) a++;
+        size_t b = s.size();
+        while (b > a && (s[b - 1] == ' ' || s[b - 1] == '\t' || s[b - 1] == '\r' || s[b - 1] == '\n')) b--;
+        return s.substr(a, b - a);
+    }
+
+    static bool fileExists(const char* path) {
+        if (FILE* f = fopen(path, "rb")) {
+            fclose(f);
+            return true;
+        }
+        return false;
+    }
+
+    static void tryAutoboot() {
+        maxFrames = 0;
+        checkpoints.clear();
+        poolLimitWords = 0;
+#if NOODS_G2_SCRIPTED_INPUT
+        inputAFrom = inputATo = inputA2From = inputA2To = 0;
+        inputRightFrom = inputRightTo = inputRight2From = inputRight2To = 0;
+        inputRight3From = inputRight3To = 0;
+#endif
+        currentFrame = 0;
+        accumFrameUs = 0;
+
+        std::string chosen;
+        const char* abFiles[] = { "sd:/autoboot.txt", "sd:/noods/autoboot.txt" };
+        for (const char* ab : abFiles) {
+            if (FILE* f = fopen(ab, "rb")) {
+                char lineBuf[256];
+                bool firstLine = true;
+                while (fgets(lineBuf, sizeof(lineBuf), f)) {
+                    std::string line = trimLine(lineBuf);
+                    if (line.empty() || line[0] == '#') continue;
+                    if (firstLine && line.find('=') == std::string::npos) {
+                        chosen = line;
+                        firstLine = false;
+                    } else if (line.rfind("MAX_FRAMES=", 0) == 0) {
+                        maxFrames = (uint32_t)strtoul(line.c_str() + 11, nullptr, 10);
+                    } else if (line.rfind("CHECKPOINTS=", 0) == 0) {
+                        const char* p = line.c_str() + 12;
+                        while (*p) {
+                            char* endp = nullptr;
+                            uint32_t v = (uint32_t)strtoul(p, &endp, 10);
+                            if (endp == p) break;
+                            if (v > 0) checkpoints.push_back(v);
+                            p = (*endp == ',') ? (endp + 1) : endp;
+                        }
+                    } else if (line.rfind("POOL_LIMIT_WORDS=", 0) == 0) {
+                        poolLimitWords = (uint32_t)strtoul(line.c_str() + 17, nullptr, 10);
+#if NOODS_G2_SCRIPTED_INPUT
+                    } else if (line.rfind("INPUT_A_FROM=", 0) == 0) {
+                        inputAFrom = (uint32_t)strtoul(line.c_str() + 13, nullptr, 10);
+                    } else if (line.rfind("INPUT_A_TO=", 0) == 0) {
+                        inputATo = (uint32_t)strtoul(line.c_str() + 11, nullptr, 10);
+                    } else if (line.rfind("INPUT_A2_FROM=", 0) == 0) {
+                        inputA2From = (uint32_t)strtoul(line.c_str() + 14, nullptr, 10);
+                    } else if (line.rfind("INPUT_A2_TO=", 0) == 0) {
+                        inputA2To = (uint32_t)strtoul(line.c_str() + 12, nullptr, 10);
+                    } else if (line.rfind("INPUT_RIGHT_FROM=", 0) == 0) {
+                        inputRightFrom = (uint32_t)strtoul(line.c_str() + 17, nullptr, 10);
+                    } else if (line.rfind("INPUT_RIGHT_TO=", 0) == 0) {
+                        inputRightTo = (uint32_t)strtoul(line.c_str() + 15, nullptr, 10);
+                    } else if (line.rfind("INPUT_RIGHT2_FROM=", 0) == 0) {
+                        inputRight2From = (uint32_t)strtoul(line.c_str() + 18, nullptr, 10);
+                    } else if (line.rfind("INPUT_RIGHT2_TO=", 0) == 0) {
+                        inputRight2To = (uint32_t)strtoul(line.c_str() + 16, nullptr, 10);
+                    } else if (line.rfind("INPUT_RIGHT3_FROM=", 0) == 0) {
+                        inputRight3From = (uint32_t)strtoul(line.c_str() + 18, nullptr, 10);
+                    } else if (line.rfind("INPUT_RIGHT3_TO=", 0) == 0) {
+                        inputRight3To = (uint32_t)strtoul(line.c_str() + 16, nullptr, 10);
+#endif
+                    }
+                }
+                fclose(f);
+                break;
+            }
+        }
+
+        if (chosen.empty() || !fileExists(chosen.c_str())) {
+            chosen.clear();
+            const char* fallbacks[] = {
+                "sd:/noods/suite.gba",
+                "sd:/noods/gba/suite.gba",
+                "sd:/gba/suite.gba",
+                "sd:/suite.gba",
+                "sd:/noods/suite-auto.gba",
+                "sd:/nds/rockwrestler.nds",
+                "sd:/noods/rockwrestler.nds",
+                "sd:/rockwrestler.nds",
+                "sd:/noods/nds/rockwrestler.nds"
+            };
+            for (const char* cand : fallbacks) {
+                if (fileExists(cand)) {
+                    chosen = cand;
+                    break;
+                }
+            }
+        }
+
+        if (!chosen.empty()) {
+            if (!checkpoints.empty() || maxFrames > 0) {
+                if (FILE* f = fopen("sd:/g2_state.log", "wb")) fclose(f);
+            }
+#if NOODS_JIT
+            if (poolLimitWords > 0) {
+                ArmPpcJit::setPoolLimitWords(poolLimitWords);
+            }
+#endif
+            PPCIrqState st = PPCIrqLockByMsr();
+            romToLoadPath   = chosen;
+            romLoaded       = false;
+            triggerRomLoad  = true;
+            showFileBrowser = false;
+            PPCIrqUnlockByMsr(st);
+            SYS_Report("[NOODS] AUTOBOOT path=%s maxFrames=%u poolLimitWords=%u\n",
+                       chosen.c_str(), maxFrames, poolLimitWords);
+        }
+    }
+
+    static bool isCheckpoint(uint32_t frame) {
+        if (maxFrames > 0 && frame == maxFrames) return true;
+        for (uint32_t c : checkpoints) {
+            if (c == frame) return true;
+        }
+        return false;
+    }
+
+    static void dumpCpuLine(FILE* f, const char* label, Interpreter& cpu) {
+        uint32_t spsrVal = cpu.spsr ? *cpu.spsr : 0;
+        fprintf(f, "%s cpsr=%08X spsr=%08X pc=%08X pipe0=%08X pipe1=%08X halted=%u ime=%u ie=%08X irf=%08X postFlg=%u cycles=%u",
+                label, cpu.cpsr, spsrVal, *cpu.registers[15], cpu.pipeline[0], cpu.pipeline[1],
+                (unsigned)cpu.halted, (unsigned)cpu.ime, cpu.ie, cpu.irf, (unsigned)cpu.postFlg, cpu.cycles);
+        for (int r = 0; r < 16; r++) {
+            fprintf(f, " r%d=%08X", r, cpu.registers[r] ? *cpu.registers[r] : cpu.registersUsr[r]);
+        }
+        for (int r = 0; r < 16; r++) {
+            fprintf(f, " usr%d=%08X", r, cpu.registersUsr[r]);
+        }
+        fprintf(f, " svc13=%08X svc14=%08X irq13=%08X irq14=%08X fiq13=%08X fiq14=%08X\n",
+                cpu.registersSvc[0], cpu.registersSvc[1],
+                cpu.registersIrq[0], cpu.registersIrq[1],
+                cpu.registersFiq[5], cpu.registersFiq[6]);
+    }
+
+    static void onFrameEnd(Core* core, uint64_t frameTicks) {
+        currentFrame++;
+        if (currentFrame == 1) startTick = PPCGetTickCount();
+        uint64_t frameUs = PPCTicksToUs(frameTicks);
+        accumFrameUs += frameUs;
+
+        if (!isCheckpoint(currentFrame))
+            return;
+
+        Memory& mem = core->memory;
+        size_t ramLen = core->gbaMode ? 0x40000 : 0x400000;
+        uint64_t hRam   = fnv1a64(mem.ram, ramLen);
+        uint64_t hWram  = fnv1a64(mem.wram, sizeof(mem.wram));
+        uint64_t hItcm  = fnv1a64(mem.instrTcm, sizeof(mem.instrTcm));
+        uint64_t hDtcm  = fnv1a64(mem.dataTcm, sizeof(mem.dataTcm));
+        uint64_t hWram7 = fnv1a64(mem.wram7, sizeof(mem.wram7));
+        uint64_t hPal   = fnv1a64(mem.palette, sizeof(mem.palette));
+        uint64_t hOam   = fnv1a64(mem.oam, sizeof(mem.oam));
+        uint64_t hVram  = fnv1a64(mem.vramA, sizeof(mem.vramA));
+        hVram = fnv1a64(mem.vramB, sizeof(mem.vramB), hVram);
+        hVram = fnv1a64(mem.vramC, sizeof(mem.vramC), hVram);
+        hVram = fnv1a64(mem.vramD, sizeof(mem.vramD), hVram);
+        hVram = fnv1a64(mem.vramE, sizeof(mem.vramE), hVram);
+        hVram = fnv1a64(mem.vramF, sizeof(mem.vramF), hVram);
+        hVram = fnv1a64(mem.vramG, sizeof(mem.vramG), hVram);
+        hVram = fnv1a64(mem.vramH, sizeof(mem.vramH), hVram);
+        hVram = fnv1a64(mem.vramI, sizeof(mem.vramI), hVram);
+
+        uint64_t hTotalMem = hRam ^ (hWram << 1) ^ (hItcm << 2) ^ (hDtcm << 3) ^
+                             (hWram7 << 4) ^ (hPal << 5) ^ (hOam << 6) ^ (hVram << 7);
+
+        size_t scrPixels = NDS_SCREEN_WIDTH * NDS_SCREEN_HEIGHT;
+        uint64_t hFbTop  = fnv1a64(tempBuffer, scrPixels * sizeof(uint32_t));
+        uint64_t hFbBot  = fnv1a64(tempBuffer + scrPixels, scrPixels * sizeof(uint32_t));
+        uint64_t hFbAll  = fnv1a64(tempBuffer, scrPixels * 2 * sizeof(uint32_t));
+
+        if (FILE* f = fopen("sd:/g2_state.log", "ab")) {
+            fprintf(f, "=== CHECKPOINT FRAME %u ===\n", currentFrame);
+            fprintf(f, "CYCLES global=%u arm9=%u arm7=%u gbaMode=%d\n",
+                    core->globalCycles, core->interpreter[0].cycles, core->interpreter[1].cycles, (int)core->gbaMode);
+            dumpCpuLine(f, "ARM9", core->interpreter[0]);
+            dumpCpuLine(f, "ARM7", core->interpreter[1]);
+#if NOODS_G2_SCRIPTED_INPUT
+            fprintf(f, "SCRIPT_INPUT frame=%u key=%04X ext=%04X right=%u:%u,%u:%u,%u:%u\n",
+                    currentFrame, core->input.readKeyInput(), core->input.readExtKeyIn(),
+                    inputRightFrom, inputRightTo, inputRight2From, inputRight2To,
+                    inputRight3From, inputRight3To);
+#endif
+            fprintf(f, "MEM_HASH ram=%016llX wram=%016llX itcm=%016llX dtcm=%016llX wram7=%016llX pal=%016llX vram=%016llX oam=%016llX total=%016llX\n",
+                    (unsigned long long)hRam, (unsigned long long)hWram,
+                    (unsigned long long)hItcm, (unsigned long long)hDtcm,
+                    (unsigned long long)hWram7, (unsigned long long)hPal,
+                    (unsigned long long)hVram, (unsigned long long)hOam,
+                    (unsigned long long)hTotalMem);
+            fprintf(f, "FB_HASH top=%016llX bottom=%016llX combined=%016llX\n",
+                    (unsigned long long)hFbTop, (unsigned long long)hFbBot, (unsigned long long)hFbAll);
+            fprintf(f, "PERF frame=%u accum_us=%llu avg_frame_us=%llu\n",
+                    currentFrame, (unsigned long long)accumFrameUs,
+                    (unsigned long long)(accumFrameUs / currentFrame));
+            // Rendered FPS and emulated FPS are different when frameskip is nonzero.
+            // Sample the UI's rendered-frame counter separately from Core::fps.
+            PPCIrqState frameLock = PPCIrqLockByMsr();
+            uint32_t rendered = perf.renderFrameCount;
+            PPCIrqUnlockByMsr(frameLock);
+            fprintf(f, "DISPLAY frames=%u rendered=%u produced=%u overwritten=%u core_fps=%d skip=%d elapsed_us=%llu loops=%u render_us=%llu flush_us=%llu vsync_us=%llu\n",
+                    currentFrame, rendered, framesProduced, framesOverwritten,
+                    core->fps, Settings::frameskip,
+                    (unsigned long long)PPCTicksToUs(PPCGetTickCount() - startTick),
+                    videoLoopCount,
+                    (unsigned long long)PPCTicksToUs(videoRenderTicks),
+                    (unsigned long long)PPCTicksToUs(videoFlushTicks),
+                    (unsigned long long)PPCTicksToUs(videoVsyncTicks));
+#if NOODS_JIT
+            ArmPpcJit::dumpStats(f);
+#else
+            fprintf(f, "JIT_STATS enabled=0\n");
+#endif
+#if NOODS_NDS_TASK_PROFILE
+            if (!core->gbaMode) Interpreter::dumpNdsTaskProfile(f);
+#endif
+            fflush(f);
+            fclose(f);
+        }
+
+        if (maxFrames > 0 && currentFrame == maxFrames) {
+            mem.syncMgbaLogToSd(false);
+            if (FILE* mf = fopen("sd:/mem_dump.bin", "wb")) {
+                fwrite(mem.wram, 1, sizeof(mem.wram), mf);
+                fwrite(mem.instrTcm, 1, sizeof(mem.instrTcm), mf);
+                fwrite(mem.dataTcm, 1, sizeof(mem.dataTcm), mf);
+                fwrite(mem.wram7, 1, sizeof(mem.wram7), mf);
+                fwrite(mem.palette, 1, sizeof(mem.palette), mf);
+                fwrite(mem.oam, 1, sizeof(mem.oam), mf);
+#if NOODS_FULL_RAM_DUMP
+                fwrite(mem.ram, 1, 0x400000, mf);
+#else
+                fwrite(mem.ram, 1, 0x40000, mf);
+#endif
+                fflush(mf);
+                fclose(mf);
+            }
+            if (FILE* ff = fopen("sd:/fb_dump.bin", "wb")) {
+                fwrite(tempBuffer, sizeof(uint32_t), scrPixels * 2, ff);
+                fflush(ff);
+                fclose(ff);
+            }
+            fatUnmount("sd");
+            fatInitDefault();
+        }
+
+        SYS_Report("[NOODS] CHECKPOINT frame=%u cyc=%u mem=%016llX fb=%016llX us=%llu\n",
+                   currentFrame, core->globalCycles,
+                   (unsigned long long)hTotalMem, (unsigned long long)hFbAll,
+                   (unsigned long long)accumFrameUs);
+
+        if (maxFrames > 0 && currentFrame >= maxFrames) {
+            SYS_Report("[NOODS] MAX_FRAMES_DONE frame=%u\n", currentFrame);
+            runEmulatorThread = false;
+        }
+    }
+};
+
+uint32_t NoodsTestHarness::maxFrames = 0;
+std::vector<uint32_t> NoodsTestHarness::checkpoints;
+uint32_t NoodsTestHarness::poolLimitWords = 0;
+#if NOODS_G2_SCRIPTED_INPUT
+uint32_t NoodsTestHarness::inputAFrom = 0, NoodsTestHarness::inputATo = 0;
+uint32_t NoodsTestHarness::inputA2From = 0, NoodsTestHarness::inputA2To = 0;
+uint32_t NoodsTestHarness::inputRightFrom = 0, NoodsTestHarness::inputRightTo = 0;
+uint32_t NoodsTestHarness::inputRight2From = 0, NoodsTestHarness::inputRight2To = 0;
+uint32_t NoodsTestHarness::inputRight3From = 0, NoodsTestHarness::inputRight3To = 0;
+#endif
+uint32_t NoodsTestHarness::currentFrame = 0;
+uint64_t NoodsTestHarness::startTick = 0;
+uint64_t NoodsTestHarness::accumFrameUs = 0;
+
 static sptr EmulatorThreadMain(void* /*arg*/) {
     const size_t pixelCount = NDS_SCREEN_WIDTH * NDS_SCREEN_HEIGHT * 2;
 
@@ -468,6 +798,10 @@ static sptr EmulatorThreadMain(void* /*arg*/) {
                 else               ndsRom = loadPath;
             }
 
+            // Default to a displayed frame per emulated GBA frame; preserve
+            // the player's explicit frameskip choice and the DS default.
+            if (!frameskipUserSet) Settings::frameskip = gbaRom.empty() ? 2 : 0;
+
             try {
                 ndsCore   = new Core(ndsRom, gbaRom);
                 romLoaded = true;
@@ -486,6 +820,17 @@ static sptr EmulatorThreadMain(void* /*arg*/) {
                 int16_t  touchY   = g_ndsTouchY;
                 PPCIrqUnlockByMsr(st);
 
+#if NOODS_G2_SCRIPTED_INPUT
+                uint32_t f = NoodsTestHarness::currentFrame;
+                if ((NoodsTestHarness::inputAFrom && f >= NoodsTestHarness::inputAFrom && f < NoodsTestHarness::inputATo) ||
+                    (NoodsTestHarness::inputA2From && f >= NoodsTestHarness::inputA2From && f < NoodsTestHarness::inputA2To))
+                    buttons |= (1u << NDS_KEY_A);
+                if ((NoodsTestHarness::inputRightFrom && f >= NoodsTestHarness::inputRightFrom && f < NoodsTestHarness::inputRightTo) ||
+                    (NoodsTestHarness::inputRight2From && f >= NoodsTestHarness::inputRight2From && f < NoodsTestHarness::inputRight2To) ||
+                    (NoodsTestHarness::inputRight3From && f >= NoodsTestHarness::inputRight3From && f < NoodsTestHarness::inputRight3To))
+                    buttons |= (1u << NDS_KEY_RIGHT);
+#endif
+
                 for (int bit = 0; bit < 12; bit++) {
                     if (buttons & (1 << bit)) ndsCore->input.pressKey(bit);
                     else                      ndsCore->input.releaseKey(bit);
@@ -499,14 +844,23 @@ static sptr EmulatorThreadMain(void* /*arg*/) {
                 }
             }
 
+            uint64_t t0 = PPCGetTickCount();
             ndsCore->runCore();
+            uint64_t t1 = PPCGetTickCount();
 
             if (ndsCore->gpu.getFrame(tempBuffer, ndsCore->gbaMode)) {
                 PPCIrqState st = PPCIrqLockByMsr();
-                memcpy(backBuffer, tempBuffer, pixelCount * sizeof(uint32_t));
+                framesProduced++;
+                if (newFrameReady) framesOverwritten++;
+                // GBA output is 240x160, not two 256x192 DS screens. Keep the
+                // interrupt-disabled copy limited to the pixels actually displayed.
+                size_t copyPixels = ndsCore->gbaMode ? (size_t)GBA_SCREEN_WIDTH * GBA_SCREEN_HEIGHT : pixelCount;
+                memcpy(backBuffer, tempBuffer, copyPixels * sizeof(uint32_t));
                 newFrameReady = true;
                 PPCIrqUnlockByMsr(st);
             }
+
+            NoodsTestHarness::onFrameEnd(ndsCore, t1 - t0);
         }
         else {
             KThreadSleepMs(16);
@@ -537,6 +891,11 @@ static void InitializeNDS() {
 
     if (fatInitDefault()) {
         UpdateFileBrowser(currentDir);
+#if NOODS_FORCE_BROWSER
+        SYS_Report("[NOODS] FILE_BROWSER active dir=%s\n", currentDir.c_str());
+#else
+        NoodsTestHarness::tryAutoboot();
+#endif
     }
 
     const size_t sz = NDS_SCREEN_WIDTH * NDS_SCREEN_HEIGHT * sizeof(uint32_t);
@@ -1161,7 +1520,10 @@ int main(int /*argc*/, char** /*argv*/) {
         }
         else {
             Wii_DebugOverlayPrint(0, " ");
-            Wii_DebugOverlayPrint(1, "FPS: %5.1f", perf.fps);
+            // Present FPS excludes frames skipped by the GPU; Core::fps counts
+            // every emulated video frame. Show both to avoid conflating them.
+            Wii_DebugOverlayPrint(1, "Display: %5.1f  Emu: %d FPS", perf.fps,
+                                  ndsCore ? ndsCore->fps : 0);
             Wii_DebugOverlayPrint(2, "HOME=Quit  B++=Settings");
             Wii_DebugOverlayPrint(3, " ");
             Wii_DebugOverlayPrint(4, " ");
@@ -1172,9 +1534,17 @@ int main(int /*argc*/, char** /*argv*/) {
 
         bool isGba = (ndsCore && romLoaded && !showFileBrowser
                       && !showSettingsMenu) ? ndsCore->gbaMode : false;
+        uint64_t videoT0 = PPCGetTickCount();
         Wii_VideoRender(renderTop, renderBottom, isGba);
+        uint64_t videoT1 = PPCGetTickCount();
         Wii_VideoFlushAsync();
+        uint64_t videoT2 = PPCGetTickCount();
         VIDEO_WaitVSync();
+        uint64_t videoT3 = PPCGetTickCount();
+        videoRenderTicks += videoT1 - videoT0;
+        videoFlushTicks += videoT2 - videoT1;
+        videoVsyncTicks += videoT3 - videoT2;
+        videoLoopCount++;
     }
 
     return 0;

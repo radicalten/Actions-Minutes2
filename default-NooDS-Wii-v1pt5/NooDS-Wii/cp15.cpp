@@ -26,6 +26,11 @@ void Cp15::saveState(FILE *file) {
     fwrite(&dtcmReg, sizeof(dtcmReg), 1, file);
     fwrite(&itcmReg, sizeof(itcmReg), 1, file);
     fwrite(&procId, sizeof(procId), 1, file);
+    fwrite(&dataCacheConfig, sizeof(dataCacheConfig), 1, file);
+    fwrite(&instructionCacheConfig, sizeof(instructionCacheConfig), 1, file);
+    fwrite(&writeBufferControl, sizeof(writeBufferControl), 1, file);
+    fwrite(regionPerms, sizeof(regionPerms), 1, file);
+    fwrite(regionControl, sizeof(regionControl), 1, file);
 }
 
 void Cp15::loadState(FILE *file) {
@@ -35,6 +40,11 @@ void Cp15::loadState(FILE *file) {
     fread(&dtcm, sizeof(dtcm), 1, file);
     fread(&itcm, sizeof(itcm), 1, file);
     fread(&procId, sizeof(procId), 1, file);
+    fread(&dataCacheConfig, sizeof(dataCacheConfig), 1, file);
+    fread(&instructionCacheConfig, sizeof(instructionCacheConfig), 1, file);
+    fread(&writeBufferControl, sizeof(writeBufferControl), 1, file);
+    fread(regionPerms, sizeof(regionPerms), 1, file);
+    fread(regionControl, sizeof(regionControl), 1, file);
 
     // Set registers along with values based on them
     write(1, 0, 0, ctrl);
@@ -43,11 +53,33 @@ void Cp15::loadState(FILE *file) {
 }
 
 uint32_t Cp15::read(uint8_t cn, uint8_t cm, uint8_t cp) {
-    // Read a value from a CP15 register
-    switch ((cn << 16) | (cm << 8) | (cp << 0)) {
-        case 0x000000: return 0x41059461; // Main ID
+    // Read a value from a CP15 register.
+    if (cn == 5 && cm == 0 && cp <= 3) {
+        uint32_t value = 0;
+        const bool wide = cp >= 2;
+        const unsigned fieldBits = wide ? 4 : 2;
+        for (unsigned region = 0; region < 8; region++) {
+            uint32_t field;
+            if (cp == 0) field = (regionPerms[region] >> 4) & 0x03;
+            else if (cp == 1) field = regionPerms[region] & 0x03;
+            else if (cp == 2) field = (regionPerms[region] >> 4) & 0x0F;
+            else field = regionPerms[region] & 0x0F;
+            value |= field << (region * fieldBits);
+        }
+        return value;
+    }
+    if (cn == 6 && cm < 8 && cp <= 1)
+        return regionControl[cm];
+
+    switch ((cn << 16) | (cm << 8) | cp) {
+        case 0x000000: case 0x000003: case 0x000004: case 0x000005:
+        case 0x000006: case 0x000007: return 0x41059461; // Main ID (mirrored)
         case 0x000001: return 0x0F0D2112; // Cache type
+        case 0x000002: return 0x00140180; // TCM size
         case 0x010000: return ctrlReg; // Control
+        case 0x020000: return dataCacheConfig; // Data cache configuration
+        case 0x020001: return instructionCacheConfig; // Instruction cache configuration
+        case 0x030000: return writeBufferControl; // Write-buffer control
         case 0x090100: return dtcmReg; // Data TCM base/size
         case 0x090101: return itcmReg; // Instruction TCM size
         case 0x0D0001: case 0x0D0101: return procId; // Trace process ID
@@ -59,9 +91,39 @@ uint32_t Cp15::read(uint8_t cn, uint8_t cm, uint8_t cp) {
 }
 
 void Cp15::write(uint8_t cn, uint8_t cm, uint8_t cp, uint32_t value) {
-    // Write a value to a CP15 register
+    // Write a value to a CP15 register.
     uint32_t oldAddr, oldSize;
-    switch ((cn << 16) | (cm << 8) | (cp << 0)) {
+    if (cn == 5 && cm == 0 && cp <= 3) {
+        const bool wide = cp >= 2;
+        const unsigned fieldBits = wide ? 4 : 2;
+        const uint32_t fieldMask = wide ? 0x0F : 0x03;
+        for (unsigned region = 0; region < 8; region++) {
+            const uint8_t field = (value >> (region * fieldBits)) & fieldMask;
+            if (cp == 0 || cp == 2)
+                regionPerms[region] = (regionPerms[region] & 0x0F) | (field << 4);
+            else
+                regionPerms[region] = (regionPerms[region] & 0xF0) | field;
+        }
+        return;
+    }
+    if (cn == 6 && cm < 8 && cp <= 1) {
+        regionControl[cm] = value & 0xFFFFF03F;
+        return;
+    }
+
+    switch ((cn << 16) | (cm << 8) | cp) {
+    case 0x020000: // Data cache configuration
+        dataCacheConfig = value & 0xFF;
+        return;
+
+    case 0x020001: // Instruction cache configuration
+        instructionCacheConfig = value & 0xFF;
+        return;
+
+    case 0x030000: // Write-buffer control
+        writeBufferControl = value & 0xFF;
+        return;
+
     case 0x010000: // Control
         // Set writable control bits and update their state values
         ctrlReg = (ctrlReg & ~0xFF085) | (value & 0xFF085);

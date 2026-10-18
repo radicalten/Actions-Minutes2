@@ -19,6 +19,7 @@
 */
 
 #include "core.h"
+#include "arm_jit.h"
 #include <tuxedo/thread.h>
 
 Interpreter::Interpreter(Core *core, bool arm7): core(core), arm7(arm7) {
@@ -77,13 +78,20 @@ void Interpreter::loadState(FILE *file) {
     // Update mapped registers
     swapRegisters(cpsr);
     pcData = nullptr;
+#if NOODS_JIT
+    ArmPpcJit::invalidateCpu(arm7);
+#endif
 }
 
 void Interpreter::init() {
     // Prepare to boot the BIOS
+    spsrFiq = spsrSvc = spsrAbt = spsrIrq = spsrUnd = 0x10;
     setCpsr(0x000000D3); // Supervisor, interrupts off
     registersUsr[15] = arm7 ? 0x00000000 : 0xFFFF0000;
     flushPipeline();
+#if NOODS_JIT
+    ArmPpcJit::invalidateCpu(arm7);
+#endif
 
     // Reset the I/O registers
     ime = 0;
@@ -93,6 +101,7 @@ void Interpreter::init() {
 
 void Interpreter::directBoot() {
     // Prepare to directly boot a ROM
+    spsrFiq = spsrSvc = spsrAbt = spsrIrq = spsrUnd = 0x10;
     setCpsr(0x000000DF); // System, interrupts off
     registersUsr[15] = core->gbaMode ? 0x8000000 : entryAddr;
     registersUsr[14] = registersUsr[15];
@@ -101,6 +110,9 @@ void Interpreter::directBoot() {
     registersIrq[0] = arm7 ? (core->gbaMode ? 0x3007FA0 : 0x380FF80) : 0x3003F80;
     registersSvc[0] = arm7 ? (core->gbaMode ? 0x3007FE0 : 0x380FFC0) : 0x3003FC0;
     flushPipeline();
+#if NOODS_JIT
+    ArmPpcJit::invalidateCpu(arm7);
+#endif
 }
 
 void Interpreter::resetCycles() {
@@ -121,7 +133,12 @@ void Interpreter::runCoreNone(Core &core) {
         // Jump to the next task and run all that are scheduled now
         core.globalCycles = core.events[0].cycles;
         while (core.events[0].cycles <= core.globalCycles) {
+            {
+#if NOODS_JIT && NOODS_JIT_POLL_SKIP
+                ArmPpcJit::pollEpoch++;
+#endif
             core.tasks[core.events[0].task]();
+            }
             core.events.erase(core.events.begin());
         }
     }
@@ -149,11 +166,32 @@ template <bool _arm7, int shift> void Interpreter::runCoreSingle(Core &core) {
         // Jump to the next task and run all that are scheduled now
         core.globalCycles = core.events[0].cycles;
         while (core.events[0].cycles <= core.globalCycles) {
+            {
+#if NOODS_JIT && NOODS_JIT_POLL_SKIP
+                ArmPpcJit::pollEpoch++;
+#endif
             core.tasks[core.events[0].task]();
+            }
             core.events.erase(core.events.begin());
         }
     }
 }
+
+#if NOODS_NDS_TASK_PROFILE
+// Diagnostic only: aggregate PPC time in CPU scheduling and each scheduled task.
+static uint64_t ndsCpuTicks;
+static uint64_t ndsTaskTicks[MAX_TASKS];
+static uint32_t ndsTaskCalls[MAX_TASKS];
+
+void Interpreter::dumpNdsTaskProfile(FILE *f) {
+    fprintf(f, "NDS_CPU us=%llu\n", (unsigned long long)PPCTicksToUs(ndsCpuTicks));
+    for (unsigned i = 0; i < MAX_TASKS; ++i) {
+        if (ndsTaskCalls[i])
+            fprintf(f, "NDS_TASK id=%u count=%u us=%llu\n", i, ndsTaskCalls[i],
+                    (unsigned long long)PPCTicksToUs(ndsTaskTicks[i]));
+    }
+}
+#endif
 
 void Interpreter::runCoreNds(Core &core) {
     // Run the core with both CPUs active in NDS mode
@@ -168,6 +206,9 @@ void Interpreter::runCoreNds(Core &core) {
         if (!is_running) break;
 
         // Run the ARM9 and half-speed ARM7 until the next scheduled task
+#if NOODS_NDS_TASK_PROFILE
+        uint64_t cpuStart = PPCGetTickCount();
+#endif
         while (core.events[0].cycles > core.globalCycles) {
             if (core.globalCycles >= arm9.cycles)
                 arm9.cycles = core.globalCycles + arm9.runOpcode();
@@ -176,10 +217,26 @@ void Interpreter::runCoreNds(Core &core) {
             core.globalCycles = std::min<uint32_t>(arm9.cycles, arm7.cycles);
         }
 
+#if NOODS_NDS_TASK_PROFILE
+        ndsCpuTicks += PPCGetTickCount() - cpuStart;
+#endif
         // Jump to the next task and run all that are scheduled now
         core.globalCycles = core.events[0].cycles;
         while (core.events[0].cycles <= core.globalCycles) {
+            {
+#if NOODS_JIT && NOODS_JIT_POLL_SKIP
+                ArmPpcJit::pollEpoch++;
+#endif
+#if NOODS_NDS_TASK_PROFILE
+            SchedTask task = core.events[0].task;
+            uint64_t taskStart = PPCGetTickCount();
+            core.tasks[task]();
+            ndsTaskTicks[task] += PPCGetTickCount() - taskStart;
+            ndsTaskCalls[task]++;
+#else
             core.tasks[core.events[0].task]();
+#endif
+            }
             core.events.erase(core.events.begin());
         }
     }
@@ -215,7 +272,12 @@ void Interpreter::runCoreDsi(Core &core) {
         // Jump to the next task and run all that are scheduled now
         core.globalCycles = core.events[0].cycles;
         while (core.events[0].cycles <= core.globalCycles) {
+            {
+#if NOODS_JIT && NOODS_JIT_POLL_SKIP
+                ArmPpcJit::pollEpoch++;
+#endif
             core.tasks[core.events[0].task]();
+            }
             core.events.erase(core.events.begin());
         }
     }
@@ -232,7 +294,11 @@ FORCE_INLINE int Interpreter::runOpcode() {
         pipeline[1] = (((*registers[15] += 2) & 0xFFE) && pcData) ? U8TO16(pcData += 2, 0) : getOpcode16();
 
         // Execute a THUMB instruction
+#if NOODS_JIT
+        return ArmPpcJit::executeThumb(this, opcode);
+#else
         return (this->*thumbInstrs[(opcode >> 6) & 0x3FF])(opcode);
+#endif
     }
     else { // ARM mode
         // Increment the program counter and fill the pipeline from pointer or fallback
@@ -242,7 +308,11 @@ FORCE_INLINE int Interpreter::runOpcode() {
         switch (condition[((opcode >> 24) & 0xF0) | (cpsr >> 28)]) {
             case 0: return 1; // False
             case 2: return handleReserved(opcode); // Reserved
+#if NOODS_JIT
+            default: return ArmPpcJit::executeArm(this, opcode);
+#else
             default: return (this->*armInstrs[((opcode >> 16) & 0xFF0) | ((opcode >> 4) & 0xF)])(opcode);
+#endif
         }
     }
 }
@@ -317,6 +387,16 @@ int Interpreter::exception(uint8_t vector) {
     return 3;
 }
 
+int Interpreter::undefinedException(bool thumb) {
+    // Match Dust's ARM7/ARM9 undefined-instruction entry: preserve the old CPSR
+    // in the Undefined SPSR bank, clear Thumb state, disable IRQs, and branch to +4.
+    setCpsr((cpsr & ~0x3F) | BIT(7) | 0x1B, true);
+    *registers[14] = *registers[15] - (thumb ? 2 : 4);
+    *registers[15] = (arm7 ? 0 : core->cp15.exceptionAddr) | 0x04;
+    flushPipeline();
+    return 3;
+}
+
 void Interpreter::flushPipeline() {
     // Adjust the program counter and refill the pipeline after a jump
     if (cpsr & BIT(5)) { // THUMB mode
@@ -333,9 +413,18 @@ void Interpreter::flushPipeline() {
 
 void Interpreter::swapRegisters(uint32_t value) {
     // Swap banked registers based on a CPU mode value
-    switch (value & 0x1F) {
-    case 0x10: // User
-    case 0x1F: // System
+    switch (value & 0x0F) {
+    case 0x00: // User
+    case 0x04: // Reserved: System register bank, Abort SPSR bank
+    case 0x05:
+    case 0x06:
+    case 0x08: // Reserved: System register bank, Undefined SPSR bank
+    case 0x09:
+    case 0x0A:
+    case 0x0C: // Reserved and System modes share the System register bank
+    case 0x0D:
+    case 0x0E:
+    case 0x0F: // System
         registers[8] = &registersUsr[8];
         registers[9] = &registersUsr[9];
         registers[10] = &registersUsr[10];
@@ -343,10 +432,15 @@ void Interpreter::swapRegisters(uint32_t value) {
         registers[12] = &registersUsr[12];
         registers[13] = &registersUsr[13];
         registers[14] = &registersUsr[14];
-        spsr = nullptr;
+        if ((value & 0x0F) >= 0x04 && (value & 0x0F) <= 0x06)
+            spsr = &spsrAbt;
+        else if ((value & 0x0F) >= 0x08 && (value & 0x0F) <= 0x0A)
+            spsr = &spsrUnd;
+        else
+            spsr = nullptr;
         break;
 
-    case 0x11: // FIQ
+    case 0x01: // FIQ (mode field bits 3:0)
         registers[8] = &registersFiq[0];
         registers[9] = &registersFiq[1];
         registers[10] = &registersFiq[2];
@@ -357,7 +451,7 @@ void Interpreter::swapRegisters(uint32_t value) {
         spsr = &spsrFiq;
         break;
 
-    case 0x12: // IRQ
+    case 0x02: // IRQ (mode field bits 3:0)
         registers[8] = &registersUsr[8];
         registers[9] = &registersUsr[9];
         registers[10] = &registersUsr[10];
@@ -368,7 +462,7 @@ void Interpreter::swapRegisters(uint32_t value) {
         spsr = &spsrIrq;
         break;
 
-    case 0x13: // Supervisor
+    case 0x03: // Supervisor (mode field bits 3:0)
         registers[8] = &registersUsr[8];
         registers[9] = &registersUsr[9];
         registers[10] = &registersUsr[10];
@@ -379,7 +473,7 @@ void Interpreter::swapRegisters(uint32_t value) {
         spsr = &spsrSvc;
         break;
 
-    case 0x17: // Abort
+    case 0x07: // Abort (mode field bits 3:0)
         registers[8] = &registersUsr[8];
         registers[9] = &registersUsr[9];
         registers[10] = &registersUsr[10];
@@ -390,7 +484,7 @@ void Interpreter::swapRegisters(uint32_t value) {
         spsr = &spsrAbt;
         break;
 
-    case 0x1B: // Undefined
+    case 0x0B: // Undefined (mode field bits 3:0)
         registers[8] = &registersUsr[8];
         registers[9] = &registersUsr[9];
         registers[10] = &registersUsr[10];
@@ -402,14 +496,14 @@ void Interpreter::swapRegisters(uint32_t value) {
         break;
 
     default:
-        LOG_CRIT("Unknown ARM%d CPU mode: 0x%X\n", arm7 ? 7 : 9, value & 0x1F);
+        LOG_CRIT("Unknown ARM%d CPU mode: 0x%X\n", arm7 ? 7 : 9, value & 0x0F);
         break;
     }
 }
 
 void Interpreter::setCpsr(uint32_t value, bool save) {
     // Update registers if the CPU mode changed
-    if ((value & 0x1F) != (cpsr & 0x1F))
+    if ((value & 0x0F) != (cpsr & 0x0F))
         swapRegisters(value);
 
     // Set the CPSR, saving the old value if requested
@@ -475,15 +569,15 @@ int Interpreter::finishHleIrq() {
 }
 
 int Interpreter::unkArm(uint32_t opcode) {
-    // Handle an unknown ARM opcode
-    LOG_CRIT("Unknown ARM%d ARM opcode: 0x%X\n", arm7 ? 7 : 9, opcode);
-    return 1;
+    // Unknown ARM encodings enter Undefined mode rather than acting as NOPs.
+    (void)opcode;
+    return undefinedException(false);
 }
 
 int Interpreter::unkThumb(uint16_t opcode) {
-    // Handle an unknown THUMB opcode
-    LOG_CRIT("Unknown ARM%d THUMB opcode: 0x%X\n", arm7 ? 7 : 9, opcode);
-    return 1;
+    // Unknown Thumb encodings enter the same Undefined vector with a Thumb LR offset.
+    (void)opcode;
+    return undefinedException(true);
 }
 
 void Interpreter::writeIme(uint8_t value) {

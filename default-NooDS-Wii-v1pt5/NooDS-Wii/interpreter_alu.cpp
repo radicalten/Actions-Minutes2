@@ -20,6 +20,12 @@
 
 #include "core.h"
 
+// Avoid undefined C++ shifts when ARM rotate amounts are zero or a multiple of 32.
+static inline uint32_t rotateRight32(uint32_t value, unsigned amount) {
+    amount &= 31;
+    return amount ? ((value >> amount) | (value << (32 - amount))) : value;
+}
+
 // Define functions for each ARM shift variation
 #define ALU_FUNCS(func, S) \
     int Interpreter::func##Lli(uint32_t opcode) { return func(opcode, lli##S(opcode)); } \
@@ -135,14 +141,14 @@ FORCE_INLINE uint32_t Interpreter::rrr(uint32_t opcode) { // Rm,ROR Rs
     // When used as Rm, the program counter is read with +4
     uint32_t value = *registers[opcode & 0xF] + (((opcode & 0xF) == 0xF) << 2);
     uint8_t shift = *registers[(opcode >> 8) & 0xF];
-    return (value << (32 - (shift & 0x1F))) | (value >> ((shift & 0x1F)));
+    return rotateRight32(value, shift);
 }
 
 FORCE_INLINE uint32_t Interpreter::imm(uint32_t opcode) { // #i
     // Rotate 8-bit immediate right by a multiple of 2
     uint32_t value = opcode & 0xFF;
     uint8_t shift = (opcode >> 7) & 0x1E;
-    return (value << (32 - shift)) | (value >> shift);
+    return rotateRight32(value, shift);
 }
 
 FORCE_INLINE uint32_t Interpreter::lliS(uint32_t opcode) { // Rm,LSL #i (S)
@@ -203,7 +209,7 @@ FORCE_INLINE uint32_t Interpreter::rriS(uint32_t opcode) { // Rm,ROR #i (S)
     // A shift of 0 translates to a rotate with carry of 1
     uint32_t value = *registers[opcode & 0xF];
     uint8_t shift = (opcode >> 7) & 0x1F;
-    uint32_t res = shift ? ((value << (32 - shift)) | (value >> shift)) : (((cpsr & BIT(29)) << 2) | (value >> 1));
+    uint32_t res = shift ? rotateRight32(value, shift) : (((cpsr & BIT(29)) << 2) | (value >> 1));
     cpsr = (cpsr & ~BIT(29)) | ((bool)(value & BIT(shift ? (shift - 1) : 0)) << 29);
     return res;
 }
@@ -214,7 +220,7 @@ FORCE_INLINE uint32_t Interpreter::rrrS(uint32_t opcode) { // Rm,ROR Rs (S)
     uint32_t value = *registers[opcode & 0xF] + (((opcode & 0xF) == 0xF) << 2);
     uint8_t shift = *registers[(opcode >> 8) & 0xF];
     if (shift > 0) cpsr = (cpsr & ~BIT(29)) | ((bool)(value & BIT((shift - 1) & 0x1F)) << 29);
-    return (value << (32 - (shift & 0x1F))) | (value >> ((shift & 0x1F)));
+    return rotateRight32(value, shift);
 }
 
 FORCE_INLINE uint32_t Interpreter::immS(uint32_t opcode) { // #i (S)
@@ -222,7 +228,7 @@ FORCE_INLINE uint32_t Interpreter::immS(uint32_t opcode) { // #i (S)
     uint32_t value = opcode & 0xFF;
     uint8_t shift = (opcode >> 7) & 0x1E;
     if (shift > 0) cpsr = (cpsr & ~BIT(29)) | ((bool)(value & BIT(shift - 1)) << 29);
-    return (value << (32 - shift)) | (value >> shift);
+    return rotateRight32(value, shift);
 }
 
 FORCE_INLINE int Interpreter::_and(uint32_t opcode, uint32_t op2) { // AND Rd,Rn,op2
@@ -531,7 +537,7 @@ FORCE_INLINE int Interpreter::rscs(uint32_t opcode, uint32_t op2) { // RSCS Rd,R
     uint32_t *op0 = registers[(opcode >> 12) & 0xF];
     uint32_t op1 = *registers[(opcode >> 16) & 0xF] + (((opcode & 0x20F0010) == 0x00F0010) << 2);
     *op0 = op2 - op1 - 1 + ((cpsr & BIT(29)) >> 29);
-    cpsr = (cpsr & ~0xC0000000) | (*op0 & BIT(31)) | ((*op0 == 0) << 30) | ((op2 >= *op0 &&
+    cpsr = (cpsr & ~0xF0000000) | (*op0 & BIT(31)) | ((*op0 == 0) << 30) | ((op2 >= *op0 &&
         (op1 != -1 || (cpsr & BIT(29)))) << 29) | (((op1 ^ op2) & ~(*op0 ^ op1) & BIT(31)) >> 3);
 
     // Handle pipelining and mode switching
@@ -1232,7 +1238,7 @@ int Interpreter::rorDpT(uint16_t opcode) { // ROR Rd,Rs
     uint32_t *op0 = registers[opcode & 0x7];
     uint32_t op1 = *registers[opcode & 0x7];
     uint8_t op2 = *registers[(opcode >> 3) & 0x7];
-    *op0 = (*op0 << (32 - (op2 & 0x1F))) | (*op0 >> (op2 & 0x1F));
+    *op0 = rotateRight32(*op0, op2);
     cpsr = (cpsr & ~0xC0000000) | (*op0 & BIT(31)) | ((*op0 == 0) << 30);
     if (op2 > 0) cpsr = (cpsr & ~BIT(29)) | ((bool)(op1 & BIT((op2 - 1) & 0x1F)) << 29);
     return 1;
@@ -1339,7 +1345,8 @@ int Interpreter::negDpT(uint16_t opcode) { // NEG Rd,Rs
     uint32_t *op0 = registers[opcode & 0x7];
     uint32_t op2 = *registers[(opcode >> 3) & 0x7];
     *op0 = -op2;
-    cpsr = (cpsr & ~0xF0000000) | (*op0 & BIT(31)) | ((*op0 == 0) << 30) | ((*op0 <= 0) << 29);
+    cpsr = (cpsr & ~0xF0000000) | (*op0 & BIT(31)) | ((*op0 == 0) << 30) |
+        ((op2 == 0) << 29) | ((op2 == 0x80000000) << 28);
     return 1;
 }
 

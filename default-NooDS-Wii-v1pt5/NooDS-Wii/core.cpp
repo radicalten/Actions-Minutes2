@@ -245,6 +245,9 @@ void Core::saveState(FILE* file) {
 }
 
 void Core::loadState(FILE* file) {
+#if NOODS_JIT && NOODS_JIT_POLL_SKIP
+    ArmPpcJit::pollEpoch++;
+#endif
     fread(&arm7Hle,      sizeof(arm7Hle),      1, file);
     fread(&dsiMode,      sizeof(dsiMode),      1, file);
     fread(&gbaMode,      sizeof(gbaMode),      1, file);
@@ -288,6 +291,7 @@ void Core::updateRun() {
 // resetCycles — prevent globalCycles overflow every ~2 billion ticks
 // ---------------------------------------------------------------------------
 void Core::resetCycles() {
+    divSqrt.resetCycles(globalCycles);
     const size_t n = events.size();
     for (size_t i = 0; i < n; i++)
         events[i].cycles -= globalCycles;

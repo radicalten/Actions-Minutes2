@@ -57,6 +57,7 @@ public:
     void writePowCnt1(uint16_t mask, uint16_t value);
 
 private:
+    friend class ArmPpcJit; // guarded MMIO fast path reads the live DISPSTAT field
     Core *core;
 
     struct Buffers {

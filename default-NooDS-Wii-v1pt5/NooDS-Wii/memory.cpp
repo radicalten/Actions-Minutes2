@@ -19,7 +19,15 @@
 */
 
 #include <cstring>
+#include <cstdio>
+#include <string>
+#ifdef GEKKO
+#include <gccore.h>
+#include <fat.h>
+#endif
 #include "core.h"
+
+static std::string s_mgbaLogData;
 
 // Defines an 8-bit register in an I/O switch statement
 #define DEF_IO_8(addr, func) \
@@ -247,6 +255,9 @@ void Memory::updateMap9(uint32_t start, uint32_t end, bool tcm) {
 
     // Update the ARM9 opcode pointer in case it was remapped
     core->interpreter[0].getOpcode16();
+#if NOODS_JIT
+    ArmPpcJit::invalidateCpu(false);
+#endif
 }
 
 void Memory::updateMap7(uint32_t start, uint32_t end) {
@@ -331,6 +342,9 @@ void Memory::updateMap7(uint32_t start, uint32_t end) {
 
     // Update the ARM7 opcode pointer in case it was remapped
     core->interpreter[1].getOpcode16();
+#if NOODS_JIT
+    ArmPpcJit::invalidateCpu(true);
+#endif
 }
 
 void Memory::updateVram() {
@@ -613,6 +627,8 @@ template <typename T> T Memory::readFallback(bool arm7, uint32_t address) {
 
     // Handle special memory reads such as I/O registers, overlapping VRAM, or areas smaller than 4KB
     if (!arm7) { // ARM9
+        // Fast path for halfword polls of DISPSTAT: same value as ioRead9 (single aligned halfword, base 0)
+        if (sizeof(T) == 2 && address == 0x04000004u) return core->gpu.readDispStat(0);
         switch (address & 0xFF000000) {
         case 0x4000000: // I/O registers
             return ioRead9<T>(address);
@@ -745,6 +761,9 @@ template <typename T> void Memory::writeFallback(bool arm7, uint32_t address, T 
             }
             if (mapping->count == 0) break;
             mapping->write<T>(address & 0x3FFF, value);
+#if NOODS_JIT
+            ArmPpcJit::invalidateSharedAddr(address);
+#endif
             return;
         }
 
@@ -796,6 +815,9 @@ template <typename T> void Memory::writeFallback(bool arm7, uint32_t address, T 
             VramMapping *mapping = &vram7[(address & 0x3FFFF) >> 17];
             if (mapping->count == 0) break;
             mapping->write<T>(address & 0x1FFFF, value);
+#if NOODS_JIT
+            ArmPpcJit::invalidateSharedAddr(address);
+#endif
             return;
         }
 
@@ -809,6 +831,9 @@ template <typename T> void Memory::writeFallback(bool arm7, uint32_t address, T 
     if (data) {
         for (uint32_t i = 0; i < sizeof(T); i++)
             data[i] = value >> (i * 8);
+#if NOODS_JIT
+        ArmPpcJit::invalidateSharedAddr(address);
+#endif
         return;
     }
 
@@ -1131,6 +1156,24 @@ template <typename T> T Memory::ioRead7(uint32_t address) {
 }
 
 template <typename T> T Memory::ioReadGba(uint32_t address) {
+    // Handle mGBA debug registers (0x4FFF600..0x4FFF780)
+    if (address >= 0x4FFF600 && address < 0x4FFF800) {
+        if (address == 0x4FFF780)
+            return (T)mgbaDebugEnable;
+        if (address == 0x4FFF700)
+            return (T)mgbaDebugFlags;
+        if (address < 0x4FFF700) {
+            T val = 0;
+            for (uint32_t i = 0; i < sizeof(T); i++) {
+                uint32_t off = (address + i) - 0x4FFF600;
+                if (off < 256)
+                    val |= (T)((uint8_t)mgbaDebugBuf[off]) << (i * 8);
+            }
+            return val;
+        }
+        return 0;
+    }
+
     // Read a value from one or more GBA I/O registers
     T value = 0;
     for (uint32_t i = 0; i < sizeof(T);) {
@@ -1727,6 +1770,44 @@ template <typename T> void Memory::ioWrite7(uint32_t address, T value) {
 }
 
 template <typename T> void Memory::ioWriteGba(uint32_t address, T value) {
+    // Handle mGBA debug registers (0x4FFF600..0x4FFF780)
+    if (address >= 0x4FFF600 && address < 0x4FFF800) {
+        if (address == 0x4FFF780) {
+            uint16_t v16 = (uint16_t)(value & 0xFFFF);
+            if (v16 == 0xC0DE) {
+                mgbaDebugEnable = 0x1DEA;
+                memset(mgbaDebugBuf, 0, sizeof(mgbaDebugBuf));
+                if (!mgbaLogInitialized) {
+                    s_mgbaLogData.clear();
+                    s_mgbaLogData.reserve(512 * 1024);
+                    mgbaLogInitialized = true;
+                }
+            } else {
+                mgbaDebugEnable = 0;
+            }
+            return;
+        }
+        if (address == 0x4FFF700) {
+            uint16_t v16 = (uint16_t)(value & 0xFFFF);
+            mgbaDebugFlags = v16;
+            if (mgbaDebugEnable == 0x1DEA && (v16 & 0x0100)) {
+                flushMgbaDebugLog(v16);
+                mgbaDebugFlags &= ~0x0100;
+                memset(mgbaDebugBuf, 0, sizeof(mgbaDebugBuf));
+            }
+            return;
+        }
+        if (address < 0x4FFF700) {
+            for (uint32_t i = 0; i < sizeof(T); i++) {
+                uint32_t off = (address + i) - 0x4FFF600;
+                if (off < 256)
+                    mgbaDebugBuf[off] = (char)((value >> (i * 8)) & 0xFF);
+            }
+            return;
+        }
+        return;
+    }
+
     // Write a value to one or more GBA I/O registers
     for (uint32_t i = 0; i < sizeof(T);) {
         // Store data to a register
@@ -1850,6 +1931,47 @@ template <typename T> void Memory::ioWriteGba(uint32_t address, T value) {
 void Memory::writeDmaFill(int channel, uint32_t mask, uint32_t value) {
     // Write to one of the DMAFILL registers
     dmaFill[channel] = (dmaFill[channel] & ~mask) | (value & mask);
+}
+
+void Memory::syncMgbaLogToSd(bool unmountSync) {
+    if (s_mgbaLogData.empty())
+        return;
+    if (FILE *f = fopen("sd:/gbaout.log", "wb")) {
+        fwrite(s_mgbaLogData.data(), 1, s_mgbaLogData.size(), f);
+        fflush(f);
+        fclose(f);
+    }
+#ifdef GEKKO
+    if (unmountSync) {
+        fatUnmount("sd");
+        fatInitDefault();
+    }
+#endif
+}
+
+void Memory::flushMgbaDebugLog(uint16_t /*flags*/) {
+    mgbaDebugBuf[256] = '\0';
+    size_t len = strlen(mgbaDebugBuf);
+    while (len > 0 && (mgbaDebugBuf[len - 1] == '\n' || mgbaDebugBuf[len - 1] == '\r'))
+        mgbaDebugBuf[--len] = '\0';
+    if (len == 0)
+        return;
+
+    s_mgbaLogData.append(mgbaDebugBuf, len);
+    s_mgbaLogData.push_back('\n');
+
+    bool isAllDone = (strcmp(mgbaDebugBuf, "ALL DONE") == 0);
+    bool isMilestone = isAllDone ||
+                       (strncmp(mgbaDebugBuf, "END:", 4) == 0) ||
+                       (strncmp(mgbaDebugBuf, "SKIP:", 5) == 0);
+    if (isMilestone) {
+        syncMgbaLogToSd(isAllDone);
+    }
+#ifdef GEKKO
+    if (isMilestone || strncmp(mgbaDebugBuf, "BEGIN:", 6) == 0 || strstr(mgbaDebugBuf, "FAIL") != nullptr) {
+        SYS_Report("[MGBA] %s\n", mgbaDebugBuf);
+    }
+#endif
 }
 
 void Memory::writeVramCnt(int index, uint8_t value) {

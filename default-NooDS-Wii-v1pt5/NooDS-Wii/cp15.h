@@ -46,4 +46,9 @@ private:
     uint32_t dtcmReg = 0x00;
     uint32_t itcmReg = 0x00;
     uint32_t procId = 0x00;
+    uint32_t dataCacheConfig = 0x00;
+    uint32_t instructionCacheConfig = 0x00;
+    uint32_t writeBufferControl = 0x00;
+    uint8_t regionPerms[8] = {};
+    uint32_t regionControl[8] = {};
 };

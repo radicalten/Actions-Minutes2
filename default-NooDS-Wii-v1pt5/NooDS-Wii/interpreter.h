@@ -44,6 +44,9 @@ public:
     template <bool, int> static void runCoreSingle(Core &core);
     static void runCoreNds(Core &core);
     static void runCoreDsi(Core &core);
+#if NOODS_NDS_TASK_PROFILE
+    static void dumpNdsTaskProfile(FILE *f);
+#endif
 
     uint16_t getOpcode16();
     uint32_t getOpcode32();
@@ -67,6 +70,9 @@ public:
     void writeIrf(uint32_t mask, uint32_t value);
     void writePostFlg(uint8_t value);
 
+    friend struct NoodsTestHarness;
+    friend class ArmPpcJit;
+
 private:
     Core *core;
     bool arm7;
@@ -83,7 +89,9 @@ private:
     uint32_t registersUnd[2] = {};
 
     uint32_t cpsr = 0, *spsr = nullptr;
-    uint32_t spsrFiq = 0, spsrSvc = 0, spsrAbt = 0, spsrIrq = 0, spsrUnd = 0;
+    // Dust initializes every banked SPSR to User mode (0x10); reserved mode bit 4
+    // must remain set when an MSR field mask leaves it untouched.
+    uint32_t spsrFiq = 0x10, spsrSvc = 0x10, spsrAbt = 0x10, spsrIrq = 0x10, spsrUnd = 0x10;
 
     uint32_t cycles = 0;
     bool dsiCycle = false;
@@ -100,6 +108,7 @@ private:
 
     int runOpcode();
     int exception(uint8_t vector);
+    int undefinedException(bool thumb);
     void flushPipeline();
     void swapRegisters(uint32_t value);
     void setCpsr(uint32_t value, bool save = false);

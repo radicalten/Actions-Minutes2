@@ -22,6 +22,7 @@
 
 #include <cstdint>
 #include "defines.h"
+#include "arm_jit.h"
 
 class Core;
 
@@ -67,11 +68,23 @@ public:
     template <typename T> T read(bool arm7, uint32_t address, bool tcm = true);
     template <typename T> void write(bool arm7, uint32_t address, T value, bool tcm = true);
 
+    friend struct NoodsTestHarness;
+    friend class ArmPpcJit;
+
 private:
     Core *core;
     uint32_t gbaBiosAddr = 0;
 
-    uint8_t bios9[0x8000] = {}; // 32KB ARM9 BIOS
+    uint16_t mgbaDebugEnable = 0;
+    uint16_t mgbaDebugFlags = 0;
+    bool mgbaLogInitialized = false;
+    char mgbaDebugBuf[257] = {};
+    void flushMgbaDebugLog(uint16_t flags);
+    void syncMgbaLogToSd(bool unmountSync = false);
+
+    // Keep all page-mapped storage word-aligned for Broadway's byte-reversed
+    // halfword/word bus accesses. The mapped arrays below have 4-byte sizes.
+    alignas(4) uint8_t bios9[0x8000] = {}; // 32KB ARM9 BIOS
     uint8_t bios7[0x4000] = {}; // 16KB ARM7 BIOS
     uint8_t gbaBios[0x4000] = {}; // 16KB GBA BIOS
 
@@ -137,6 +150,24 @@ template <typename T> FORCE_INLINE T Memory::read(bool arm7, uint32_t address, b
     if (uint8_t *data = readMap[address >> 12]) {
         T value = 0;
         data += address & (0x1000 - sizeof(T));
+#ifdef ENDIAN_BIG
+        // On Broadway, aligned mapped pages can use lhbrx/lwbrx instead of
+        // four byte loads and shifts. Preserve byte-wise behavior for maps
+        // whose backing pointer is not aligned (e.g. external ROM buffers).
+        if constexpr (sizeof(T) == 4) {
+            if (((uintptr_t)data & 3u) == 0) {
+                uint32_t raw;
+                __builtin_memcpy(&raw, data, 4);
+                return __builtin_bswap32(raw);
+            }
+        } else if constexpr (sizeof(T) == 2) {
+            if (((uintptr_t)data & 1u) == 0) {
+                uint16_t raw;
+                __builtin_memcpy(&raw, data, 2);
+                return __builtin_bswap16(raw);
+            }
+        }
+#endif
         for (uint32_t i = 0; i < sizeof(T); i++)
             value |= data[i] << (i * 8);
         return value;
@@ -154,8 +185,30 @@ template <typename T> FORCE_INLINE void Memory::write(bool arm7, uint32_t addres
     uint8_t **writeMap = arm7 ? writeMap7 : (tcm ? writeMap9A : writeMap9B);
     if (uint8_t *data = writeMap[address >> 12]) {
         data += address & (0x1000 - sizeof(T));
-        for (uint32_t i = 0; i < sizeof(T); i++)
-            data[i] = value >> (i * 8);
+#ifdef ENDIAN_BIG
+        bool fastStore = false;
+        if constexpr (sizeof(T) == 4) {
+            if (((uintptr_t)data & 3u) == 0) {
+                uint32_t raw = __builtin_bswap32((uint32_t)value);
+                __builtin_memcpy(data, &raw, 4);
+                fastStore = true;
+            }
+        } else if constexpr (sizeof(T) == 2) {
+            if (((uintptr_t)data & 1u) == 0) {
+                uint16_t raw = __builtin_bswap16((uint16_t)value);
+                __builtin_memcpy(data, &raw, 2);
+                fastStore = true;
+            }
+        }
+        if (!fastStore)
+#endif
+        {
+            for (uint32_t i = 0; i < sizeof(T); i++)
+                data[i] = value >> (i * 8);
+        }
+#if NOODS_JIT
+        ArmPpcJit::invalidateSharedAddr(address);
+#endif
         return;
     }
 
