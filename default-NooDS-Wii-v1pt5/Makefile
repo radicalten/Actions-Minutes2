@@ -8,7 +8,6 @@ BLOCKS ?= 0
 FULL_RAM_DUMP ?= 0
 G2_SCRIPTED_INPUT ?= 0
 
-# User-facing JIT builds open the SD browser. Set BROWSER=0 for ROM-autoboot regression runs.
 ifeq ($(origin BROWSER),undefined)
   ifeq ($(JIT),1)
     BROWSER := 1
