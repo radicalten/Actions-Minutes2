@@ -396,7 +396,7 @@ static void InitializeSettings() {
     Settings::sdImagePath  = "";
     Settings::basePath     = "sd:/";
     Settings::fpsLimiter   = 1;
-    Settings::frameskip    = 2; // DS default; GBA defaults to no skipping when loaded.
+    Settings::frameskip    = 0; // DS default; GBA defaults to no skipping when loaded.
     Settings::threaded2D   = 0;
     Settings::threaded3D   = 0;
     Settings::highRes3D    = 0;
