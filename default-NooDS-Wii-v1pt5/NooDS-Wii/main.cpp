@@ -779,7 +779,7 @@ static sptr EmulatorThreadMain(void* /*arg*/) {
 
             // Default to a displayed frame per emulated GBA frame; preserve
             // the player's explicit frameskip choice and the DS default.
-            if (!frameskipUserSet) Settings::frameskip = gbaRom.empty() ? 2 : 0;
+            if (!frameskipUserSet) Settings::frameskip = gbaRom.empty() ? 0 : 0;
 
             try {
                 ndsCore   = new Core(ndsRom, gbaRom);
