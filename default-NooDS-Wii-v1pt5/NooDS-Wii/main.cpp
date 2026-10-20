@@ -52,6 +52,9 @@
 #ifndef NOODS_FULL_RAM_DUMP
 #define NOODS_FULL_RAM_DUMP 0
 #endif
+#ifndef NOODS_TEST_FAST
+#define NOODS_TEST_FAST 0
+#endif
 
 extern "C" {
     #include <tuxedo/thread.h>
@@ -396,7 +399,11 @@ static void InitializeSettings() {
     Settings::sdImagePath  = "";
     Settings::basePath     = "sd:/";
     Settings::fpsLimiter   = 1;
-    Settings::frameskip    = 0; // DS default; GBA defaults to no skipping when loaded.
+    Settings::frameskip    = 0; // DS default; regression tests also pin this to zero.
+#if NOODS_TEST_FAST
+    Settings::fpsLimiter   = 0; // Uncap host presentation; emulated timing is unchanged.
+    Settings::frameskip    = 0;
+#endif
     Settings::threaded2D   = 0;
     Settings::threaded3D   = 0;
     Settings::highRes3D    = 0;
@@ -474,6 +481,7 @@ struct NoodsTestHarness {
     static uint32_t inputAFrom, inputATo, inputA2From, inputA2To;
     static uint32_t inputRightFrom, inputRightTo;
     static uint32_t inputRight2From, inputRight2To, inputRight3From, inputRight3To;
+    static uint32_t vramDumpFrom, vramDumpTo;
 #endif
     static uint32_t currentFrame;
     static uint64_t startTick;
@@ -512,6 +520,7 @@ struct NoodsTestHarness {
         inputAFrom = inputATo = inputA2From = inputA2To = 0;
         inputRightFrom = inputRightTo = inputRight2From = inputRight2To = 0;
         inputRight3From = inputRight3To = 0;
+        vramDumpFrom = vramDumpTo = 0;
 #endif
         currentFrame = 0;
         accumFrameUs = 0;
@@ -562,6 +571,10 @@ struct NoodsTestHarness {
                         inputRight3From = (uint32_t)strtoul(line.c_str() + 18, nullptr, 10);
                     } else if (line.rfind("INPUT_RIGHT3_TO=", 0) == 0) {
                         inputRight3To = (uint32_t)strtoul(line.c_str() + 16, nullptr, 10);
+                    } else if (line.rfind("DUMP_VRAM_FROM=", 0) == 0) {
+                        vramDumpFrom = (uint32_t)strtoul(line.c_str() + 15, nullptr, 10);
+                    } else if (line.rfind("DUMP_VRAM_TO=", 0) == 0) {
+                        vramDumpTo = (uint32_t)strtoul(line.c_str() + 13, nullptr, 10);
 #endif
                     }
                 }
@@ -621,10 +634,25 @@ struct NoodsTestHarness {
         uint64_t frameUs = PPCTicksToUs(frameTicks);
         accumFrameUs += frameUs;
 
+        Memory& mem = core->memory;
+#if NOODS_G2_SCRIPTED_INPUT
+        if (vramDumpFrom > 0 && currentFrame >= vramDumpFrom && currentFrame <= vramDumpTo) {
+            if (FILE* vf = fopen("sd:/vramA_frames.bin", "ab")) {
+                uint8_t frameBytes[4] = {
+                    (uint8_t)(currentFrame >> 0), (uint8_t)(currentFrame >> 8),
+                    (uint8_t)(currentFrame >> 16), (uint8_t)(currentFrame >> 24)
+                };
+                fwrite(frameBytes, 1, sizeof(frameBytes), vf);
+                fwrite(mem.ram + 0x3F0400, 1, 20 * sizeof(uint32_t), vf);
+                fwrite(mem.vramA, 1, sizeof(mem.vramA), vf);
+                fflush(vf);
+                fclose(vf);
+            }
+        }
+#endif
         if (!isCheckpoint(currentFrame))
             return;
 
-        Memory& mem = core->memory;
         size_t ramLen = core->gbaMode ? 0x40000 : 0x400000;
         uint64_t hRam   = fnv1a64(mem.ram, ramLen);
         uint64_t hWram  = fnv1a64(mem.wram, sizeof(mem.wram));
@@ -746,6 +774,7 @@ uint32_t NoodsTestHarness::inputA2From = 0, NoodsTestHarness::inputA2To = 0;
 uint32_t NoodsTestHarness::inputRightFrom = 0, NoodsTestHarness::inputRightTo = 0;
 uint32_t NoodsTestHarness::inputRight2From = 0, NoodsTestHarness::inputRight2To = 0;
 uint32_t NoodsTestHarness::inputRight3From = 0, NoodsTestHarness::inputRight3To = 0;
+uint32_t NoodsTestHarness::vramDumpFrom = 0, NoodsTestHarness::vramDumpTo = 0;
 #endif
 uint32_t NoodsTestHarness::currentFrame = 0;
 uint64_t NoodsTestHarness::startTick = 0;
@@ -823,6 +852,10 @@ static sptr EmulatorThreadMain(void* /*arg*/) {
                 }
             }
 
+#if NOODS_TEST_FAST
+            // Keep the raster regression deterministic even if a test UI changes settings.
+            Settings::frameskip = 0;
+#endif
             uint64_t t0 = PPCGetTickCount();
             ndsCore->runCore();
             uint64_t t1 = PPCGetTickCount();
