@@ -510,6 +510,58 @@ template <bool gbaMode> void Gpu2D::drawText(int bg, int line) {
     if (yOffset >= 256 && (bgCnt[bg] & BIT(15)))
         tileBase += (bgCnt[bg] & BIT(14)) ? 0x1000 : 0x800;
 
+    // With mosaic enabled and a horizontal period above 1, the fetched pixel
+    // repeats across each horizontal mosaic block (the vertical snap is
+    // already in yOffset). Fetch once per block and replicate the pixel,
+    // stepping by whole blocks so no per-pixel modulo or redundant VRAM
+    // reads are needed. A period of 1 is a visual no-op, so those layers
+    // keep the fast tile path below.
+    if ((bgCnt[bg] & BIT(6)) && (mosaic & 0xF)) {
+        int periodH = (mosaic & 0xF) + 1;
+        int width = gbaMode ? 240 : 256;
+        uint8_t *extPal = (bgCnt[bg] & BIT(7)) ?
+            ((dispCnt & BIT(30)) ? extPalettes[bg + (bg < 2 && (bgCnt[bg] & BIT(13))) * 2] : nullptr) : nullptr;
+        for (int x = 0; x < width; x += periodH) {
+            // Move the tile address to the current tile; x is a block start,
+            // so the snapped sample offset is x itself
+            int xOffset = (bgHOfs[bg] + x) & 0x1FF;
+            uint32_t tileAddr = tileBase + ((xOffset & 0xF8) >> 2);
+
+            // If the X-offset exceeds 256 and the background is 512 pixels wide, move to the next 256x256 section
+            if (xOffset >= 256 && (bgCnt[bg] & BIT(14)))
+                tileAddr += 0x800;
+
+            // Get the current tile and the pixel offsets within it, accounting for flips
+            uint16_t tile = core->memory.read<uint16_t>(gbaMode, tileAddr);
+            int px = (tile & BIT(10)) ? (7 - (xOffset & 7)) : (xOffset & 7);
+            int py = (tile & BIT(11)) ? (7 - (yOffset & 7)) : (yOffset & 7);
+
+            // Fetch the block's pixel once
+            uint16_t color;
+            if (bgCnt[bg] & BIT(7)) { // 8-bit
+                uint8_t *pal = extPal ? &extPal[(tile >> 3) & 0x1E00] : palette;
+                uint8_t index = core->memory.read<uint8_t>(gbaMode, indexBase + (tile & 0x3FF) * 64 + py * 8 + px);
+                if (!index)
+                    continue;
+                color = U8TO16(pal, index * 2) | BIT(15);
+            }
+            else { // 4-bit
+                uint8_t *pal = &palette[(tile & 0xF000) >> 7];
+                uint32_t indices = core->memory.read<uint32_t>(gbaMode, indexBase + (tile & 0x3FF) * 32 + py * 4);
+                uint8_t index = (indices >> (px * 4)) & 0xF;
+                if (!index)
+                    continue;
+                color = U8TO16(pal, index * 2) | BIT(15);
+            }
+
+            // Replicate the pixel across the rest of the block
+            int end = std::min(x + periodH, width);
+            for (int i = x; i < end; i++)
+                drawBgPixel(bg, line, i, color);
+        }
+        return;
+    }
+
     // Draw a line
     int width = (gbaMode ? 240 : 256) + (bgHOfs[bg] & 0x7);
     if (bgCnt[bg] & BIT(7)) { // 8-bit
