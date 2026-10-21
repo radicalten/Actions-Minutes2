@@ -1279,11 +1279,9 @@ bool ArmPpcJit::emitInlineBxArm(uint32_t *&p, Interpreter *cpu, uint32_t opcode,
     *p++ = JitPpc::cmplwi(0, JitPpc::R10, 0xFA0);
     fixSlow(3); // bgt slow
 
-    *p++ = JitPpc::srwi(JitPpc::R5, JitPpc::R8, 12);
-    *p++ = JitPpc::slwi(JitPpc::R5, JitPpc::R5, 2);
-    *p++ = JitPpc::lwz(JitPpc::R4, JitPpc::R31, offCore);
-    emitLoadImm32(p, JitPpc::R7, offReadMap);
-    *p++ = JitPpc::add(JitPpc::R4, JitPpc::R4, JitPpc::R7);
+    *p++ = JitPpc::rlwinm(JitPpc::R5, JitPpc::R8, 22, 10, 29); // (address >> 12) * 4
+    // The Core and its inline page tables remain stable until JIT reset.
+    emitLoadImm32(p, JitPpc::R4, (uint32_t)(uintptr_t)cpu->core + offReadMap);
     *p++ = JitPpc::lwzx(JitPpc::R6, JitPpc::R4, JitPpc::R5);
     *p++ = JitPpc::cmpwi(0, JitPpc::R6, 0);
     fixSlow(0); // beq slow
@@ -1407,11 +1405,9 @@ bool ArmPpcJit::emitInlineBxThumb(uint32_t *&p, Interpreter *cpu, uint16_t opcod
     *p++ = JitPpc::cmplwi(0, JitPpc::R10, 0xFA0);
     fixSlow(3);
 
-    *p++ = JitPpc::srwi(JitPpc::R5, JitPpc::R8, 12);
-    *p++ = JitPpc::slwi(JitPpc::R5, JitPpc::R5, 2);
-    *p++ = JitPpc::lwz(JitPpc::R4, JitPpc::R31, offCore);
-    emitLoadImm32(p, JitPpc::R7, offReadMap);
-    *p++ = JitPpc::add(JitPpc::R4, JitPpc::R4, JitPpc::R7);
+    *p++ = JitPpc::rlwinm(JitPpc::R5, JitPpc::R8, 22, 10, 29); // (address >> 12) * 4
+    // The Core and its inline page tables remain stable until JIT reset.
+    emitLoadImm32(p, JitPpc::R4, (uint32_t)(uintptr_t)cpu->core + offReadMap);
     *p++ = JitPpc::lwzx(JitPpc::R6, JitPpc::R4, JitPpc::R5);
     *p++ = JitPpc::cmpwi(0, JitPpc::R6, 0);
     fixSlow(0);
@@ -1552,11 +1548,9 @@ bool ArmPpcJit::emitPcDestLoadTerminatorArm(uint32_t *&p, Interpreter *cpu, uint
     }
 
     // Mapped read of the loaded value into R8 (same page-map fast path as emitNativeLoadArm)
-    *p++ = JitPpc::srwi(JitPpc::R5, JitPpc::R3, 12);
-    *p++ = JitPpc::slwi(JitPpc::R5, JitPpc::R5, 2);
-    *p++ = JitPpc::lwz(JitPpc::R4, JitPpc::R31, offCore);
-    emitLoadImm32(p, JitPpc::R7, offReadMap);
-    *p++ = JitPpc::add(JitPpc::R4, JitPpc::R4, JitPpc::R7);
+    *p++ = JitPpc::rlwinm(JitPpc::R5, JitPpc::R3, 22, 10, 29); // (address >> 12) * 4
+    // The Core and its inline page tables remain stable until JIT reset.
+    emitLoadImm32(p, JitPpc::R4, (uint32_t)(uintptr_t)cpu->core + offReadMap);
     *p++ = JitPpc::lwzx(JitPpc::R6, JitPpc::R4, JitPpc::R5);
     *p++ = JitPpc::cmpwi(0, JitPpc::R6, 0);
     fixSlow(0);
@@ -1593,11 +1587,9 @@ bool ArmPpcJit::emitPcDestLoadTerminatorArm(uint32_t *&p, Interpreter *cpu, uint
     fixSlow(2);
     *p++ = JitPpc::cmplwi(0, JitPpc::R10, 0xFA0);
     fixSlow(3);
-    *p++ = JitPpc::srwi(JitPpc::R5, JitPpc::R9, 12);
-    *p++ = JitPpc::slwi(JitPpc::R5, JitPpc::R5, 2);
-    *p++ = JitPpc::lwz(JitPpc::R4, JitPpc::R31, offCore);
-    emitLoadImm32(p, JitPpc::R7, offReadMap);
-    *p++ = JitPpc::add(JitPpc::R4, JitPpc::R4, JitPpc::R7);
+    *p++ = JitPpc::rlwinm(JitPpc::R5, JitPpc::R9, 22, 10, 29); // (address >> 12) * 4
+    // The Core and its inline page tables remain stable until JIT reset.
+    emitLoadImm32(p, JitPpc::R4, (uint32_t)(uintptr_t)cpu->core + offReadMap);
     *p++ = JitPpc::lwzx(JitPpc::R6, JitPpc::R4, JitPpc::R5);
     *p++ = JitPpc::cmpwi(0, JitPpc::R6, 0);
     fixSlow(0);
@@ -1698,11 +1690,9 @@ bool ArmPpcJit::emitNativeLoadThumb(uint32_t *&p, Interpreter *cpu, uint16_t opc
     }
 
     const uint32_t offTblOff = (uint32_t)(offsetof(Core, memory) + (cpu->arm7 ? offsetof(Memory, readMap7) : offsetof(Memory, readMap9A)));
-    *p++ = JitPpc::srwi(JitPpc::R5, JitPpc::R3, 12);
-    *p++ = JitPpc::slwi(JitPpc::R5, JitPpc::R5, 2);
-    *p++ = JitPpc::lwz(JitPpc::R4, JitPpc::R31, (int16_t)offsetof(Interpreter, core));
-    emitLoadImm32(p, JitPpc::R7, offTblOff);
-    *p++ = JitPpc::add(JitPpc::R4, JitPpc::R4, JitPpc::R7);
+    *p++ = JitPpc::rlwinm(JitPpc::R5, JitPpc::R3, 22, 10, 29); // (address >> 12) * 4
+    // The Core and its inline page tables remain stable until JIT reset.
+    emitLoadImm32(p, JitPpc::R4, (uint32_t)(uintptr_t)cpu->core + offTblOff);
     *p++ = JitPpc::lwzx(JitPpc::R6, JitPpc::R4, JitPpc::R5);
     *p++ = JitPpc::cmpwi(0, JitPpc::R6, 0);
     uint32_t *bSlow = p++;
@@ -1802,11 +1792,9 @@ bool ArmPpcJit::emitNativeStoreThumb(uint32_t *&p, Interpreter *cpu, uint16_t op
     *bNoCode = JitPpc::bne((int16_t)((p - bNoCode) * 4));
 
     const uint32_t wmTblOff = (uint32_t)(offsetof(Core, memory) + (cpu->arm7 ? offsetof(Memory, writeMap7) : offsetof(Memory, writeMap9A)));
-    *p++ = JitPpc::srwi(JitPpc::R5, JitPpc::R3, 12);
-    *p++ = JitPpc::slwi(JitPpc::R5, JitPpc::R5, 2);
-    *p++ = JitPpc::lwz(JitPpc::R4, JitPpc::R31, (int16_t)offsetof(Interpreter, core));
-    emitLoadImm32(p, JitPpc::R7, wmTblOff);
-    *p++ = JitPpc::add(JitPpc::R4, JitPpc::R4, JitPpc::R7);
+    *p++ = JitPpc::rlwinm(JitPpc::R5, JitPpc::R3, 22, 10, 29); // (address >> 12) * 4
+    // The Core and its inline page tables remain stable until JIT reset.
+    emitLoadImm32(p, JitPpc::R4, (uint32_t)(uintptr_t)cpu->core + wmTblOff);
     *p++ = JitPpc::lwzx(JitPpc::R6, JitPpc::R4, JitPpc::R5);
     *p++ = JitPpc::cmpwi(0, JitPpc::R6, 0);
     uint32_t *bSlow = p++;
@@ -1875,8 +1863,7 @@ bool ArmPpcJit::emitNativePushPop(uint32_t *&p, Interpreter *cpu, uint16_t regMa
     const uint32_t tblOff = (uint32_t)(offsetof(Core, memory) + (isLoad
         ? (cpu->arm7 ? offsetof(Memory, readMap7) : offsetof(Memory, readMap9A))
         : (cpu->arm7 ? offsetof(Memory, writeMap7) : offsetof(Memory, writeMap9A))));
-    *p++ = JitPpc::srwi(JitPpc::R5, JitPpc::R3, 12);
-    *p++ = JitPpc::slwi(JitPpc::R5, JitPpc::R5, 2);
+    *p++ = JitPpc::rlwinm(JitPpc::R5, JitPpc::R3, 22, 10, 29); // (address >> 12) * 4
     *p++ = JitPpc::lwz(JitPpc::R4, JitPpc::R31, (int16_t)offsetof(Interpreter, core));
     emitLoadImm32(p, JitPpc::R7, tblOff);
     *p++ = JitPpc::add(JitPpc::R4, JitPpc::R4, JitPpc::R7);
@@ -1968,11 +1955,9 @@ bool ArmPpcJit::emitNativeLoadArm(uint32_t *&p, Interpreter *cpu, uint32_t opcod
     }
 
     const uint32_t offTblOff = (uint32_t)(offsetof(Core, memory) + (cpu->arm7 ? offsetof(Memory, readMap7) : offsetof(Memory, readMap9A)));
-    *p++ = JitPpc::srwi(JitPpc::R5, JitPpc::R3, 12);
-    *p++ = JitPpc::slwi(JitPpc::R5, JitPpc::R5, 2);
-    *p++ = JitPpc::lwz(JitPpc::R4, JitPpc::R31, (int16_t)offsetof(Interpreter, core));
-    emitLoadImm32(p, JitPpc::R7, offTblOff);
-    *p++ = JitPpc::add(JitPpc::R4, JitPpc::R4, JitPpc::R7);
+    *p++ = JitPpc::rlwinm(JitPpc::R5, JitPpc::R3, 22, 10, 29); // (address >> 12) * 4
+    // The Core and its inline page tables remain stable until JIT reset.
+    emitLoadImm32(p, JitPpc::R4, (uint32_t)(uintptr_t)cpu->core + offTblOff);
     *p++ = JitPpc::lwzx(JitPpc::R6, JitPpc::R4, JitPpc::R5);
     *p++ = JitPpc::cmpwi(0, JitPpc::R6, 0);
     uint32_t *bSlow = p++;
@@ -2082,11 +2067,9 @@ bool ArmPpcJit::emitNativeStoreArm(uint32_t *&p, Interpreter *cpu, uint32_t opco
     *bNoCode = JitPpc::bne((int16_t)((p - bNoCode) * 4));
 
     const uint32_t wmTblOff = (uint32_t)(offsetof(Core, memory) + (cpu->arm7 ? offsetof(Memory, writeMap7) : offsetof(Memory, writeMap9A)));
-    *p++ = JitPpc::srwi(JitPpc::R5, JitPpc::R3, 12);
-    *p++ = JitPpc::slwi(JitPpc::R5, JitPpc::R5, 2);
-    *p++ = JitPpc::lwz(JitPpc::R4, JitPpc::R31, (int16_t)offsetof(Interpreter, core));
-    emitLoadImm32(p, JitPpc::R7, wmTblOff);
-    *p++ = JitPpc::add(JitPpc::R4, JitPpc::R4, JitPpc::R7);
+    *p++ = JitPpc::rlwinm(JitPpc::R5, JitPpc::R3, 22, 10, 29); // (address >> 12) * 4
+    // The Core and its inline page tables remain stable until JIT reset.
+    emitLoadImm32(p, JitPpc::R4, (uint32_t)(uintptr_t)cpu->core + wmTblOff);
     *p++ = JitPpc::lwzx(JitPpc::R6, JitPpc::R4, JitPpc::R5);
     *p++ = JitPpc::cmpwi(0, JitPpc::R6, 0);
     uint32_t *bSlow = p++;
