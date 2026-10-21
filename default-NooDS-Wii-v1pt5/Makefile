@@ -52,7 +52,7 @@ LDFLAGS += $(CXXFLAGS) \
 -L$(DEVKITPRO)/portlibs/ppc/lib \
 -L$(DEVKITPRO)/libogc/lib \
 -L$(DEVKITPRO)/libogc/lib/wii \
--lasnd -lwiikeyboard -lfat -lwiiuse -lbte -logc -lm
+-lwiikeyboard -lfat -lwiiuse -lbte -logc -lm
 
 EXCLUDE    :=
 SRCDIR     := NooDS-Wii
