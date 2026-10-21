@@ -77,7 +77,9 @@ Core::Core(std::string ndsRom, std::string gbaRom, int id,
                 HleBios(this, 1, HleBios::swiTableGba) },
       input(this),
       interpreter { Interpreter(this, 0), Interpreter(this, 1) },
-      ipc(this), memory(this), rtc(this), saveStates(this),
+      ipc(this),
+      memory(this, (gbaRom != "" || gbaRomFd != -1) && ndsRom == "" && ndsRomFd == -1),
+      rtc(this), saveStates(this),
       spi(this), spu(this),
       timers { Timers(this, 0), Timers(this, 1) },
       wifi(this),
@@ -149,10 +151,15 @@ Core::Core(std::string ndsRom, std::string gbaRom, int id,
     tasks[WIFI_TRANS_ACK]   = SchedCallback(shim_wifiTransmit, &wifi, CMD_ACK);
     tasks[GBA_SIO_TRANSFER] = SchedCallback(shim_gbaSioTransfer, &memory);
 
+#if NOODS_JIT
+    ArmPpcJit::reset();
+#endif
+
     // ------------------------------------------------------------------
     // BIOS / firmware loading
     // ------------------------------------------------------------------
-    bool required = !Settings::directBoot ||
+    bool standaloneGba = (gbaRom != "" || gbaRomFd != -1) && ndsRom == "" && ndsRomFd == -1;
+    bool required = (!standaloneGba && !Settings::directBoot) ||
                     (ndsRom == "" && gbaRom == "" &&
                      ndsRomFd == -1 && gbaRomFd == -1);
 
@@ -184,7 +191,7 @@ Core::Core(std::string ndsRom, std::string gbaRom, int id,
         if (!cartridgeGba.setRom(gbaRom, gbaRomFd, gbaSaveFd, gbaStateFd, -1))
             throw ERROR_ROM;
 
-        if (Settings::directBoot && ndsRom == "" && ndsRomFd == -1) {
+        if (standaloneGba) {
             memory.write<uint16_t>(0, 0x4000304, 0x8003);
             enterGbaMode();
         }
@@ -356,14 +363,18 @@ void Core::enterGbaMode() {
     memory.write<uint8_t>(0, 0x4000240, 0x80);
     memory.write<uint8_t>(0, 0x4000241, 0x80);
 
-    if (realGbaBios) {
+    if (realGbaBios && !Settings::directBoot) {
         interpreter[1].bios = nullptr;
         return;
     }
 
-    interpreter[1].bios = &hleBios[2];
+    interpreter[1].bios = realGbaBios ? nullptr : &hleBios[2];
     interpreter[1].directBoot();
     memory.setGbaBiosOpenBus(0xE129F000u);
+    memory.write<uint16_t>(1, 0x4000020, 0x100); // BG2PA post-BIOS identity (1.0x)
+    memory.write<uint16_t>(1, 0x4000026, 0x100); // BG2PD post-BIOS identity (1.0x)
+    memory.write<uint16_t>(1, 0x4000030, 0x100); // BG3PA post-BIOS identity (1.0x)
+    memory.write<uint16_t>(1, 0x4000036, 0x100); // BG3PD post-BIOS identity (1.0x)
     memory.write<uint16_t>(1, 0x4000088, 0x200);
 }
 

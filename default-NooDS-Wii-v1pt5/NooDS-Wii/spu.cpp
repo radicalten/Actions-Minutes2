@@ -55,10 +55,10 @@ const int16_t Spu::adpcmTable[] = {
 // Constructor / Destructor
 // ---------------------------------------------------------------------------
 Spu::Spu(Core *core) : core(core) {
-    ready         = false;
-    writeIdx      = 0;
-    bufferPointer = 0;
-    memset(buffers,     0, sizeof(buffers));
+    ringWrite     = 0;
+    ringRead      = 0;
+    lastPopSample = 0;
+    memset(ringBuf,     0, sizeof(ringBuf));
     memset(&waitQueue1, 0, sizeof(waitQueue1));
     memset(&waitQueue2, 0, sizeof(waitQueue2));
 }
@@ -182,14 +182,13 @@ void Spu::loadState(FILE *file) {
         }
     }
 
-    // Restore the double-buffer to a clean state so getSamples() does not
+    // Restore the ring buffer to a clean state so drainSamples() does not
     // serve stale pre-load data.
-    memset(buffers, 0, sizeof(buffers));
-    bufferPointer = 0;
-    writeIdx      = 0;
-
     PPCIrqState st = PPCIrqLockByMsr();
-    ready = false;
+    memset(ringBuf, 0, sizeof(ringBuf));
+    ringWrite     = 0;
+    ringRead      = 0;
+    lastPopSample = 0;
     PPCIrqUnlockByMsr(st);
 }
 
@@ -206,55 +205,45 @@ void Spu::loadState(FILE *file) {
 // Returns true  → dst filled with fresh emulator audio.
 // Returns false → dst filled with the last known sample repeated (silence).
 // ---------------------------------------------------------------------------
-bool Spu::getSamples(uint32_t *dst, int count) {
-    // Never read past the end of our fixed-size buffers.
-    if (count > SPU_BUF_FRAMES)
-        count = SPU_BUF_FRAMES;
+int Spu::drainSamples(uint32_t *dst, int maxCount, uint32_t *availAfter, int minCount) {
+    if (maxCount <= 0) {
+        if (availAfter) *availAfter = ringWrite - ringRead;
+        return 0;
+    }
 
-    bool wait = false;   // true → emulator is behind, serve repeated silence
-
-    // Synchronisation: audioThread runs at priority 0x48 (higher than
-    // emulatorThread at 0x50) and wakes exclusively on hardware ASND DMA
-    // callbacks (~46.9 Hz). Never spin here — if no fresh buffer is ready,
-    // immediately hold the last sample so emulatorThread keeps 100% CPU;
-    // back-pressure when emulatorThread exceeds 60 FPS happens in pushSample().
+    uint32_t n = 0;
     {
         PPCIrqState st = PPCIrqLockByMsr();
-        if (!ready) wait = true;
+        uint32_t rd    = ringRead;
+        uint32_t avail = ringWrite - rd;
+        if (avail >= (uint32_t)minCount) {
+            n = (avail < (uint32_t)maxCount) ? avail : (uint32_t)maxCount;
+            for (uint32_t i = 0; i < n; i++)
+                dst[i] = ringBuf[(rd + i) & SPU_RING_MASK];
+            if (n > 0) {
+                ringRead      = rd + n;
+                lastPopSample = dst[n - 1];
+            }
+        }
+        if (availAfter) *availAfter = avail - n;
         PPCIrqUnlockByMsr(st);
     }
 
-    // ------------------------------------------------------------------
-    // Fill the caller's buffer.
-    // ------------------------------------------------------------------
-    if (wait) {
-        // Emulator is behind — repeat the last sample of the completed
-        // buffer so the output fades rather than clicking.
-        PPCIrqState st   = PPCIrqLockByMsr();
-        int         ri   = writeIdx ^ 1;  // the side not currently being written
-        uint32_t    last = buffers[ri][SPU_BUF_FRAMES - 1];
-        PPCIrqUnlockByMsr(st);
-
-        for (int i = 0; i < count; i++)
-            dst[i] = last;
-
-        return false;
-    }
-
-    // Copy the completed buffer (opposite of current write side) then clear ready.
-    {
-        PPCIrqState st = PPCIrqLockByMsr();
-        int ri = writeIdx ^ 1;
-        memcpy(dst, buffers[ri], (size_t)count * sizeof(uint32_t));
-        ready = false;
-        PPCIrqUnlockByMsr(st);
-    }
-
-    // Wake the emulator thread if it is blocking on back-pressure
-    // (fpsLimiter == 1 only).
-    if (Settings::fpsLimiter == 1)
+    if (n > 0 && Settings::fpsLimiter == 1)
         KThrQueueUnblockAllByValue(&waitQueue1, 1);
 
+    return (int)n;
+}
+
+bool Spu::getSamples(uint32_t *dst, int count) {
+    if (count <= 0) return false;
+    int got = drainSamples(dst, count, nullptr, count);
+    if (got == 0) {
+        uint32_t hold = lastPopSample;
+        for (int i = 0; i < count; i++)
+            dst[i] = hold;
+        return false;
+    }
     return true;
 }
 
@@ -262,56 +251,33 @@ bool Spu::getSamples(uint32_t *dst, int count) {
 // pushSample
 //
 // Called from the emulator thread (runSample / runGbaSample).
-// Accumulates one stereo pair into the current write buffer.
-// When the buffer is full it applies back-pressure (if requested),
-// then atomically swaps the write index and signals the audio thread.
+// Enqueues one packed stereo sample into the 4096-sample ring buffer and
+// applies back-pressure only if the ring exceeds SPU_TARGET_LATENCY (~62 ms).
 // ---------------------------------------------------------------------------
 void Spu::pushSample(int16_t sampleLeft, int16_t sampleRight) {
-    buffers[writeIdx][bufferPointer++] =
+    const uint32_t packed =
         ((uint32_t)(uint16_t)sampleRight << 16) |
         ((uint32_t)(uint16_t)sampleLeft  & 0xFFFF);
 
-    // Nothing more to do until the buffer is full.
-    if (bufferPointer < SPU_BUF_FRAMES)
-        return;
-
-    // ------------------------------------------------------------------
-    // Back-pressure: wait until the audio thread has consumed the
-    // previously completed buffer before we overwrite it, when host AI DMA is active.
-    // ------------------------------------------------------------------
     extern volatile bool g_wiiAudioHardwareActive;
     if ((Settings::fpsLimiter == 1 && g_wiiAudioHardwareActive) || Settings::fpsLimiter == 2) {
-        u64 start   = PPCGetTickCount();
-        u64 timeout = PPCUsToTicks(Settings::fpsLimiter == 2 ? 1000000 : 50000);
-        while (true) {
-            PPCIrqState st = PPCIrqLockByMsr();
-            bool isReady   = ready;
-            PPCIrqUnlockByMsr(st);
-
-            if (!isReady) break;   // audio thread has consumed it
-
-            if (PPCGetTickCount() - start > timeout) break;   // give up
-
-            KThreadSleepUs(250);
+        if ((ringWrite - ringRead) >= SPU_TARGET_LATENCY) {
+            u64 start   = PPCGetTickCount();
+            u64 timeout = PPCUsToTicks(Settings::fpsLimiter == 2 ? 1000000 : 30000);
+            while ((ringWrite - ringRead) >= SPU_TARGET_LATENCY) {
+                if (PPCGetTickCount() - start > timeout) break;
+                KThreadSleepUs(250);
+            }
         }
     }
-    // fpsLimiter == 0: overwrite without waiting.
 
-    // ------------------------------------------------------------------
-    // Atomically make the completed buffer visible to the audio thread.
-    // ------------------------------------------------------------------
-    {
-        PPCIrqState st = PPCIrqLockByMsr();
-        writeIdx ^= 1;   // flip: audio thread now reads the old writeIdx
-        ready     = true;
-        PPCIrqUnlockByMsr(st);
-    }
-
-    bufferPointer = 0;   // start filling the new write buffer
-
-    // Wake the audio thread if it was blocking on fpsLimiter == 1.
-    if (Settings::fpsLimiter == 1)
-        KThrQueueUnblockAllByValue(&waitQueue2, 1);
+    PPCIrqState st = PPCIrqLockByMsr();
+    uint32_t wr = ringWrite;
+    if ((wr - ringRead) >= SPU_RING_SIZE)
+        ringRead = wr - (SPU_RING_SIZE - 1);
+    ringBuf[wr & SPU_RING_MASK] = packed;
+    ringWrite = wr + 1;
+    PPCIrqUnlockByMsr(st);
 }
 
 // ---------------------------------------------------------------------------
@@ -951,7 +917,7 @@ void Spu::writeGbaSoundCntX(int channel, uint16_t mask, uint16_t value) {
     mask &= (channel == 3) ? 0x40FF : 0x47FF;
     gbaSoundCntX[channel] = (gbaSoundCntX[channel] & ~mask) | (value & mask);
 
-    if (!Settings::emulateAudio || !(value & BIT(15))) return;
+    if (!(value & BIT(15))) return;
 
     bool dacOn = (channel == 2) ? ((gbaSoundCntL[1] & BIT(7)) != 0) : ((gbaSoundCntH[channel] & 0xF800) != 0);
     if (dacOn)
@@ -1036,8 +1002,6 @@ void Spu::writeGbaFifoB(uint32_t mask, uint32_t value) {
 // NDS register writers
 // ---------------------------------------------------------------------------
 void Spu::writeSoundCnt(int channel, uint32_t mask, uint32_t value) {
-    if (!Settings::emulateAudio) value &= ~BIT(31);
-
     bool enable = !(soundCnt[channel] & BIT(31)) && (value & mask & BIT(31));
 
     mask &= 0xFF7F837F;

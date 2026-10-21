@@ -41,6 +41,7 @@ int Settings::screen1Size  = 0;
 int Settings::screen2Size  = 0;
 int Settings::screenSwap   = 0;
 int Settings::wiiScreenGap = 1;
+int Settings::armJit       = 1;
 int Settings::arm7Hle      = 0;
 int Settings::dsiMode      = 0;
 
@@ -97,6 +98,7 @@ std::vector<Setting> Settings::settings = {
     Setting("screen2Size",  &screen2Size,  false),
     Setting("screenSwap",   &screenSwap,   false),
     Setting("wiiScreenGap", &wiiScreenGap, false),
+    Setting("armJit",       &armJit,       false),
     Setting("arm7Hle",      &arm7Hle,      false),
     Setting("dsiMode",      &dsiMode,      false),
     Setting("bios9Path",    &bios9Path,    true),
@@ -145,9 +147,10 @@ bool Settings::load(std::string path) {
         std::string name = line.substr(0, split);
         for (size_t i = 0; i < settings.size(); i++) {
             if (name != settings[i].name) continue;
-            // Strip the trailing newline from the value.
-            std::string value = line.substr(split + 1,
-                                            line.size() - split - 2);
+            // Strip any trailing CR/LF characters from the value.
+            std::string value = line.substr(split + 1);
+            while (!value.empty() && (value.back() == '\n' || value.back() == '\r'))
+                value.pop_back();
             if (settings[i].isString)
                 *(std::string*)settings[i].value = value;
             else if (!value.empty() &&
@@ -165,6 +168,7 @@ bool Settings::load(std::string path) {
     if (screenSwap   < 0 || screenSwap   > 1) screenSwap   = 0;
     if (wiiScreenGap < 0 || wiiScreenGap > 4) wiiScreenGap = 1;
     if (screenFilter < 0 || screenFilter > 2) screenFilter = 0;
+    armJit = (armJit != 0) ? 1 : 0;
     return true;
 }
 

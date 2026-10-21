@@ -57,7 +57,7 @@ volatile uint8_t ConsoleUI::running;
 std::string ConsoleUI::ndsPath, ConsoleUI::gbaPath;
 std::string ConsoleUI::basePath, ConsoleUI::curPath;
 
-uint32_t ConsoleUI::framebuffer[256 * 192 * 8];
+uint32_t *ConsoleUI::framebuffer = nullptr;
 ScreenLayout ConsoleUI::layout;
 bool ConsoleUI::gbaMode;
 bool ConsoleUI::changed;
@@ -143,6 +143,9 @@ int ConsoleUI::stringWidth(std::string &string) {
 
 void ConsoleUI::initialize(int width, int height,
     std::string root, std::string prefix) {
+
+    if (!framebuffer)
+        framebuffer = new uint32_t[256 * 192 * 8]();
 
     fileTextures[0]   = bmpToTexture(&_binary_src_console_images_file_dark_bmp_start);
     fileTextures[1]   = bmpToTexture(&_binary_src_console_images_file_light_bmp_start);
@@ -324,7 +327,11 @@ void ConsoleUI::mainLoop(MenuTouch (*specialTouch)(),
 }
 
 int ConsoleUI::setPath(std::string path) {
-    if (path.find(".nds", path.length() - 4) != std::string::npos) {
+    size_t dotPos = path.find_last_of('.');
+    std::string ext = (dotPos != std::string::npos) ? path.substr(dotPos) : "";
+    std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+
+    if (ext == ".nds" || ext == ".srl") {
         if (gbaPath != "") {
             if (!message("Loading NDS ROM",
                 "Load the previous GBA ROM alongside this ROM?", 1))
@@ -335,7 +342,7 @@ int ConsoleUI::setPath(std::string path) {
         ndsPath = "";
         return 1;
     }
-    else if (path.find(".gba", path.length() - 4) != std::string::npos) {
+    else if (ext == ".gba" || ext == ".agb") {
         if (ndsPath != "") {
             if (!message("Loading GBA ROM",
                 "Load the previous NDS ROM alongside this ROM?", 1))
@@ -588,29 +595,37 @@ void ConsoleUI::fileBrowser() {
         DIR    *dir = opendir(curPath.c_str());
         dirent *entry;
 
-        while ((entry = readdir(dir))) {
-            std::string name    = entry->d_name;
+        while (dir && (entry = readdir(dir))) {
+            std::string name = entry->d_name;
+            if (name == "." || name == ".." || name.rfind("._", 0) == 0)
+                continue;
             std::string subpath = curPath + "/" + name;
             struct stat substat;
-            stat(subpath.c_str(), &substat);
+            if (stat(subpath.c_str(), &substat) != 0)
+                continue;
 
             if (S_ISDIR(substat.st_mode)) {
                 files.push_back(MenuItem(name, "",
                     folderTextures[menuTheme], 64));
             }
-            else if (name.find(".nds", name.length() - 4) != std::string::npos) {
-                void *texture =
-                    createTexture(NdsIcon(subpath).getIcon(), 32, 32);
-                files.push_back(MenuItem(name, "", texture, 32));
-            }
-            else if (name.find(".gba", name.length() - 4) != std::string::npos) {
-                files.push_back(MenuItem(name, "",
-                    fileTextures[menuTheme], 64));
+            else {
+                size_t dotPos = name.find_last_of('.');
+                std::string ext = (dotPos != std::string::npos) ? name.substr(dotPos) : "";
+                std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+                if (ext == ".nds" || ext == ".srl") {
+                    void *texture =
+                        createTexture(NdsIcon(subpath).getIcon(), 32, 32);
+                    files.push_back(MenuItem(name, "", texture, 32));
+                }
+                else if (ext == ".gba" || ext == ".agb") {
+                    files.push_back(MenuItem(name, "",
+                        fileTextures[menuTheme], 64));
+                }
             }
         }
 
         sort(files.begin(), files.end());
-        closedir(dir);
+        if (dir) closedir(dir);
 
         uint32_t pressed = menu("NooDS", files, index, "Settings", "Exit");
 

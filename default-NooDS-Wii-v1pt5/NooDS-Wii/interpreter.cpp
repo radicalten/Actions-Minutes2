@@ -166,7 +166,7 @@ template <bool _arm7, int shift> void Interpreter::runCoreSingle(Core &core) {
         if (_arm7 && core.gbaMode) {
             while (core.events[0].cycles > arm.cycles) {
 #if NOODS_JIT && NOODS_JIT_BLOCKS && NOODS_GBA_JIT
-                if (arm.pcData && core.gbaBus.nextSeq &&
+                if (Settings::armJit && arm.pcData && core.gbaBus.nextSeq &&
                     ArmPpcJit::tryExecuteGbaFast(&arm, core.memory.getWaitCnt(), core.events[0].cycles))
                     continue;
 #endif
@@ -389,7 +389,8 @@ FORCE_INLINE int Interpreter::runOpcode(uint32_t remIndep, uint32_t remShared) {
 
         // Execute a THUMB instruction
 #if NOODS_JIT
-        cyc = ArmPpcJit::executeThumb(this, opcode, remIndep, remShared);
+        cyc = Settings::armJit ? ArmPpcJit::executeThumb(this, opcode, remIndep, remShared)
+                               : (this->*thumbInstrs[(opcode >> 6) & 0x3FF])(opcode);
 #else
         cyc = (this->*thumbInstrs[(opcode >> 6) & 0x3FF])(opcode);
 #endif
@@ -403,7 +404,8 @@ FORCE_INLINE int Interpreter::runOpcode(uint32_t remIndep, uint32_t remShared) {
             case 0: cyc = 1; break; // False
             case 2: cyc = handleReserved(opcode); break; // Reserved
 #if NOODS_JIT
-            default: cyc = ArmPpcJit::executeArm(this, opcode, remIndep, remShared); break;
+            default: cyc = Settings::armJit ? ArmPpcJit::executeArm(this, opcode, remIndep, remShared)
+                                            : (this->*armInstrs[((opcode >> 16) & 0xFF0) | ((opcode >> 4) & 0xF)])(opcode); break;
 #else
             default: cyc = (this->*armInstrs[((opcode >> 16) & 0xFF0) | ((opcode >> 4) & 0xF)])(opcode); break;
 #endif

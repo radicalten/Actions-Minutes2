@@ -39,10 +39,10 @@ class Memory {
 public:
     // 32-bit address space, split into 4KB blocks
     uint8_t *readMap9A[0x100000] = {};
-    uint8_t *readMap9B[0x100000] = {};
+    uint8_t **readMap9B = nullptr;
     uint8_t *readMap7[0x100000] = {};
     uint8_t *writeMap9A[0x100000] = {};
-    uint8_t *writeMap9B[0x100000] = {};
+    uint8_t **writeMap9B = nullptr;
     uint8_t *writeMap7[0x100000] = {};
 
     uint8_t palette[0x800] = {}; // 2KB palette
@@ -52,7 +52,8 @@ public:
     uint8_t *tex3D[4] = {};
     uint8_t *pal3D[6] = {};
 
-    Memory(Core *core): core(core) {};
+    Memory(Core *core, bool gbaOnly = false);
+    ~Memory();
     void saveState(FILE *file);
     void loadState(FILE *file);
 
@@ -118,7 +119,8 @@ private:
     uint8_t bios7[0x4000] = {}; // 16KB ARM7 BIOS
     uint8_t gbaBios[0x4000] = {}; // 16KB GBA BIOS
 
-    uint8_t ram[0x1000000] = {}; // 16MB main RAM
+    uint8_t *ram = nullptr; // Dynamically sized main RAM (256KB GBA / 4MB NDS / 16MB DSi)
+    size_t ramAllocBytes = 0;
     uint8_t wram[0x8000] = {}; // 32KB shared WRAM
     uint8_t instrTcm[0x8000] = {}; // 32KB instruction TCM
     uint8_t dataTcm[0x4000] = {}; // 16KB data TCM

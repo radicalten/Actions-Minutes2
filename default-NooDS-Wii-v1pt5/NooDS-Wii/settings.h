@@ -54,6 +54,7 @@ public:
     static int screen2Size;     // 0=Auto, 1=0.50x..8=2.50x, 9=Off
     static int screenSwap;      // 0=Off, 1=On
     static int wiiScreenGap;    // 0=0px, 1=2px, 2=8px, 3=16px, 4=32px
+    static int armJit;          // 0=Off (Interpreter), 1=On (PPC JIT Recompiler)
     static int arm7Hle;
     static int dsiMode;
 

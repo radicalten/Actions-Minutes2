@@ -688,16 +688,16 @@ void Wii_VideoRender(const uint32_t* srcTop, const uint32_t* srcBottom,
     if (!gbaMode && rects.botVis)
         DrawScreenQuad(&wiiVid.texObjBottom, rects.botX1, rects.botY1, rects.botX2, rects.botY2, false);
 
-    if (!gbaMode && g_cursorShow) {
-        Wii_DrawCursor(g_cursorX, g_cursorY);
-    }
-
     if (wiiDbg.enabled && wiiDbg.texData) {
         DrawScreenQuad(&wiiDbg.texObj,
                        0.0f, 0.0f,
                        (f32)DEBUG_OVERLAY_WIDTH,
                        (f32)DEBUG_OVERLAY_HEIGHT,
                        true);
+    }
+
+    if (!gbaMode && g_cursorShow) {
+        Wii_DrawCursor(g_cursorX, g_cursorY);
     }
 
     // 2x2 near-black vertex-colored corner pixel so host presenters with duplicate-XFB
@@ -707,6 +707,13 @@ void Wii_VideoRender(const uint32_t* srcTop, const uint32_t* srcBottom,
     const u8 c  = (++s_vsyncBeat & 1u) ? 0x04 : 0x00;
     const f32 bx = (f32)(rmode->fbWidth  - 2);
     const f32 by = (f32)(rmode->efbHeight - 2);
+    GX_SetNumChans(1);
+    GX_SetChanCtrl(GX_COLOR0A0,
+                   GX_DISABLE, GX_SRC_REG, GX_SRC_VTX,
+                   GX_LIGHTNULL, GX_DF_NONE, GX_AF_NONE);
+    GX_SetNumTexGens(0);
+    GX_SetNumTevStages(1);
+    GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORDNULL, GX_TEXMAP_NULL, GX_COLOR0A0);
     GX_SetTevOp(GX_TEVSTAGE0, GX_PASSCLR);
     GX_SetBlendMode(GX_BM_NONE, GX_BL_ONE, GX_BL_ZERO, GX_LO_CLEAR);
     GX_Begin(GX_QUADS, GX_VTXFMT0, 4);

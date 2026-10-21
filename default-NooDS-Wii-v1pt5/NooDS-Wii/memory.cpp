@@ -20,12 +20,61 @@
 
 #include <cstring>
 #include <cstdio>
+#include <cstdlib>
+#include <malloc.h>
+#include <new>
 #include <string>
 #ifdef GEKKO
 #include <gccore.h>
 #include <fat.h>
 #endif
 #include "core.h"
+
+#ifndef NOODS_FULL_RAM_DUMP
+#define NOODS_FULL_RAM_DUMP 0
+#endif
+
+Memory::Memory(Core *core, bool gbaOnly): core(core) {
+    if (Settings::dsiMode)
+        ramAllocBytes = 0x1000000u;
+    else if (gbaOnly && !NOODS_FULL_RAM_DUMP)
+        ramAllocBytes = 0x40000u;
+    else
+        ramAllocBytes = 0x400000u;
+
+    ram = (uint8_t*)memalign(32, ramAllocBytes);
+    if (!ram) throw std::bad_alloc();
+    std::memset(ram, 0, ramAllocBytes);
+
+    if (!gbaOnly) {
+        readMap9B  = (uint8_t**)memalign(32, 0x100000 * sizeof(uint8_t*));
+        writeMap9B = (uint8_t**)memalign(32, 0x100000 * sizeof(uint8_t*));
+        if (!readMap9B || !writeMap9B) {
+            free(readMap9B);  readMap9B  = nullptr;
+            free(writeMap9B); writeMap9B = nullptr;
+            free(ram);        ram        = nullptr;
+            throw std::bad_alloc();
+        }
+        std::memset(readMap9B,  0, 0x100000 * sizeof(uint8_t*));
+        std::memset(writeMap9B, 0, 0x100000 * sizeof(uint8_t*));
+    }
+}
+
+Memory::~Memory() {
+    if (readMap9B) {
+        free(readMap9B);
+        readMap9B = nullptr;
+    }
+    if (writeMap9B) {
+        free(writeMap9B);
+        writeMap9B = nullptr;
+    }
+    if (ram) {
+        free(ram);
+        ram = nullptr;
+    }
+    ramAllocBytes = 0;
+}
 
 static std::string s_mgbaLogData;
 
@@ -81,7 +130,9 @@ template <typename T> void VramMapping::write(uint32_t address, T value) {
 
 void Memory::saveState(FILE *file) {
     // Write state data to the file
-    fwrite(ram, 1, core->dsiMode ? 0x1000000 : 0x400000, file);
+    size_t saveRamBytes = core->dsiMode ? 0x1000000u : (core->gbaMode ? 0x40000u : 0x400000u);
+    if (saveRamBytes > ramAllocBytes) saveRamBytes = ramAllocBytes;
+    fwrite(ram, 1, saveRamBytes, file);
     fwrite(wram, 1, sizeof(wram), file);
     fwrite(instrTcm, 1, sizeof(instrTcm), file);
     fwrite(dataTcm, 1, sizeof(dataTcm), file);
@@ -121,7 +172,9 @@ void Memory::saveState(FILE *file) {
 
 void Memory::loadState(FILE *file) {
     // Read state data from the file
-    fread(ram, 1, core->dsiMode ? 0x1000000 : 0x400000, file);
+    size_t loadRamBytes = core->dsiMode ? 0x1000000u : (core->gbaMode ? 0x40000u : 0x400000u);
+    if (loadRamBytes > ramAllocBytes) loadRamBytes = ramAllocBytes;
+    fread(ram, 1, loadRamBytes, file);
     fread(wram, 1, sizeof(wram), file);
     fread(instrTcm, 1, sizeof(instrTcm), file);
     fread(dataTcm, 1, sizeof(dataTcm), file);
@@ -193,14 +246,20 @@ bool Memory::loadBios7() {
 }
 
 bool Memory::loadGbaBios() {
-    // Load the GBA BIOS if the file is found
+    // Load the GBA BIOS only if a valid 16KB BIOS image is found
     if (FILE *file = fopen(Settings::gbaBiosPath.c_str(), "rb")) {
-        fread(gbaBios, sizeof(uint8_t), 0x4000, file);
+        fseek(file, 0, SEEK_END);
+        long sz = ftell(file);
+        fseek(file, 0, SEEK_SET);
+        if (sz == 0x4000 && fread(gbaBios, sizeof(uint8_t), 0x4000, file) == 0x4000 && gbaBios[3] == 0xEA) {
+            fclose(file);
+            return true;
+        }
         fclose(file);
-        return true;
     }
 
     // Prepare HLE BIOS with a special opcode for interrupt return
+    std::memset(gbaBios, 0, sizeof(gbaBios));
     gbaBios[3] = 0xFF;
     return false;
 }
@@ -212,6 +271,8 @@ void Memory::copyBiosLogo(uint8_t *logo) {
 }
 
 void Memory::updateMap9(uint32_t start, uint32_t end, bool tcm) {
+    if (!readMap9B || !writeMap9B) return;
+
     // Update the ARM9 read and write memory maps in the given range
     for (uint64_t address = start; address < end; address += 0x1000) {
         // Get the current read and write pointers; there are TCM and non-TCM maps
