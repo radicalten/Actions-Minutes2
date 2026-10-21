@@ -925,10 +925,11 @@ void CartridgeGba::eepromWrite(uint8_t value) {
 }
 
 uint8_t CartridgeGba::sramRead(uint32_t address) {
-    if (saveSize == 0x8000 && address < 0xE008000) {
-        return save[address - 0xE000000];
+    if (saveSize == 0x8000) {
+        return save[address & 0x7FFF];
     }
-    else if ((saveSize == 0x10000 || saveSize == 0x20000) && address < 0xE010000) {
+    else if (saveSize == 0x10000 || saveSize == 0x20000) {
+        address = 0xE000000 | (address & 0xFFFF);
         if (flashCmd == 0x90 && address == 0xE000000) {
             return 0xC2;
         }
@@ -945,13 +946,14 @@ uint8_t CartridgeGba::sramRead(uint32_t address) {
 }
 
 void CartridgeGba::sramWrite(uint32_t address, uint8_t value) {
-    if (saveSize == 0x8000 && address < 0xE008000) {
+    if (saveSize == 0x8000) {
         PPCIrqState st = PPCIrqLockByMsr();
-        save[address - 0xE000000] = value;
+        save[address & 0x7FFF] = value;
         saveDirty = true;
         PPCIrqUnlockByMsr(st);
     }
-    else if ((saveSize == 0x10000 || saveSize == 0x20000) && address < 0xE010000) {
+    else if (saveSize == 0x10000 || saveSize == 0x20000) {
+        address = 0xE000000 | (address & 0xFFFF);
         if (flashCmd == 0xA0) {
             if (bankSwap) address += 0x10000;
             PPCIrqState st = PPCIrqLockByMsr();

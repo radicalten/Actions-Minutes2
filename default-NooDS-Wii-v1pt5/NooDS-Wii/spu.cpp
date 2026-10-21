@@ -217,8 +217,9 @@ bool Spu::getSamples(uint32_t *dst, int count) {
     // Synchronisation: wait until a full buffer is available, or decide
     // to serve silence depending on the fps-limiter policy.
     // ------------------------------------------------------------------
-    if (Settings::fpsLimiter == 2) {
-        // Strict limiter: busy-wait up to one video frame period (~16 ms).
+    if (Settings::fpsLimiter == 1 || Settings::fpsLimiter == 2) {
+        // Bounded wait up to one video frame period (~16 ms) prevents permanent
+        // deadlock if host audio is inactive or a wakeup races.
         u64 start   = PPCGetTickCount();
         u64 timeout = PPCUsToTicks(1000000 / 60);
         while (true) {
@@ -234,16 +235,6 @@ bool Spu::getSamples(uint32_t *dst, int count) {
             }
             KThreadYield();
         }
-    }
-    else if (Settings::fpsLimiter == 1) {
-        // Cooperative limiter: block this thread until pushSample wakes us.
-        PPCIrqState st = PPCIrqLockByMsr();
-        bool isReady   = ready;
-        PPCIrqUnlockByMsr(st);
-
-        if (!isReady)
-            KThrQueueBlock(&waitQueue2, 1);
-        // After unblocking, ready is guaranteed true by pushSample.
     }
     else {
         // No limiter: if data is not ready, serve silence immediately.
@@ -307,10 +298,11 @@ void Spu::pushSample(int16_t sampleLeft, int16_t sampleRight) {
     // Back-pressure: wait until the audio thread has consumed the
     // previously completed buffer before we overwrite it.
     // ------------------------------------------------------------------
-    if (Settings::fpsLimiter == 2) {
-        // Busy-wait up to 1 s (hard cap to prevent permanent hang).
+    if (Settings::fpsLimiter == 1 || Settings::fpsLimiter == 2) {
+        // Bounded wait up to ~32 ms prevents permanent hang when host audio
+        // backend is silent while still throttling smoothly to 60 Hz on hardware.
         u64 start   = PPCGetTickCount();
-        u64 timeout = PPCUsToTicks(1000000);
+        u64 timeout = PPCUsToTicks(Settings::fpsLimiter == 2 ? 1000000 : (1000000 / 30));
         while (true) {
             PPCIrqState st = PPCIrqLockByMsr();
             bool isReady   = ready;
@@ -322,15 +314,6 @@ void Spu::pushSample(int16_t sampleLeft, int16_t sampleRight) {
 
             KThreadYield();
         }
-    }
-    else if (Settings::fpsLimiter == 1) {
-        // Block until getSamples() signals us.
-        PPCIrqState st = PPCIrqLockByMsr();
-        bool isReady   = ready;
-        PPCIrqUnlockByMsr(st);
-
-        if (isReady)
-            KThrQueueBlock(&waitQueue1, 1);
     }
     // fpsLimiter == 0: overwrite without waiting.
 
@@ -894,6 +877,8 @@ void Spu::writeGbaSoundCntL(int channel, uint8_t value) {
     // Channel 0 exposes all 7 bits; channel 1 only the wave-RAM control bits.
     uint8_t mask = (channel == 0) ? 0x7F : 0xE0;
     gbaSoundCntL[channel / 2] = (gbaSoundCntL[channel / 2] & ~mask) | (value & mask);
+    if (channel != 0 && !(gbaSoundCntL[1] & BIT(7)))
+        gbaMainSoundCntX &= ~BIT(2);
 }
 
 void Spu::writeGbaSoundCntH(int channel, uint16_t mask, uint16_t value) {
@@ -903,6 +888,8 @@ void Spu::writeGbaSoundCntH(int channel, uint16_t mask, uint16_t value) {
         case 3: mask &= 0xFF3F; break;   // noise: no frequency
     }
     gbaSoundCntH[channel] = (gbaSoundCntH[channel] & ~mask) | (value & mask);
+    if (channel != 2 && !(gbaSoundCntH[channel] & 0xF800))
+        gbaMainSoundCntX &= ~BIT(channel);
 }
 
 void Spu::writeGbaSoundCntX(int channel, uint16_t mask, uint16_t value) {
@@ -912,8 +899,9 @@ void Spu::writeGbaSoundCntX(int channel, uint16_t mask, uint16_t value) {
 
     if (!Settings::emulateAudio || !(value & BIT(15))) return;
 
-    // Trigger / restart the channel.
-    gbaMainSoundCntX |= BIT(channel);
+    bool dacOn = (channel == 2) ? ((gbaSoundCntL[1] & BIT(7)) != 0) : ((gbaSoundCntH[channel] & 0xF800) != 0);
+    if (dacOn)
+        gbaMainSoundCntX |= BIT(channel);
     switch (channel) {
         case 0:
             gbaSweepTimer   = (gbaSoundCntL[0] & 0x70) >> 4;
@@ -1099,8 +1087,8 @@ uint16_t Spu::readGbaSoundCntH(int channel) {
 }
 
 uint16_t Spu::readGbaSoundCntX(int channel) {
-    // Frequency bits (10-0) are write-only; return them as 0.
-    return gbaSoundCntX[channel] & (uint16_t)~0x07FFu;
+    // Frequency bits (10-0) are write-only on channels 0-2; channel 3 noise clock bits (7-0) are readable.
+    return gbaSoundCntX[channel] & (uint16_t)((channel == 3) ? 0x40FFu : 0x4000u);
 }
 
 uint8_t Spu::readGbaWaveRam(int index) {

@@ -198,7 +198,7 @@ bool Gpu::getFrame(uint32_t *out, bool gbaCrop) {
     return true;
 }
 
-void Gpu::gbaScanline240() {
+void Gpu::gbaHblankDma() {
     if (vCount < 160) {
         if (gpuThreadStack) {
             while (drawing != 0)
@@ -211,6 +211,10 @@ void Gpu::gbaScanline240() {
         core->dma[1].trigger(2);
     }
 
+    core->schedule(GBA_HBLANK_DMA, 308 * 4);
+}
+
+void Gpu::gbaScanline240() {
     dispStat[1] |= BIT(1);
 
     if (dispStat[1] & BIT(4))

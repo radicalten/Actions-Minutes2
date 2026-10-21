@@ -57,8 +57,18 @@ public:
     void interrupt();
 
     bool isThumb() { return cpsr & BIT(5); }
+    bool isPrivileged() const { return (cpsr & 0x1F) != 0x10; }
     uint32_t getPC() { return *registers[15]; }
     int handleHleIrq();
+    int takeAbort(uint8_t vector, uint32_t lrVal);
+    void advanceGbaCycles(int c);
+    void stallGbaDmaCycles(uint32_t c);
+    void runGbaOpcode();
+
+    bool mpuDataCheck = false;
+    bool dataAbort = false;
+    bool inGbaHaltSwi = false;
+    bool irqFromHalt = false;
 
     uint8_t readIme() { return ime; }
     uint32_t readIe() { return ie; }

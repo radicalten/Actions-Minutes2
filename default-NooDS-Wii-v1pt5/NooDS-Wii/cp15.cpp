@@ -90,6 +90,54 @@ uint32_t Cp15::read(uint8_t cn, uint8_t cm, uint8_t cp) {
     }
 }
 
+void Cp15::updateMpuState() {
+    if (!(ctrlReg & BIT(0))) {
+        mpuRestricted = false;
+        return;
+    }
+    // Fast-path check: unrestricted only when region 0 covers full 4GB with AP=3/3
+    // and no higher region is enabled with non-full permissions.
+    bool fullBg = ((regionControl[0] & 0x3F) == 0x3F) && (regionPerms[0] == 0x33);
+    bool higherRestricted = false;
+    for (int r = 1; r < 8; r++) {
+        if ((regionControl[r] & 1) && regionPerms[r] != 0x33) {
+            higherRestricted = true;
+            break;
+        }
+    }
+    mpuRestricted = !fullBg || higherRestricted;
+}
+
+bool Cp15::checkAccess(uint32_t addr, bool isWrite, bool isData, bool privileged) const {
+    if (!(ctrlReg & BIT(0)))
+        return true;
+
+    for (int r = 7; r >= 0; r--) {
+        uint32_t reg = regionControl[r];
+        if (!(reg & 1))
+            continue;
+        uint32_t sizeField = (reg >> 1) & 0x1F;
+        if (sizeField < 11)
+            continue;
+        if (sizeField < 31) {
+            uint32_t mask = ~((2u << sizeField) - 1u);
+            if ((addr & mask) != (reg & mask))
+                continue;
+        }
+        uint8_t ap = isData ? ((regionPerms[r] >> 4) & 0x0F) : (regionPerms[r] & 0x0F);
+        switch (ap) {
+            case 0: return false;
+            case 1: return privileged;
+            case 2: return privileged ? true : !isWrite;
+            case 3: return true;
+            case 5: return privileged ? !isWrite : false;
+            case 6: return !isWrite;
+            default: return false;
+        }
+    }
+    return false;
+}
+
 void Cp15::write(uint8_t cn, uint8_t cm, uint8_t cp, uint32_t value) {
     // Write a value to a CP15 register.
     uint32_t oldAddr, oldSize;
@@ -104,10 +152,12 @@ void Cp15::write(uint8_t cn, uint8_t cm, uint8_t cp, uint32_t value) {
             else
                 regionPerms[region] = (regionPerms[region] & 0xF0) | field;
         }
+        updateMpuState();
         return;
     }
     if (cn == 6 && cm < 8 && cp <= 1) {
         regionControl[cm] = value & 0xFFFFF03F;
+        updateMpuState();
         return;
     }
 
@@ -132,6 +182,7 @@ void Cp15::write(uint8_t cn, uint8_t cm, uint8_t cp, uint32_t value) {
         dtcmCanWrite = (ctrlReg & BIT(16));
         itcmCanRead = (ctrlReg & BIT(18)) && !(ctrlReg & BIT(19));
         itcmCanWrite = (ctrlReg & BIT(18));
+        updateMpuState();
 
         // Update the memory map at the current TCM locations
         core->memory.updateMap9(dtcmAddr, dtcmAddr + dtcmSize, true);

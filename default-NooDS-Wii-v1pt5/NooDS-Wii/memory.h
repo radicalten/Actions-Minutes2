@@ -65,6 +65,17 @@ public:
     void updateMap7(uint32_t start, uint32_t end);
     void updateVram();
 
+    void setGbaBiosOpenBus(uint32_t val) { gbaBiosOpenBus = val; }
+    void setGbaDmaLatch(uint32_t val) { gbaDmaOpenBus = val; gbaDmaOpenBusActive = true; }
+    void clearGbaDmaOpenBus() { gbaDmaOpenBusActive = false; }
+    void completeGbaSioTransfer();
+    uint16_t getWaitCnt() const { return gbaWaitCnt; }
+    bool mpuDataCheckActive = false;
+    bool gbaModeCached = false;
+    bool gbaCpuExecActive = false;
+    bool handleMpuDataAbort(uint32_t address, bool isWrite);
+    void onGbaCpuDataAccess(uint32_t address, uint32_t sizeBytes, bool isLoad);
+
     template <typename T> T read(bool arm7, uint32_t address, bool tcm = true);
     template <typename T> void write(bool arm7, uint32_t address, T value, bool tcm = true);
 
@@ -74,6 +85,25 @@ public:
 private:
     Core *core;
     uint32_t gbaBiosAddr = 0;
+    uint32_t gbaBiosOpenBus = 0xE129F000u;
+    uint32_t gbaDmaOpenBus = 0;
+    bool gbaDmaOpenBusActive = false;
+    uint16_t gbaWaitCnt = 0;
+    uint16_t gbaKeyCnt = 0;
+    uint16_t gbaSioData[4] = {};
+    uint16_t gbaSioCnt = 0;
+    uint16_t gbaSioSend = 0;
+    uint16_t gbaRCnt = 0x8000;
+    uint16_t gbaJoyCnt = 0;
+    uint32_t gbaJoyRecv = 0;
+    uint32_t gbaJoyTrans = 0;
+    uint16_t gbaJoyStat = 0;
+    bool gbaSioActive = false;
+
+    template <typename T> T readGbaOpenBus(uint32_t address);
+    bool isGbaReadableIoWord(uint32_t wAddr) const;
+    uint16_t readGbaSio(uint32_t hAddr);
+    void writeGbaSio(uint32_t hAddr, uint16_t mask, uint16_t value);
 
     uint16_t mgbaDebugEnable = 0;
     uint16_t mgbaDebugFlags = 0;
@@ -145,6 +175,12 @@ template uint8_t Memory::read(bool arm7, uint32_t address, bool tcm);
 template uint16_t Memory::read(bool arm7, uint32_t address, bool tcm);
 template uint32_t Memory::read(bool arm7, uint32_t address, bool tcm);
 template <typename T> FORCE_INLINE T Memory::read(bool arm7, uint32_t address, bool tcm) {
+    if (!arm7 && __builtin_expect(mpuDataCheckActive, 0)) {
+        if (handleMpuDataAbort(address, false))
+            return 0;
+    }
+    if (arm7 && gbaCpuExecActive)
+        onGbaCpuDataAccess(address, sizeof(T), true);
     // Look up a pointer to readable memory and read a value from it LSB-first
     uint8_t **readMap = arm7 ? readMap7 : (tcm ? readMap9A : readMap9B);
     if (uint8_t *data = readMap[address >> 12]) {
@@ -181,6 +217,18 @@ template void Memory::write(bool arm7, uint32_t address, uint8_t value, bool tcm
 template void Memory::write(bool arm7, uint32_t address, uint16_t value, bool tcm);
 template void Memory::write(bool arm7, uint32_t address, uint32_t value, bool tcm);
 template <typename T> FORCE_INLINE void Memory::write(bool arm7, uint32_t address, T value, bool tcm) {
+    if (!arm7 && __builtin_expect(mpuDataCheckActive, 0)) {
+        if (handleMpuDataAbort(address, true))
+            return;
+    }
+    if (arm7 && gbaCpuExecActive)
+        onGbaCpuDataAccess(address, sizeof(T), false);
+    if constexpr (sizeof(T) == 1) {
+        if (arm7 && gbaModeCached && (address >> 24) == 6) {
+            writeFallback<uint8_t>(arm7, address, value);
+            return;
+        }
+    }
     // Look up a pointer to writable memory and write a value to it LSB-first
     uint8_t **writeMap = arm7 ? writeMap7 : (tcm ? writeMap9A : writeMap9B);
     if (uint8_t *data = writeMap[address >> 12]) {

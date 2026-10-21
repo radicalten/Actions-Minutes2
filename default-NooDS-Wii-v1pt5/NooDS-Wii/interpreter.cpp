@@ -116,8 +116,9 @@ void Interpreter::directBoot() {
 }
 
 void Interpreter::resetCycles() {
-    // Adjust CPU cycles for a global cycle reset
-    cycles -= std::min(core->globalCycles, cycles);
+    // Preserve 0xFFFFFFFF sentinel when halted; otherwise adjust for global cycle reset
+    if (cycles != 0xFFFFFFFFu)
+        cycles -= std::min(core->globalCycles, cycles);
 }
 
 void Interpreter::runCoreNone(Core &core) {
@@ -130,16 +131,16 @@ void Interpreter::runCoreNone(Core &core) {
 
         if (!is_running) break;
 
-        // Jump to the next task and run all that are scheduled now
-        core.globalCycles = core.events[0].cycles;
-        while (core.events[0].cycles <= core.globalCycles) {
-            {
-#if NOODS_JIT && NOODS_JIT_POLL_SKIP
-                ArmPpcJit::pollEpoch++;
-#endif
-            core.tasks[core.events[0].task]();
-            }
+        // Jump to the next task and run all that are scheduled at this timestamp
+        uint32_t target = core.events[0].cycles;
+        while (core.events[0].cycles <= target) {
+            SchedEvent ev = core.events[0];
             core.events.erase(core.events.begin());
+            core.globalCycles = ev.cycles;
+#if NOODS_JIT && NOODS_JIT_POLL_SKIP
+            ArmPpcJit::pollEpoch++;
+#endif
+            core.tasks[ev.task]();
         }
     }
 }
@@ -160,20 +161,35 @@ template <bool _arm7, int shift> void Interpreter::runCoreSingle(Core &core) {
 
         // Run a CPU until the next scheduled task
         core.globalCycles = std::max(core.globalCycles, arm.cycles);
-        while (core.events[0].cycles > arm.cycles)
-            arm.cycles = (core.globalCycles += arm.runOpcode() << shift);
+        if (_arm7 && core.gbaMode) {
+            while (core.events[0].cycles > arm.cycles)
+                arm.runGbaOpcode();
+        }
+        else {
+            while (core.events[0].cycles > arm.cycles)
+                arm.cycles = (core.globalCycles += arm.runOpcode() << shift);
+        }
 
-        // Jump to the next task and run all that are scheduled now
-        core.globalCycles = core.events[0].cycles;
-        while (core.events[0].cycles <= core.globalCycles) {
-            {
-#if NOODS_JIT && NOODS_JIT_POLL_SKIP
-                ArmPpcJit::pollEpoch++;
-#endif
-            core.tasks[core.events[0].task]();
+        // Run all tasks scheduled up to the current timestamp, keeping mid-instruction GBA DMAs for runGbaOpcode Step 2!
+        uint32_t initialTarget = core.events[0].cycles;
+        uint32_t limit = std::max(initialTarget, arm.halted ? initialTarget : arm.cycles);
+        while (core.events[0].cycles <= limit) {
+            SchedEvent ev = core.events[0];
+            if (core.gbaMode && ev.cycles > initialTarget &&
+                ev.task >= DMA7_TRANSFER0 && ev.task <= DMA7_TRANSFER3) {
+                break;
             }
             core.events.erase(core.events.begin());
+            core.globalCycles = ev.cycles;
+#if NOODS_JIT && NOODS_JIT_POLL_SKIP
+            ArmPpcJit::pollEpoch++;
+#endif
+            core.tasks[ev.task]();
+            if (!arm.halted && arm.cycles > limit)
+                limit = arm.cycles;
         }
+        if (!arm.halted)
+            core.globalCycles = std::max(core.globalCycles, arm.cycles);
     }
 }
 
@@ -284,10 +300,55 @@ void Interpreter::runCoreDsi(Core &core) {
 }
 
 FORCE_INLINE int Interpreter::runOpcode() {
+    if (!arm7 && __builtin_expect(core->cp15.mpuRestricted, 0)) {
+        uint32_t faultPc = *registers[15] - ((cpsr & BIT(5)) ? 2 : 4);
+        if (!core->cp15.checkAccess(faultPc, false, false, isPrivileged()))
+            return takeAbort(0x0C, faultPc + 4);
+
+        uint32_t savedRegs[15];
+        for (int i = 0; i < 15; i++)
+            savedRegs[i] = *registers[i];
+
+        uint32_t opcode = pipeline[0];
+        pipeline[0] = pipeline[1];
+        int cyc;
+        if (cpsr & BIT(5)) {
+            pipeline[1] = (((*registers[15] += 2) & 0xFFE) && pcData) ? U8TO16(pcData += 2, 0) : getOpcode16();
+            core->memory.mpuDataCheckActive = true;
+            dataAbort = false;
+            cyc = (this->*thumbInstrs[(opcode >> 6) & 0x3FF])(opcode);
+            core->memory.mpuDataCheckActive = false;
+        }
+        else {
+            pipeline[1] = (((*registers[15] += 4) & 0xFFC) && pcData) ? U8TO32(pcData += 4, 0) : getOpcode32();
+            switch (condition[((opcode >> 24) & 0xF0) | (cpsr >> 28)]) {
+                case 0: cyc = 1; break;
+                case 2:
+                    core->memory.mpuDataCheckActive = true; dataAbort = false;
+                    cyc = handleReserved(opcode);
+                    core->memory.mpuDataCheckActive = false;
+                    break;
+                default:
+                    core->memory.mpuDataCheckActive = true; dataAbort = false;
+                    cyc = (this->*armInstrs[((opcode >> 16) & 0xFF0) | ((opcode >> 4) & 0xF)])(opcode);
+                    core->memory.mpuDataCheckActive = false;
+                    break;
+            }
+        }
+        if (dataAbort) {
+            dataAbort = false;
+            for (int i = 0; i < 15; i++)
+                *registers[i] = savedRegs[i];
+            return takeAbort(0x10, faultPc + 8);
+        }
+        return cyc;
+    }
+
     // Push the next opcode through the pipeline
     uint32_t opcode = pipeline[0];
     pipeline[0] = pipeline[1];
 
+    int cyc;
     // Execute an instruction
     if (cpsr & BIT(5)) { // THUMB mode
         // Increment the program counter and fill the pipeline from pointer or fallback
@@ -295,9 +356,9 @@ FORCE_INLINE int Interpreter::runOpcode() {
 
         // Execute a THUMB instruction
 #if NOODS_JIT
-        return ArmPpcJit::executeThumb(this, opcode);
+        cyc = ArmPpcJit::executeThumb(this, opcode);
 #else
-        return (this->*thumbInstrs[(opcode >> 6) & 0x3FF])(opcode);
+        cyc = (this->*thumbInstrs[(opcode >> 6) & 0x3FF])(opcode);
 #endif
     }
     else { // ARM mode
@@ -306,29 +367,142 @@ FORCE_INLINE int Interpreter::runOpcode() {
 
         // Execute an ARM instruction based on its condition
         switch (condition[((opcode >> 24) & 0xF0) | (cpsr >> 28)]) {
-            case 0: return 1; // False
-            case 2: return handleReserved(opcode); // Reserved
+            case 0: cyc = 1; break; // False
+            case 2: cyc = handleReserved(opcode); break; // Reserved
 #if NOODS_JIT
-            default: return ArmPpcJit::executeArm(this, opcode);
+            default: cyc = ArmPpcJit::executeArm(this, opcode); break;
 #else
-            default: return (this->*armInstrs[((opcode >> 16) & 0xFF0) | ((opcode >> 4) & 0xF)])(opcode);
+            default: cyc = (this->*armInstrs[((opcode >> 16) & 0xFF0) | ((opcode >> 4) & 0xF)])(opcode); break;
 #endif
         }
     }
+    if (arm7 && core->gbaMode)
+        core->memory.clearGbaDmaOpenBus();
+    return cyc;
+}
+
+void Interpreter::advanceGbaCycles(int c) {
+    cycles = (core->globalCycles += c);
+}
+
+void Interpreter::stallGbaDmaCycles(uint32_t c) {
+    if (!halted) {
+        cycles = std::max(cycles, core->globalCycles) + c;
+    }
+}
+
+void Interpreter::runGbaOpcode() {
+    uint32_t opcode = pipeline[0];
+    pipeline[0] = pipeline[1];
+    uint16_t waitCnt = core->memory.getWaitCnt();
+    bool thumb = (cpsr & BIT(5)) != 0;
+
+    // 1. Instruction fetch phase (pipeline[1])
+    if (thumb) {
+        pipeline[1] = (((*registers[15] += 2) & 0xFFE) && pcData) ? U8TO16(pcData += 2, 0) : getOpcode16();
+        int fCyc = core->gbaBus.fetchOpcode(*registers[15], false, waitCnt);
+        cycles = (core->globalCycles += fCyc);
+    }
+    else {
+        pipeline[1] = (((*registers[15] += 4) & 0xFFC) && pcData) ? U8TO32(pcData += 4, 0) : getOpcode32();
+        int fCyc = core->gbaBus.fetchOpcode(*registers[15], true, waitCnt);
+        cycles = (core->globalCycles += fCyc);
+    }
+
+    bool usedDuty = core->gbaBus.lastFetchUsedDuty;
+
+    // 2. Allow any pending GBA DMA transfer ready by end of fetch to preempt bus before data phase,
+    //    even if a scanline/audio task sits earlier in core->events!
+    if (!halted && core->events[0].cycles <= cycles) {
+        for (size_t idx = 0; idx < core->events.size() && core->events[idx].cycles <= cycles; ) {
+            SchedTask t = core->events[idx].task;
+            if (t >= DMA7_TRANSFER0 && t <= DMA7_TRANSFER3) {
+                core->events.erase(core->events.begin() + idx);
+                core->globalCycles = cycles;
+                core->tasks[t]();
+                core->globalCycles = cycles;
+                int sWait = GbaBus::romWaitS(*registers[15], waitCnt);
+                if (usedDuty && ((core->dma[1].firstPakWasWrite && sWait == 3) ||
+                                 (core->dma[1].firstPakWasRead && !(cpsr & BIT(5)) && sWait == 2))) {
+                    cycles = (core->globalCycles += 1);
+                    usedDuty = false;
+                }
+                idx = 0; // Restart scan in case higher-priority DMA became ready
+                continue;
+            }
+            idx++;
+        }
+        waitCnt = core->memory.getWaitCnt();
+    }
+
+    // 3. Execute instruction (data accesses update cycles directly on bus read/write!)
+    core->gbaBus.beginInstruction();
+    core->memory.gbaCpuExecActive = true;
+    int baseCyc;
+    if (thumb) {
+        baseCyc = (this->*thumbInstrs[(opcode >> 6) & 0x3FF])(opcode);
+    }
+    else {
+        switch (condition[((opcode >> 24) & 0xF0) | (cpsr >> 28)]) {
+            case 0: baseCyc = 1; break;
+            case 2: baseCyc = handleReserved(opcode); break;
+            default: baseCyc = (this->*armInstrs[((opcode >> 16) & 0xFF0) | ((opcode >> 4) & 0xF)])(opcode); break;
+        }
+    }
+    core->memory.gbaCpuExecActive = false;
+    if (halted) {
+        core->memory.clearGbaDmaOpenBus();
+        return;
+    }
+    waitCnt = core->memory.getWaitCnt();
+
+    // 4. Trailing internal cycles (1I after loads, multiply/shift internal ticks)
+    if (core->gbaBus.branched) {
+        // Note: if LDR PC / POP {PC} loaded from memory before branching, add 1I
+        if (core->gbaBus.hadLoad) {
+            int iCyc = core->gbaBus.stepInternal(1, waitCnt);
+            cycles = (core->globalCycles += iCyc);
+        }
+    }
+    else if (core->gbaBus.hadDataAccess) {
+        if (core->gbaBus.hadLoad) {
+            int iCyc = core->gbaBus.stepInternal(1, waitCnt);
+            cycles = (core->globalCycles += iCyc);
+        }
+    }
+    else {
+        int internal = baseCyc - 1;
+        if (internal > 0) {
+            int iCyc = core->gbaBus.stepInternal(internal, waitCnt);
+            cycles = (core->globalCycles += iCyc);
+        }
+    }
+
+    core->memory.clearGbaDmaOpenBus();
 }
 
 uint16_t Interpreter::getOpcode16() {
     // Set the opcode pointer or fall back to a regular 16-bit opcode read
-    if (!(pcData = (arm7 ? core->memory.readMap7 : core->memory.readMap9A)[*registers[15] >> 12]))
-        return core->memory.read<uint16_t>(arm7, *registers[15]);
+    if (!(pcData = (arm7 ? core->memory.readMap7 : core->memory.readMap9A)[*registers[15] >> 12])) {
+        bool prev = core->memory.gbaCpuExecActive;
+        core->memory.gbaCpuExecActive = false;
+        uint16_t op = core->memory.read<uint16_t>(arm7, *registers[15]);
+        core->memory.gbaCpuExecActive = prev;
+        return op;
+    }
     pcData += (*registers[15] & 0xFFE);
     return U8TO16(pcData, 0);
 }
 
 uint32_t Interpreter::getOpcode32() {
     // Set the opcode pointer or fall back to a regular 32-bit opcode read
-    if (!(pcData = (arm7 ? core->memory.readMap7 : core->memory.readMap9A)[*registers[15] >> 12]))
-        return core->memory.read<uint32_t>(arm7, *registers[15]);
+    if (!(pcData = (arm7 ? core->memory.readMap7 : core->memory.readMap9A)[*registers[15] >> 12])) {
+        bool prev = core->memory.gbaCpuExecActive;
+        core->memory.gbaCpuExecActive = false;
+        uint32_t op = core->memory.read<uint32_t>(arm7, *registers[15]);
+        core->memory.gbaCpuExecActive = prev;
+        return op;
+    }
     pcData += (*registers[15] & 0xFFC);
     return U8TO32(pcData, 0);
 }
@@ -359,7 +533,7 @@ void Interpreter::sendInterrupt(int bit) {
     // The ARM9 additionally needs IME to be set for it to unhalt, but the ARM7 doesn't care
     if (ie & irf) {
         if (ime && !(cpsr & BIT(7)))
-            core->schedule(SchedTask(ARM9_INTERRUPT + arm7), (arm7 && !core->gbaMode) + 1);
+            core->schedule(SchedTask(ARM9_INTERRUPT + arm7), core->gbaMode ? 3 : ((arm7 && !core->gbaMode) + 1));
         else if (ime || arm7)
             unhalt(0);
     }
@@ -368,9 +542,20 @@ void Interpreter::sendInterrupt(int bit) {
 void Interpreter::interrupt() {
     // Trigger an interrupt and unhalt the CPU if the conditions still hold
     if (ime && (ie & irf) && !(cpsr & BIT(7))) {
-        exception(0x18);
+        uint32_t irqStart = halted ? core->globalCycles : std::max(core->globalCycles, cycles);
+        int cyc = exception(0x18);
         unhalt(0);
+        if (core->gbaMode)
+            cycles = (core->globalCycles = irqStart + cyc);
     }
+}
+
+int Interpreter::takeAbort(uint8_t vector, uint32_t lrVal) {
+    setCpsr((cpsr & ~0x3F) | BIT(7) | 0x17, true); // ARM, IRQ off, Abort mode
+    *registers[14] = lrVal;
+    *registers[15] = (arm7 ? 0 : core->cp15.exceptionAddr) + vector;
+    flushPipeline();
+    return 3;
 }
 
 int Interpreter::exception(uint8_t vector) {
@@ -398,16 +583,26 @@ int Interpreter::undefinedException(bool thumb) {
 }
 
 void Interpreter::flushPipeline() {
+    bool prevExec = core->memory.gbaCpuExecActive;
+    core->memory.gbaCpuExecActive = false;
+    uint32_t targetPc;
     // Adjust the program counter and refill the pipeline after a jump
     if (cpsr & BIT(5)) { // THUMB mode
-        *registers[15] = (*registers[15] & ~0x1) + 2;
-        pipeline[0] = core->memory.read<uint16_t>(arm7, *registers[15] - 2);
+        targetPc = *registers[15] & ~0x1u;
+        *registers[15] = targetPc + 2;
+        pipeline[0] = core->memory.read<uint16_t>(arm7, targetPc);
         pipeline[1] = getOpcode16();
     }
     else { // ARM mode
-        *registers[15] = (*registers[15] & ~0x3) + 4;
-        pipeline[0] = core->memory.read<uint32_t>(arm7, *registers[15] - 4);
+        targetPc = *registers[15] & ~0x3u;
+        *registers[15] = targetPc + 4;
+        pipeline[0] = core->memory.read<uint32_t>(arm7, targetPc);
         pipeline[1] = getOpcode32();
+    }
+    core->memory.gbaCpuExecActive = prevExec;
+    if (prevExec && arm7 && core->gbaMode) {
+        int refill = core->gbaBus.branchRefill(targetPc, !(cpsr & BIT(5)), core->memory.getWaitCnt());
+        cycles = (core->globalCycles += refill);
     }
 }
 
@@ -552,12 +747,13 @@ int Interpreter::handleHleIrq() {
     *registers[14] = arm7 ? 0x00000000 : 0xFFFF0000;
     *registers[15] = core->memory.read<uint32_t>(arm7, arm7 ? 0x3FFFFFC : (core->cp15.dtcmAddr + 0x3FFC));
     flushPipeline();
-    return 3;
+    return core->gbaMode ? 21 : 3;
 }
 
 int Interpreter::finishHleIrq() {
+    bool wasIntrWait = bios->shouldCheck();
     // Update the wait flags if in the middle of an HLE IntrWait function
-    if (bios->shouldCheck())
+    if (wasIntrWait)
         bios->checkWaitFlags();
 
     // Pop registers from the stack, jump to the return address, and restore the mode
@@ -565,6 +761,19 @@ int Interpreter::finishHleIrq() {
     *registers[15] = *registers[14] - 4;
     if (spsr) setCpsr(*spsr);
     flushPipeline();
+    if (core->gbaMode) {
+        core->memory.setGbaBiosOpenBus(0xE25EF004u);
+        if (wasIntrWait && !bios->shouldCheck()) {
+            // Returning out of SWI IntrWait / VBlankIntrWait BIOS body
+            inGbaHaltSwi = false;
+            advanceGbaCycles(42);
+        }
+        else if (inGbaHaltSwi) {
+            // Returning out of SWI Halt BIOS body
+            inGbaHaltSwi = false;
+            advanceGbaCycles(23);
+        }
+    }
     return 3;
 }
 
@@ -586,7 +795,7 @@ void Interpreter::writeIme(uint8_t value) {
 
     // Trigger an interrupt if the conditions are met
     if (ime && (ie & irf) && !(cpsr & BIT(7)))
-        core->schedule(SchedTask(ARM9_INTERRUPT + arm7), (arm7 && !core->gbaMode) + 1);
+        core->schedule(SchedTask(ARM9_INTERRUPT + arm7), core->gbaMode ? 3 : ((arm7 && !core->gbaMode) + 1));
 }
 
 void Interpreter::writeIe(uint32_t mask, uint32_t value) {
@@ -596,7 +805,7 @@ void Interpreter::writeIe(uint32_t mask, uint32_t value) {
 
     // Trigger an interrupt if the conditions are met
     if (ime && (ie & irf) && !(cpsr & BIT(7)))
-        core->schedule(SchedTask(ARM9_INTERRUPT + arm7), (arm7 && !core->gbaMode) + 1);
+        core->schedule(SchedTask(ARM9_INTERRUPT + arm7), core->gbaMode ? 3 : ((arm7 && !core->gbaMode) + 1));
 }
 
 void Interpreter::writeIrf(uint32_t mask, uint32_t value) {

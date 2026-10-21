@@ -76,66 +76,16 @@ static u8*      audioThreadStack    = nullptr;
 static KThread* g_emulatorThreadHandle = nullptr;
 
 void InitializeMem2Arena() {
-    u8* lo = (u8*)SYS_GetArena2Lo();
-    u8* hi = (u8*)SYS_GetArena2Hi();
-    mem2_free_ptr  = (u8*)(((uptr)lo + 31) & ~31u);
-    mem2_max_limit = (u8*)((uptr)hi  & ~31u);
+    // libogc 3.x (tuxedo) manages MEM1 + MEM2 natively via malloc/memalign/free.
 }
 
 void* Noods_MEM2_Alloc(size_t size) {
     if (size == 0) return nullptr;
-    size = (size + 31) & ~31u;
-    if (!mem2_free_ptr || (mem2_free_ptr + size > mem2_max_limit))
-        return nullptr;
-    void* p       = (void*)mem2_free_ptr;
-    mem2_free_ptr += size;
-    return p;
+    return memalign(32, (size + 31) & ~31u);
 }
 
-void Noods_MEM2_Free(void* /*ptr*/) {}
-
-static inline bool IsMem2Ptr(void* p) {
-    return (u8*)p >= (u8*)0x90000000 &&
-           (u8*)p <  (u8*)0x93400000;
-}
-
-static void* GlobalAlloc(size_t size) {
-    void* p = nullptr;
-    if (g_emulatorThreadHandle &&
-        KThreadGetSelf() == g_emulatorThreadHandle && size >= 4096) {
-        PPCIrqState st = PPCIrqLockByMsr();
-        p = Noods_MEM2_Alloc(size);
-        PPCIrqUnlockByMsr(st);
-    }
-    if (!p) p = malloc(size);
-    return p;
-}
-
-void* operator new(size_t size) {
-    void* p = GlobalAlloc(size);
-    if (!p) throw std::bad_alloc();
-    return p;
-}
-void* operator new[](size_t size) {
-    void* p = GlobalAlloc(size);
-    if (!p) throw std::bad_alloc();
-    return p;
-}
-void operator delete(void* p) noexcept {
-    if (!p) return;
-    if (!IsMem2Ptr(p)) free(p);
-}
-void operator delete[](void* p) noexcept {
-    if (!p) return;
-    if (!IsMem2Ptr(p)) free(p);
-}
-void operator delete(void* p, size_t) noexcept {
-    if (!p) return;
-    if (!IsMem2Ptr(p)) free(p);
-}
-void operator delete[](void* p, size_t) noexcept {
-    if (!p) return;
-    if (!IsMem2Ptr(p)) free(p);
+void Noods_MEM2_Free(void* ptr) {
+    free(ptr);
 }
 
 static Core*     ndsCore   = nullptr;
@@ -585,6 +535,8 @@ struct NoodsTestHarness {
 
         if (!chosen.empty()) {
             if (!checkpoints.empty() || maxFrames > 0) {
+                Settings::fpsLimiter = 0;
+                Settings::frameskip  = 0;
                 if (FILE* f = fopen("sd:/g2_state.log", "wb")) fclose(f);
             }
 #if NOODS_JIT
@@ -736,11 +688,7 @@ struct NoodsTestHarness {
                 fwrite(mem.wram7, 1, sizeof(mem.wram7), mf);
                 fwrite(mem.palette, 1, sizeof(mem.palette), mf);
                 fwrite(mem.oam, 1, sizeof(mem.oam), mf);
-#if NOODS_FULL_RAM_DUMP
-                fwrite(mem.ram, 1, 0x400000, mf);
-#else
-                fwrite(mem.ram, 1, 0x40000, mf);
-#endif
+                fwrite(mem.ram, 1, (NOODS_FULL_RAM_DUMP || !core->gbaMode) ? 0x400000 : 0x40000, mf);
                 fflush(mf);
                 fclose(mf);
             }

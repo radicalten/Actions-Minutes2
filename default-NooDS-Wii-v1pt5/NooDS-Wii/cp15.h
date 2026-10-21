@@ -30,6 +30,7 @@ public:
     uint32_t exceptionAddr = 0;
     bool dtcmCanRead = false, dtcmCanWrite = false;
     bool itcmCanRead = false, itcmCanWrite = false;
+    bool mpuRestricted = false;
     uint32_t dtcmAddr = 0, dtcmSize = 0;
     uint32_t itcmSize = 0;
 
@@ -39,8 +40,10 @@ public:
 
     uint32_t read(uint8_t cn, uint8_t cm, uint8_t cp);
     void write(uint8_t cn, uint8_t cm, uint8_t cp, uint32_t value);
+    bool checkAccess(uint32_t addr, bool isWrite, bool isData, bool privileged) const;
 
 private:
+    void updateMpuState();
     Core *core;
     uint32_t ctrlReg = 0x78;
     uint32_t dtcmReg = 0x00;

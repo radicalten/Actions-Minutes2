@@ -49,6 +49,14 @@ void* Core::operator new[](size_t size) {
 }
 void Core::operator delete[](void* p) noexcept { Noods_MEM2_Free(p); }
 
+static void shim_gbaSioTransfer(void* obj, int /*arg*/) {
+    static_cast<Memory*>(obj)->completeGbaSioTransfer();
+}
+
+static void shim_gpuGbaHblankDma(void* obj, int /*arg*/) {
+    static_cast<Gpu*>(obj)->gbaHblankDma();
+}
+
 // ---------------------------------------------------------------------------
 // Constructor
 // ---------------------------------------------------------------------------
@@ -110,6 +118,7 @@ Core::Core(std::string ndsRom, std::string gbaRom, int id,
     tasks[NDS_SCANLINE355]  = SchedCallback(shim_gpuScanline355,   &gpu);
     tasks[GBA_SCANLINE240]  = SchedCallback(shim_gpuGbaScanline240, &gpu);
     tasks[GBA_SCANLINE308]  = SchedCallback(shim_gpuGbaScanline308, &gpu);
+    tasks[GBA_HBLANK_DMA]   = SchedCallback(shim_gpuGbaHblankDma,   &gpu);
 
     // GPU 3D command FIFO
     tasks[GPU3D_COMMANDS]   = SchedCallback(shim_gpu3dCommands, &gpu3D);
@@ -138,6 +147,7 @@ Core::Core(std::string ndsRom, std::string gbaRom, int id,
     tasks[WIFI_COUNT_MS]    = SchedCallback(shim_wifiCountMs, &wifi);
     tasks[WIFI_TRANS_REPLY] = SchedCallback(shim_wifiTransmit, &wifi, CMD_REPLY);
     tasks[WIFI_TRANS_ACK]   = SchedCallback(shim_wifiTransmit, &wifi, CMD_ACK);
+    tasks[GBA_SIO_TRANSFER] = SchedCallback(shim_gbaSioTransfer, &memory);
 
     // ------------------------------------------------------------------
     // BIOS / firmware loading
@@ -190,6 +200,9 @@ Core::Core(std::string ndsRom, std::string gbaRom, int id,
         actionReplay.loadCheats();
 
         if (Settings::directBoot) {
+            cp15.write(6, 0, 0, 0x0000003F);
+            cp15.write(5, 0, 2, 0x33333333);
+            cp15.write(5, 0, 3, 0x33333333);
             cp15.write(1, 0, 0, 0x0005707D);
             cp15.write(9, 1, 0, 0x0300000A);
             cp15.write(9, 1, 1, 0x00000020);
@@ -242,6 +255,8 @@ void Core::saveState(FILE* file) {
     fwrite(&count, sizeof(count), 1, file);
     for (uint32_t i = 0; i < count; i++)
         fwrite(&events[i], sizeof(events[i]), 1, file);
+
+    gbaBus.saveState(file);
 }
 
 void Core::loadState(FILE* file) {
@@ -252,6 +267,7 @@ void Core::loadState(FILE* file) {
     fread(&dsiMode,      sizeof(dsiMode),      1, file);
     fread(&gbaMode,      sizeof(gbaMode),      1, file);
     fread(&globalCycles, sizeof(globalCycles), 1, file);
+    memory.gbaModeCached = gbaMode;
 
     events.clear();
     uint32_t count = 0;
@@ -262,6 +278,7 @@ void Core::loadState(FILE* file) {
         events.push_back(event);
     }
 
+    gbaBus.loadState(file);
     updateRun();
 }
 
@@ -294,7 +311,7 @@ void Core::resetCycles() {
     divSqrt.resetCycles(globalCycles);
     const size_t n = events.size();
     for (size_t i = 0; i < n; i++)
-        events[i].cycles -= globalCycles;
+        events[i].cycles = (events[i].cycles > globalCycles) ? (events[i].cycles - globalCycles) : 0;
 
     for (int i = 0; i < 2; i++) {
         interpreter[i].resetCycles();
@@ -319,6 +336,8 @@ void Core::schedule(SchedTask task, uint32_t cycles) {
 // ---------------------------------------------------------------------------
 void Core::enterGbaMode() {
     gbaMode = true;
+    memory.gbaModeCached = true;
+    gbaBus.reset();
 
     interpreter[0].halt(2);
     interpreter[1].unhalt(2);
@@ -326,7 +345,8 @@ void Core::enterGbaMode() {
 
     events.clear();
     schedule(RESET_CYCLES,    0x7FFFFFFF);
-    schedule(GBA_SCANLINE240, 240 * 4);
+    schedule(GBA_HBLANK_DMA,  240 * 4);
+    schedule(GBA_SCANLINE240, 240 * 4 + 46);
     schedule(GBA_SCANLINE308, 308 * 4);
     schedule(GBA_SPU_SAMPLE,  512);
 
@@ -344,6 +364,7 @@ void Core::enterGbaMode() {
 
     interpreter[1].bios = &hleBios[2];
     interpreter[1].directBoot();
+    memory.setGbaBiosOpenBus(0xE129F000u);
     memory.write<uint16_t>(1, 0x4000088, 0x200);
 }
 

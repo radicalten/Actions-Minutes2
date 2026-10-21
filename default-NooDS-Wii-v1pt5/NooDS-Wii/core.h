@@ -55,6 +55,7 @@ extern "C" {
 #include "spu.h"
 #include "timers.h"
 #include "wifi.h"
+#include "gba_timing.h"
 
 enum CoreError {
     ERROR_BIOS,
@@ -95,6 +96,8 @@ enum SchedTask {
     WIFI_COUNT_MS,
     WIFI_TRANS_REPLY,
     WIFI_TRANS_ACK,
+    GBA_SIO_TRANSFER,
+    GBA_HBLANK_DMA,
     MAX_TASKS
 };
 
@@ -171,6 +174,7 @@ public:
     Spu             spu;
     Timers          timers[2];
     Wifi            wifi;
+    GbaBus          gbaBus;
 
     volatile uint8_t running;
 
