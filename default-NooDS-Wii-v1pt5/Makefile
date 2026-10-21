@@ -6,6 +6,7 @@ include $(DEVKITPPC)/wii_rules
 
 JIT       ?= 1
 BLOCKS    ?= 1
+GBA_JIT   ?= 0
 POLL_SKIP ?= 0
 JIT_STATS ?= 0
 BROWSER   ?= 0
@@ -16,7 +17,7 @@ TEST_FAST ?= 0
 CC      := $(DEVKITPPC)/bin/powerpc-eabi-g++
 MACHDEP := -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions
 INCLUDES += -I$(DEVKITPRO)/portlibs/wii/include -I$(DEVKITPRO)/portlibs/ppc/include -I$(DEVKITPRO)/libogc/include
-JIT_DEFS := -DNOODS_JIT=$(JIT) -DNOODS_JIT_BLOCKS=$(BLOCKS) -DNOODS_JIT_POLL_SKIP=$(POLL_SKIP) -DNOODS_JIT_STATS=$(JIT_STATS)
+JIT_DEFS := -DNOODS_JIT=$(JIT) -DNOODS_JIT_BLOCKS=$(BLOCKS) -DNOODS_GBA_JIT=$(GBA_JIT) -DNOODS_JIT_POLL_SKIP=$(POLL_SKIP) -DNOODS_JIT_STATS=$(JIT_STATS)
 BROWSER_DEFS := -DNOODS_FORCE_BROWSER=$(BROWSER)
 TEST_DEFS :=
 ifeq ($(FULL_RAM_DUMP),1)
@@ -35,7 +36,7 @@ $(BROWSER_DEFS) \
 $(TEST_DEFS) \
 $(INCLUDES) $(MACHDEP)
 
-CONFIG_TAG := jit$(JIT)_blocks$(BLOCKS)_browser$(BROWSER)
+CONFIG_TAG := jit$(JIT)_blocks$(BLOCKS)_gba$(GBA_JIT)_stats$(JIT_STATS)_browser$(BROWSER)
 ifeq ($(FULL_RAM_DUMP),1)
   CONFIG_TAG := $(CONFIG_TAG)_fullram
 endif
