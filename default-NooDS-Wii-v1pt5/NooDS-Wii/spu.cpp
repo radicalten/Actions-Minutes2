@@ -213,31 +213,12 @@ bool Spu::getSamples(uint32_t *dst, int count) {
 
     bool wait = false;   // true → emulator is behind, serve repeated silence
 
-    // ------------------------------------------------------------------
-    // Synchronisation: wait until a full buffer is available, or decide
-    // to serve silence depending on the fps-limiter policy.
-    // ------------------------------------------------------------------
-    if (Settings::fpsLimiter == 1 || Settings::fpsLimiter == 2) {
-        // Bounded wait up to one video frame period (~16 ms) prevents permanent
-        // deadlock if host audio is inactive or a wakeup races.
-        u64 start   = PPCGetTickCount();
-        u64 timeout = PPCUsToTicks(1000000 / 60);
-        while (true) {
-            PPCIrqState st = PPCIrqLockByMsr();
-            bool isReady   = ready;
-            PPCIrqUnlockByMsr(st);
-
-            if (isReady) break;
-
-            if (PPCGetTickCount() - start > timeout) {
-                wait = true;
-                break;
-            }
-            KThreadYield();
-        }
-    }
-    else {
-        // No limiter: if data is not ready, serve silence immediately.
+    // Synchronisation: audioThread runs at priority 0x48 (higher than
+    // emulatorThread at 0x50) and wakes exclusively on hardware ASND DMA
+    // callbacks (~46.9 Hz). Never spin here — if no fresh buffer is ready,
+    // immediately hold the last sample so emulatorThread keeps 100% CPU;
+    // back-pressure when emulatorThread exceeds 60 FPS happens in pushSample().
+    {
         PPCIrqState st = PPCIrqLockByMsr();
         if (!ready) wait = true;
         PPCIrqUnlockByMsr(st);
@@ -296,13 +277,12 @@ void Spu::pushSample(int16_t sampleLeft, int16_t sampleRight) {
 
     // ------------------------------------------------------------------
     // Back-pressure: wait until the audio thread has consumed the
-    // previously completed buffer before we overwrite it.
+    // previously completed buffer before we overwrite it, when host AI DMA is active.
     // ------------------------------------------------------------------
-    if (Settings::fpsLimiter == 1 || Settings::fpsLimiter == 2) {
-        // Bounded wait up to ~32 ms prevents permanent hang when host audio
-        // backend is silent while still throttling smoothly to 60 Hz on hardware.
+    extern volatile bool g_wiiAudioHardwareActive;
+    if ((Settings::fpsLimiter == 1 && g_wiiAudioHardwareActive) || Settings::fpsLimiter == 2) {
         u64 start   = PPCGetTickCount();
-        u64 timeout = PPCUsToTicks(Settings::fpsLimiter == 2 ? 1000000 : (1000000 / 30));
+        u64 timeout = PPCUsToTicks(Settings::fpsLimiter == 2 ? 1000000 : 50000);
         while (true) {
             PPCIrqState st = PPCIrqLockByMsr();
             bool isReady   = ready;
@@ -312,7 +292,7 @@ void Spu::pushSample(int16_t sampleLeft, int16_t sampleRight) {
 
             if (PPCGetTickCount() - start > timeout) break;   // give up
 
-            KThreadYield();
+            KThreadSleepUs(250);
         }
     }
     // fpsLimiter == 0: overwrite without waiting.
@@ -341,7 +321,61 @@ void Spu::pushSample(int16_t sampleLeft, int16_t sampleRight) {
 // Mixes all four legacy GBA sound channels plus the two DMA FIFOs and
 // calls pushSample() with the result.
 // ---------------------------------------------------------------------------
+void Spu::wakeSpuSchedule() {
+    if (spuSilentBatch <= 1) return;
+    const SchedTask targetTask = core->gbaMode ? GBA_SPU_SAMPLE : NDS_SPU_SAMPLE;
+    const uint32_t step = core->gbaMode ? 512u : 1024u;
+    const uint32_t shift = core->gbaMode ? 9u : 10u;
+
+    for (size_t idx = 0; idx < core->events.size(); idx++) {
+        if (core->events[idx].task == targetTask) {
+            core->events.eraseAt(idx);
+            uint32_t elapsed = (core->globalCycles >= spuSilentNextCycle - spuSilentBatch * step)
+                ? (core->globalCycles - (spuSilentNextCycle - spuSilentBatch * step))
+                : 0u;
+            uint32_t done = std::min<uint32_t>(spuSilentBatch - 1u, elapsed >> shift);
+            int16_t dc = 0;
+            if (Settings::emulateAudio) {
+                if (core->gbaMode) {
+                    int32_t bias = gbaSoundBias & 0x3FF;
+                    dc = (int16_t)((std::max(0, std::min(0x3FF, bias)) - 0x200) << 6);
+                } else if (Settings::audio16Bit) {
+                    dc = (int16_t)(std::max(0, std::min<int32_t>(0xFFFF, soundBias << 6)) - 0x8000);
+                } else {
+                    dc = (int16_t)((std::max(0, std::min<int32_t>(0x3FF, soundBias)) - 0x200) << 6);
+                }
+            }
+            for (uint32_t k = 0; k < done; k++)
+                pushSample(dc, dc);
+            uint32_t base = spuSilentNextCycle - spuSilentBatch * step;
+            uint32_t nextCyc = base + (done + 1u) * step;
+            uint32_t delta = (nextCyc > core->globalCycles) ? (nextCyc - core->globalCycles) : 1u;
+            spuSilentBatch = 1;
+            core->schedule(targetTask, delta);
+            return;
+        }
+    }
+    spuSilentBatch = 1;
+}
+
 void Spu::runGbaSample() {
+    if (!(gbaMainSoundCntX & BIT(7))) {
+        const uint32_t prevBatch = spuSilentBatch;
+        spuSilentBatch = 32;
+        spuSilentNextCycle = core->globalCycles + 32u * 512u;
+        core->schedule(GBA_SPU_SAMPLE, 32u * 512u);
+
+        int16_t dc = 0;
+        if (Settings::emulateAudio) {
+            int32_t bias = gbaSoundBias & 0x3FF;
+            dc = (int16_t)((std::max(0, std::min(0x3FF, bias)) - 0x200) << 6);
+        }
+        for (uint32_t k = 0; k < prevBatch; k++)
+            pushSample(dc, dc);
+        return;
+    }
+
+    spuSilentBatch = 1;
     // Reschedule immediately so the next sample fires on time.
     core->schedule(GBA_SPU_SAMPLE, 512);
 
@@ -571,6 +605,25 @@ void Spu::runGbaSample() {
 // volume and bias, and calls pushSample() with the final stereo pair.
 // ---------------------------------------------------------------------------
 void Spu::runSample() {
+    if (!enabled && !(sndCapCnt[0] & BIT(7)) && !(sndCapCnt[1] & BIT(7))) {
+        const uint32_t prevBatch = spuSilentBatch;
+        spuSilentBatch = 32;
+        spuSilentNextCycle = core->globalCycles + 32u * 1024u;
+        core->schedule(NDS_SPU_SAMPLE, 32u * 1024u);
+
+        int16_t dc = 0;
+        if (Settings::emulateAudio) {
+            if (Settings::audio16Bit)
+                dc = (int16_t)(std::max(0, std::min<int32_t>(0xFFFF, soundBias << 6)) - 0x8000);
+            else
+                dc = (int16_t)((std::max(0, std::min<int32_t>(0x3FF, soundBias)) - 0x200) << 6);
+        }
+        for (uint32_t k = 0; k < prevBatch; k++)
+            pushSample(dc, dc);
+        return;
+    }
+
+    spuSilentBatch = 1;
     core->schedule(NDS_SPU_SAMPLE, 512 * 2);
 
     if (!Settings::emulateAudio)
@@ -839,6 +892,7 @@ void Spu::startChannel(int channel) {
     }
 
     enabled |= BIT(channel);
+    wakeSpuSchedule();
 }
 
 // ---------------------------------------------------------------------------
@@ -941,6 +995,7 @@ void Spu::writeGbaMainSoundCntH(uint16_t mask, uint16_t value) {
 }
 
 void Spu::writeGbaMainSoundCntX(uint8_t value) {
+    const bool wasEnabled = (gbaMainSoundCntX & BIT(7)) != 0;
     gbaMainSoundCntX = (gbaMainSoundCntX & ~0x80) | (value & 0x80);
 
     if (!(gbaMainSoundCntX & BIT(7))) {
@@ -950,6 +1005,8 @@ void Spu::writeGbaMainSoundCntX(uint8_t value) {
         gbaMainSoundCntL  = 0;
         gbaMainSoundCntX &= ~0x0F;   // clear channel-active bits
         gbaFrameSequencer = 0;
+    } else if (!wasEnabled) {
+        wakeSpuSchedule();
     }
 }
 
@@ -1057,6 +1114,9 @@ void Spu::writeSndCapCnt(int channel, uint8_t value) {
         // Starting capture: reset the capture address and timer.
         sndCapCurrent[channel] = sndCapDad[channel];
         sndCapTimers[channel]  = soundTmr[1 + (channel << 1)];
+        sndCapCnt[channel] = value & 0x8F;
+        wakeSpuSchedule();
+        return;
     }
     sndCapCnt[channel] = value & 0x8F;
 }

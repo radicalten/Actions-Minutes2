@@ -19,6 +19,17 @@
 */
 
 #include "core.h"
+#include <cstring>
+
+Cp15::Cp15(Core *core): core(core) {
+    pageGen = new uint16_t[0x100000]();
+    pagePerm = new uint8_t[0x100000]();
+}
+
+Cp15::~Cp15() {
+    delete[] pageGen;
+    delete[] pagePerm;
+}
 
 void Cp15::saveState(FILE *file) {
     // Write state data to the file
@@ -90,9 +101,34 @@ uint32_t Cp15::read(uint8_t cn, uint8_t cm, uint8_t cp) {
     }
 }
 
+uint8_t Cp15::fillPagePermSlow(uint32_t page) {
+    const uint32_t addr = page << 12;
+    uint8_t p = 0;
+    if (!(ctrlReg & BIT(0))) {
+        p = 0x3F;
+    } else {
+        if (checkAccess(addr, false, true,  true))  p |= 0x01;
+        if (checkAccess(addr, true,  true,  true))  p |= 0x02;
+        if (checkAccess(addr, false, false, true))  p |= 0x04;
+        if (checkAccess(addr, false, true,  false)) p |= 0x08;
+        if (checkAccess(addr, true,  true,  false)) p |= 0x10;
+        if (checkAccess(addr, false, false, false)) p |= 0x20;
+    }
+    if (pageGen) {
+        pageGen[page] = mpuGen;
+        pagePerm[page] = p;
+    }
+    return p;
+}
+
 void Cp15::updateMpuState() {
+    if (++mpuGen == 0) {
+        if (pageGen) memset(pageGen, 0, sizeof(uint16_t) * 0x100000);
+        mpuGen = 1;
+    }
     if (!(ctrlReg & BIT(0))) {
         mpuRestricted = false;
+        mpuFastPriv = true;
         return;
     }
     // Fast-path check: unrestricted only when region 0 covers full 4GB with AP=3/3
@@ -106,6 +142,37 @@ void Cp15::updateMpuState() {
         }
     }
     mpuRestricted = !fullBg || higherRestricted;
+
+    // Standard libnds / BlocksDS / commercial privileged layout check:
+    // Standard ARM9 data regions (DTCM stack, Main RAM, I/O..OAM/VRAM) grant privileged data R/W,
+    // ITCM (at 0x01000000 or 0x01FF8000) grants privileged data read (BlocksDS maps .itcm read-only, AP=6),
+    // and no region in [0x02000000..0x08000000) restricts privileged R/W (other than a 4 KB DTCM canary).
+    bool itcmOk = checkAccess(0x01000000u, false, true, true) ||
+                  checkAccess(0x01FF8000u, false, true, true);
+    bool privOk =
+        itcmOk &&
+        checkAccess(dtcmAddr + 0x3FF0u, false, true, true) && checkAccess(dtcmAddr + 0x3FF0u, true, true, true) &&
+        checkAccess(0x02000000u, false, true, true) && checkAccess(0x02000000u, true, true, true) &&
+        checkAccess(0x04000000u, false, true, true) && checkAccess(0x04000000u, true, true, true) &&
+        checkAccess(0x06000000u, false, true, true) && checkAccess(0x06000000u, true, true, true);
+    if (privOk) {
+        for (int r = 0; r < 8; r++) {
+            uint32_t reg = regionControl[r];
+            if (!(reg & 1)) continue;
+            uint32_t sizeField = (reg >> 1) & 0x1F;
+            if (sizeField < 11) continue;
+            uint32_t base = (sizeField < 31) ? (reg & ~((2u << sizeField) - 1u)) : 0u;
+            uint8_t dataAp = (regionPerms[r] >> 4) & 0x0F;
+            const bool privRW = (dataAp == 1 || dataAp == 2 || dataAp == 3);
+            if (!privRW && base >= 0x02000000u && base < 0x08000000u &&
+                !(base == dtcmAddr && sizeField == 11) &&
+                !checkAccess(base, true, true, true)) {
+                privOk = false;
+                break;
+            }
+        }
+    }
+    mpuFastPriv = privOk;
 }
 
 bool Cp15::checkAccess(uint32_t addr, bool isWrite, bool isData, bool privileged) const {

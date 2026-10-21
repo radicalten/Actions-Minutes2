@@ -71,13 +71,70 @@ void Gpu3DRenderer::loadState(FILE *file) {
     fread(toonTable, 2, sizeof(toonTable) / 2, file);
 }
 
+namespace {
+struct Gpu3DRenderLuts {
+    uint32_t rgb5To6[32768];
+    uint32_t alpha5To6[32];
+    struct UDivEntry {
+        uint32_t mul;
+        uint8_t add;
+        uint8_t shift;
+    } udiv[1025];
+
+    Gpu3DRenderLuts() {
+        for (uint32_t c = 0; c < 32768; c++) {
+            uint32_t r = ((c >> 0) & 0x1F) * 2; if (r > 0) r++;
+            uint32_t g = ((c >> 5) & 0x1F) * 2; if (g > 0) g++;
+            uint32_t b = ((c >> 10) & 0x1F) * 2; if (b > 0) b++;
+            rgb5To6[c] = (b << 12) | (g << 6) | r;
+        }
+        for (uint32_t a = 0; a < 32; a++) {
+            uint32_t a6 = a * 2; if (a6 > 0) a6++;
+            alpha5To6[a] = a6 << 18;
+        }
+        udiv[0] = { 0, 2, 0 };
+        for (uint32_t d = 1; d <= 1024; d++) {
+            if ((d & (d - 1)) == 0) {
+                uint8_t sh = 0;
+                for (uint32_t t = d; t > 1; t >>= 1) sh++;
+                udiv[d] = { 0, 2, sh };
+            } else {
+                uint64_t nc = ((uint64_t)(0xFFFFFFFFu / d) * d) - 1u;
+                for (uint32_t p = 32; p < 64; p++) {
+                    uint64_t twoP = 1ULL << p;
+                    uint64_t rem = (twoP - 1u) % d;
+                    if (twoP > nc * (d - 1u - rem)) {
+                        uint64_t m = (twoP + d - 1u - rem) / d;
+                        if (m < (1ULL << 32))
+                            udiv[d] = { (uint32_t)m, 0, (uint8_t)(p - 32) };
+                        else
+                            udiv[d] = { (uint32_t)m, 1, (uint8_t)(p - 32) };
+                        break;
+                    }
+                }
+            }
+        }
+    }
+};
+static const Gpu3DRenderLuts s_3dLuts;
+
+static inline uint32_t udivSpan(uint32_t n, uint32_t d) {
+    if (__builtin_expect(d <= 1024, 1)) {
+        const auto &e = s_3dLuts.udiv[d];
+        if (e.add == 2) return n >> e.shift;
+        uint32_t q = (uint32_t)(((uint64_t)n * e.mul) >> 32);
+        if (e.add == 1) {
+            q = ((n - q) >> 1) + q;
+            return q >> (e.shift - 1);
+        }
+        return q >> e.shift;
+    }
+    return n / d;
+}
+} // namespace
+
 uint32_t Gpu3DRenderer::rgba5ToRgba6(uint32_t color) {
-    // Convert an RGBA5 value to an RGBA6 value
-    uint8_t r = ((color >> 0) & 0x1F) * 2; if (r > 0) r++;
-    uint8_t g = ((color >> 5) & 0x1F) * 2; if (g > 0) g++;
-    uint8_t b = ((color >> 10) & 0x1F) * 2; if (b > 0) b++;
-    uint8_t a = ((color >> 15) & 0x1F) * 2; if (a > 0) a++;
-    return (a << 18) | (b << 12) | (g << 6) | r;
+    return s_3dLuts.alpha5To6[(color >> 15) & 0x1Fu] | s_3dLuts.rgb5To6[color & 0x7FFFu];
 }
 
 uint32_t *Gpu3DRenderer::getLine(int line) {
@@ -145,9 +202,12 @@ uint32_t *Gpu3DRenderer::getLine1(int line) {
 void Gpu3DRenderer::drawScanline(int line) {
     if (line == 0) {
         // Calculate the scanline bounds for each polygon
-        for (int i = 0; i < core->gpu3D.polygonCountOut; i++) {
+        const int polyCount = core->gpu3D.polygonCountOut;
+        const bool edgeMark = (disp3DCnt & BIT(5)) != 0;
+        for (int i = 0; i < polyCount; i++) {
             polygonTop[i] = 192 * 2;
             polygonBot[i] = 0 * 2;
+            polygonSharesSameIdOpaqueEdge[i] = false;
 
             _Polygon *polygon = &core->gpu3D.polygonsOut[i];
             for (int j = 0; j < polygon->size; j++) {
@@ -157,6 +217,38 @@ void Gpu3DRenderer::drawScanline(int line) {
             }
 
             if (polygonTop[i] == polygonBot[i]) polygonBot[i]++;
+        }
+
+        if (edgeMark) {
+            for (int i = 0; i < polyCount; i++) {
+                _Polygon *polygon = &core->gpu3D.polygonsOut[i];
+                if (polygon->size != 3 || polygon->alpha != 63 || polygonSharesSameIdOpaqueEdge[i])
+                    continue;
+                for (int otherIndex = i + 1; otherIndex < polyCount; otherIndex++) {
+                    _Polygon *other = &core->gpu3D.polygonsOut[otherIndex];
+                    if (other->size < 3 || other->alpha != 63 || other->id != polygon->id)
+                        continue;
+                    bool shared = false;
+                    for (int a = 0; a < polygon->size && !shared; a++) {
+                        Vertex *a0 = &core->gpu3D.verticesOut[polygon->vertices + a];
+                        Vertex *a1 = &core->gpu3D.verticesOut[polygon->vertices + ((a + 1) % polygon->size)];
+                        for (int b = 0; b < other->size; b++) {
+                            Vertex *b0 = &core->gpu3D.verticesOut[other->vertices + b];
+                            Vertex *b1 = &core->gpu3D.verticesOut[other->vertices + ((b + 1) % other->size)];
+                            if ((a0->x == b0->x && a0->y == b0->y && a1->x == b1->x && a1->y == b1->y) ||
+                                (a0->x == b1->x && a0->y == b1->y && a1->x == b0->x && a1->y == b0->y)) {
+                                shared = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (shared) {
+                        polygonSharesSameIdOpaqueEdge[i] = true;
+                        if (other->size == 3)
+                            polygonSharesSameIdOpaqueEdge[otherIndex] = true;
+                    }
+                }
+            }
         }
 
         resShift = Settings::highRes3D;
@@ -301,7 +393,8 @@ void Gpu3DRenderer::drawScanline1(int line) {
 
     stencilClear[line] = false;
 
-    std::vector<int> translucent;
+    int translucent[2048];
+    int translucentCount = 0;
 
     for (int i = 0; i < core->gpu3D.polygonCountOut; i++) {
         if (line < polygonTop[i] || line >= polygonBot[i])
@@ -309,12 +402,12 @@ void Gpu3DRenderer::drawScanline1(int line) {
 
         _Polygon *polygon = &core->gpu3D.polygonsOut[i];
         if (polygon->alpha < 0x3F || polygon->textureFmt == 1 || polygon->textureFmt == 6)
-            translucent.push_back(i);
+            translucent[translucentCount++] = i;
         else
             drawPolygon(line, i);
     }
 
-    for (unsigned int i = 0; i < translucent.size(); i++)
+    for (int i = 0; i < translucentCount; i++)
         drawPolygon(line, translucent[i]);
 }
 
@@ -420,9 +513,9 @@ uint32_t Gpu3DRenderer::interpolateLinear(uint32_t v1, uint32_t v2, uint32_t x1,
     if (x >= x2) return v2;
 
     if (v1 <= v2)
-        return v1 + (v2 - v1) * (x - x1) / (x2 - x1);
+        return v1 + udivSpan((v2 - v1) * (x - x1), x2 - x1);
     else
-        return v2 + (v1 - v2) * (x2 - x) / (x2 - x1);
+        return v2 + udivSpan((v1 - v2) * (x2 - x), x2 - x1);
 }
 
 uint32_t Gpu3DRenderer::interpolateLinRev(uint32_t v1, uint32_t v2, uint32_t x1, uint32_t x, uint32_t x2) {
@@ -430,9 +523,9 @@ uint32_t Gpu3DRenderer::interpolateLinRev(uint32_t v1, uint32_t v2, uint32_t x1,
     if (x >= x2) return v2;
 
     if (v1 <= v2)
-        return v2 - (v2 - v1) * (x2 - x) / (x2 - x1);
+        return v2 - udivSpan((v2 - v1) * (x2 - x), x2 - x1);
     else
-        return v1 - (v1 - v2) * (x - x1) / (x2 - x1);
+        return v1 - udivSpan((v1 - v2) * (x - x1), x2 - x1);
 }
 
 uint32_t Gpu3DRenderer::interpolateFactor(uint32_t factor, uint32_t shift, uint32_t v1, uint32_t v2) {
@@ -1073,27 +1166,7 @@ void Gpu3DRenderer::drawPolygon(int line, int polygonIndex) {
         stencilClear[line] = false;
     }
 
-    bool sharesSameIdOpaqueEdge = false;
-    if ((disp3DCnt & BIT(5)) && polygon->size == 3 && polygon->alpha == 63) {
-        for (int otherIndex = 0; otherIndex < core->gpu3D.polygonCountOut && !sharesSameIdOpaqueEdge; otherIndex++) {
-            if (otherIndex == polygonIndex) continue;
-            _Polygon *other = &core->gpu3D.polygonsOut[otherIndex];
-            if (other->size < 3 || other->alpha != 63 || other->id != polygon->id) continue;
-            for (int a = 0; a < polygon->size && !sharesSameIdOpaqueEdge; a++) {
-                Vertex *a0 = &core->gpu3D.verticesOut[polygon->vertices + a];
-                Vertex *a1 = &core->gpu3D.verticesOut[polygon->vertices + ((a + 1) % polygon->size)];
-                for (int b = 0; b < other->size; b++) {
-                    Vertex *b0 = &core->gpu3D.verticesOut[other->vertices + b];
-                    Vertex *b1 = &core->gpu3D.verticesOut[other->vertices + ((b + 1) % other->size)];
-                    if ((a0->x == b0->x && a0->y == b0->y && a1->x == b1->x && a1->y == b1->y) ||
-                        (a0->x == b1->x && a0->y == b1->y && a1->x == b0->x && a1->y == b0->y)) {
-                        sharesSameIdOpaqueEdge = true;
-                        break;
-                    }
-                }
-            }
-        }
-    }
+    const bool sharesSameIdOpaqueEdge = polygonSharesSameIdOpaqueEdge[polygonIndex];
 
     uint32_t x1e = x1, x4e = ++x4;
 

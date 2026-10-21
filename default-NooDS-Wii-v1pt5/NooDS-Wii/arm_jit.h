@@ -40,7 +40,7 @@ class Interpreter;
 #ifndef NOODS_JIT_STATS
 #define NOODS_JIT_STATS 1
 #endif
-extern "C" int jit_enter(void *code, Interpreter *cpu);
+extern "C" int jit_enter(void *code, Interpreter *cpu, uint32_t maxIters = 1);
 extern "C" void jit_exit(void);
 extern "C" int jit_fallback_arm(Interpreter *cpu, uint32_t opcode);
 extern "C" int jit_fallback_thumb(Interpreter *cpu, uint32_t opcode);
@@ -261,13 +261,14 @@ constexpr inline uint32_t isync()                       { return (19u << 26) | (
 
 class ArmPpcJit {
 public:
-    static constexpr size_t STUB_TABLE_SIZE  = 8192; // Direct-mapped Phase 1/2 per-instruction cache per CPU
-    static constexpr size_t BLOCK_TABLE_SIZE = 8192; // Direct-mapped Phase 2 multi-instruction block cache per CPU
-    static constexpr size_t PAGE_EPOCH_SIZE  = 4096; // 4 KB page generation slots per CPU
-    static constexpr size_t DEFAULT_POOL_BYTES = 1 * 1024 * 1024; // 1 MiB code pool in MEM2
+    static constexpr size_t STUB_TABLE_SIZE  = 32768; // Direct-mapped Phase 1/2 per-instruction cache per CPU
+    static constexpr size_t BLOCK_TABLE_SIZE = 32768; // Direct-mapped Phase 2 multi-instruction block cache per CPU
+    static constexpr size_t PAGE_EPOCH_SIZE  = 32768; // Collision-free 4 KB page slots covering 0x00000000..0x07FFFFFF
+    static constexpr size_t CODE_LINE_WORDS  = 65536; // 64-byte line bitmap covering 0x00000000..0x07FFFFFF (256 KiB)
+    static constexpr size_t DEFAULT_POOL_BYTES = 8 * 1024 * 1024; // 8 MiB code pool in MEM2
     static constexpr size_t DEFAULT_POOL_WORDS = DEFAULT_POOL_BYTES / sizeof(uint32_t);
     static constexpr size_t MAX_STUB_WORDS     = 224;
-    static constexpr size_t MAX_BLOCK_WORDS    = 4096; // reserve for 24 inline memory accesses and guarded MMIO paths
+    static constexpr size_t MAX_BLOCK_WORDS    = 4096; // reserve for inline memory accesses and guarded MMIO paths
     static constexpr size_t MAX_BLOCK_INSTRS   = 24;
 
     struct StubEntry {
@@ -277,6 +278,9 @@ public:
         void *code;
     };
 
+    // 32-byte L1-cache-line-sized block descriptor:
+    //   instrCount:   bits[7:0]=count, bit[8]=gbaPureAlu, bit[9]=hasBranch, bits[11:10]=loopKind, bit[15]=pollPure
+    //   prefixCycles: bits[7:0]=prefixCycles, bits[15:8]=loopCycles
     struct alignas(32) BlockEntry {
         uint32_t pc;
         uint32_t opcode0;
@@ -285,7 +289,7 @@ public:
         uint32_t epochAndFlags; // (poolEpoch << 2) | (thumb << 1) | valid
         uint32_t pageEpoch;
         uint16_t instrCount;
-        uint16_t prefixCycles; // Cycles of I_0 .. I_{K-2}
+        uint16_t prefixCycles;
         void *code;
     };
 
@@ -324,13 +328,19 @@ public:
     static void reset();
     static void setPoolLimitWords(size_t maxWords);
 
-    // Execute one instruction (Phase 1 fallback stub or Phase 2 native stub/block)
-    static int executeArm(Interpreter *cpu, uint32_t opcode);
-    static int executeThumb(Interpreter *cpu, uint32_t opcode);
+    // Execute one instruction (or superblock / bounded hardware loop up to remIndep/remShared cycles)
+    static int executeArm(Interpreter *cpu, uint32_t opcode, uint32_t remIndep = 1, uint32_t remShared = 1);
+    static int executeThumb(Interpreter *cpu, uint32_t opcode, uint32_t remIndep = 1, uint32_t remShared = 1);
+    static bool tryExecuteGbaFast(Interpreter *cpu, uint16_t waitCnt, uint32_t targetCycles);
+
+    static inline bool hasCodeAtAddr(uint32_t addr) {
+        return (codeLineBits[(addr >> 11) & (CODE_LINE_WORDS - 1)] & (1u << ((addr >> 6) & 31u))) != 0;
+    }
 
     // SMC & Memory map invalidation hooks
     static void invalidateAddr(bool arm7, uint32_t addr);
     static void invalidateRange(bool arm7, uint32_t startAddr, uint32_t endAddr);
+    static void invalidateMapRange(bool arm7, uint32_t startAddr, uint32_t endAddr);
     static void invalidateSharedAddr(uint32_t addr);
     static void invalidateCpu(bool arm7);
     static void invalidateAll();
@@ -361,6 +371,7 @@ private:
     static BlockEntry blockTable[2][BLOCK_TABLE_SIZE];
     static uint32_t pageEpoch[2][PAGE_EPOCH_SIZE];
     static uint32_t pageHasBlockBits[2][PAGE_EPOCH_SIZE / 32];
+    static uint32_t codeLineBits[CODE_LINE_WORDS];
     static Stats stats;
 
     // Joint poll-loop skipping (NOODS_JIT_POLL_SKIP). See arm_jit.cpp for the invariants.
@@ -378,7 +389,7 @@ private:
     static PollTrack pollTrack[2];
 public:
     static uint32_t pollEpoch;   // bumped by every impure dispatch and every scheduled event
-    template <bool Track> static int executeArmCore(Interpreter *cpu, uint32_t opcode, bool *outPure);
+    template <bool Track> static int executeArmCore(Interpreter *cpu, uint32_t opcode, bool *outPure, uint32_t remIndep = 1, uint32_t remShared = 1);
     static int pollExecArm(Interpreter *cpu, uint32_t opcode);
     static int pollJointSkip(Interpreter *cpu, uint32_t S, int r, int ci);
     static void pollSnapshot(PollTrack &t, Interpreter *cpu, uint32_t S);
@@ -390,10 +401,19 @@ private:
     static void *compileStub(Interpreter *cpu, uint32_t instrPC, uint32_t opcode, bool thumb);
     static bool emitNativeThumb(uint32_t *&p, Interpreter *cpu, uint16_t opcode, int &outCycles, bool emitFlags = true);
     static bool emitNativeArm(uint32_t *&p, Interpreter *cpu, uint32_t opcode, int &outCycles, bool emitFlags = true);
+    static bool emitNativeLoadThumb(uint32_t *&p, Interpreter *cpu, uint16_t opcode, int &outCycles);
+    static bool emitNativeStoreThumb(uint32_t *&p, Interpreter *cpu, uint16_t opcode, int &outCycles);
+    static bool emitNativePushPop(uint32_t *&p, Interpreter *cpu, uint16_t regMask, bool isLoad, uint32_t rawOpcode, bool isThumb, int &outCycles);
     static bool emitNativeLoadArm(uint32_t *&p, Interpreter *cpu, uint32_t opcode, int &outCycles);
     static bool emitNativeStoreArm(uint32_t *&p, Interpreter *cpu, uint32_t opcode, int &outCycles);
+    static void emitGuardedPollHalfLoad(uint32_t *&p, Interpreter *cpu, uint8_t rd,
+                                        void (*storeFn)(uint32_t *&, uint8_t, uint8_t),
+                                        uint32_t **outJumpSlots, int &jumpCount);
     static void emitHelperR15Sync(uint32_t *&p, bool enter);
-    static bool emitInlineBranchArm(uint32_t *&p, Interpreter *cpu, uint32_t opcode, uint32_t instrPC, int32_t totalDelta, int32_t prefixCycles, bool helperInBlock);
+    static bool emitInlineBranchArm(uint32_t *&p, Interpreter *cpu, uint32_t opcode, uint32_t instrPC, int32_t totalDelta, int32_t prefixCycles, bool helperInBlock, uint32_t *loopTop = nullptr);
+    static bool emitInlineBranchThumb(uint32_t *&p, Interpreter *cpu, uint16_t opcode, uint32_t instrPC, int32_t totalDelta, int32_t prefixCycles, bool helperInBlock, uint32_t *loopTop = nullptr);
+    static bool emitInlineBxArm(uint32_t *&p, Interpreter *cpu, uint32_t opcode, uint32_t instrPC, int32_t totalDelta, int32_t prefixCycles, bool helperInBlock);
+    static bool emitInlineBxThumb(uint32_t *&p, Interpreter *cpu, uint16_t opcode, uint32_t instrPC, int32_t totalDelta, int32_t prefixCycles, bool helperInBlock);
     static bool emitPcDestLoadTerminatorArm(uint32_t *&p, Interpreter *cpu, uint32_t opcode, uint32_t instrPC, int32_t totalDelta, int32_t prefixCycles, bool helperInBlock);
 
     static void emitLoadGuestReg(uint32_t *&p, uint8_t dstPpc, uint8_t guestReg);
@@ -402,6 +422,6 @@ private:
     static void emitUpdateAddNZCV(uint32_t *&p);
     static void emitUpdateSubNZCV(uint32_t *&p);
 
-    template <bool Track = false> static int tryExecuteBlock(Interpreter *cpu, uint32_t instrPC, uint32_t opcode, bool thumb, bool &outIsNative0, bool *outPure = nullptr);
+    template <bool Track = false> static int tryExecuteBlock(Interpreter *cpu, uint32_t instrPC, uint32_t opcode, bool thumb, bool &outIsNative0, bool *outPure = nullptr, uint32_t remIndep = 1, uint32_t remShared = 1);
     static bool compileBlock(Interpreter *cpu, uint32_t instrPC, uint32_t opcode0, bool thumb, BlockEntry &entry);
 };

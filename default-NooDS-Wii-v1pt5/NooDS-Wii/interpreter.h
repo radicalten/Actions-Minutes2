@@ -116,7 +116,7 @@ private:
     static const uint8_t condition[0x100];
     static const uint8_t bitCount[0x100];
 
-    int runOpcode();
+    int runOpcode(uint32_t remIndep = 1, uint32_t remShared = 1);
     int exception(uint8_t vector);
     int undefinedException(bool thumb);
     void flushPipeline();

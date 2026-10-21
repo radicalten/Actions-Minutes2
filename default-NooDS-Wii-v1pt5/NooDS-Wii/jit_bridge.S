@@ -65,6 +65,7 @@ jit_enter:
     stw     0, 36(1)
     stmw    28, 16(1)
     mr      31, 4
+    mr      30, 5
     mtctr   3
     bctr
     .size jit_enter, .-jit_enter

@@ -25,6 +25,7 @@
 class Core;
 
 class Input {
+    friend class ArmPpcJit;
 public:
     Input(Core *core): core(core) {}
 

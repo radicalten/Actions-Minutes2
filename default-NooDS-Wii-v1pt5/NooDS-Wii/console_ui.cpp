@@ -649,7 +649,16 @@ void ConsoleUI::settingsMenu() {
     const std::vector<std::string> toggle      = { "Off", "On" };
     const std::vector<std::string> theme       = { "Dark", "Light" };
     const std::vector<std::string> frames      = { "None", "1 Frame", "2 Frames",
-                                                   "3 Frames", "4 Frames", "5 Frames" };
+                                                   "3 Frames", "4 Frames", "5 Frames",
+                                                   "6 Frames", "7 Frames", "8 Frames",
+                                                   "9 Frames", "10 Frames",
+                                                   "15 Frames", "20 Frames", "30 Frames" };
+    const std::vector<std::string> scrSizes    = { "Auto", "0.50x", "0.75x", "1.00x",
+                                                   "1.25x", "1.50x", "1.75x", "2.00x",
+                                                   "2.50x", "Off" };
+    const std::vector<std::string> wiiLayouts  = { "Vertical", "Side-by-Side",
+                                                   "Hybrid (Top)", "Hybrid (Bottom)",
+                                                   "Screen 1 Only", "Screen 2 Only" };
     const std::vector<std::string> threads     = { "Disabled", "1 Thread", "2 Threads" };
     const std::vector<std::string> position    = { "Center", "Top", "Bottom", "Left", "Right" };
     const std::vector<std::string> rotation    = { "None", "Clockwise", "Counter-Clockwise" };
@@ -670,7 +679,7 @@ void ConsoleUI::settingsMenu() {
             MenuItem("Show FPS Counter",       toggle[showFpsCounter]),
             MenuItem("Menu Theme",             theme[menuTheme]),
             MenuItem("Graphics Settings",      true),
-            MenuItem("Skip Frames",            frames[Settings::frameskip]),
+            MenuItem("Skip Frames",            frames[Settings::frameskipToIndex(Settings::frameskip)]),
             MenuItem("Threaded 2D",            toggle[Settings::threaded2D]),
             MenuItem("Threaded 3D",            threads[Settings::threaded3D]),
             MenuItem("High-Resolution 3D",     toggle[Settings::highRes3D]),
@@ -694,7 +703,11 @@ void ConsoleUI::settingsMenu() {
             MenuItem("Screen Filter",          filter[Settings::screenFilter]),
             MenuItem("Aspect Ratio",           aspect[ScreenLayout::aspectRatio]),
             MenuItem("Integer Scale",          toggle[ScreenLayout::integerScale]),
-            MenuItem("GBA Crop",               toggle[ScreenLayout::gbaCrop])
+            MenuItem("GBA Crop",               toggle[ScreenLayout::gbaCrop]),
+            MenuItem("Wii Layout Mode",        wiiLayouts[Settings::screenLayout]),
+            MenuItem("Screen 1 Size",          scrSizes[Settings::screen1Size]),
+            MenuItem("Screen 2 Size",          scrSizes[Settings::screen2Size]),
+            MenuItem("Swap Screens",           toggle[Settings::screenSwap])
         };
 
         uint32_t pressed = menu("Settings", settings, index, "Controls");
@@ -705,7 +718,7 @@ void ConsoleUI::settingsMenu() {
                 case 2:  Settings::romInRam               = (Settings::romInRam + 1) % 2;    break;
                 case 3:  Settings::fpsLimiter             = (Settings::fpsLimiter + 1) % 2;  break;
                 case 4:  showFpsCounter                   = (showFpsCounter + 1) % 2;        break;
-                case 7:  Settings::frameskip              = (Settings::frameskip + 1) % 6;   break;
+                case 7:  Settings::stepFrameskip(+1);                                        break;
                 case 8:  Settings::threaded2D             = (Settings::threaded2D + 1) % 2;  break;
                 case 9:  Settings::threaded3D             = (Settings::threaded3D + 1) % 3;  break;
                 case 10: Settings::highRes3D              = (Settings::highRes3D + 1) % 2;   break;
@@ -726,6 +739,10 @@ void ConsoleUI::settingsMenu() {
                 case 29: ScreenLayout::aspectRatio        = (ScreenLayout::aspectRatio + 1) % 4;       break;
                 case 30: ScreenLayout::integerScale       = (ScreenLayout::integerScale + 1) % 2;      break;
                 case 31: ScreenLayout::gbaCrop            = (ScreenLayout::gbaCrop + 1) % 2;           break;
+                case 32: Settings::screenLayout           = (Settings::screenLayout + 1) % 6;          break;
+                case 33: Settings::screen1Size            = (Settings::screen1Size + 1) % 10;          break;
+                case 34: Settings::screen2Size            = (Settings::screen2Size + 1) % 10;          break;
+                case 35: Settings::screenSwap             = (Settings::screenSwap + 1) % 2;            break;
                 case 5:
                     menuTheme = (menuTheme + 1) % 2;
                     palette   = &themeColors[menuTheme * 7];

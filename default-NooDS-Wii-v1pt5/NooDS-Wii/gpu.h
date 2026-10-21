@@ -32,6 +32,7 @@ extern "C" {
 class Core;
 
 class Gpu {
+    friend class ArmPpcJit;
 public:
     Gpu(Core *core);
     ~Gpu();
@@ -67,6 +68,8 @@ private:
         bool top3D = false;
     };
 
+    uint32_t *framePool[4] = {};
+    uint8_t framePoolIdx = 0;
     std::queue<Buffers> framebuffers;
     volatile bool ready;
 

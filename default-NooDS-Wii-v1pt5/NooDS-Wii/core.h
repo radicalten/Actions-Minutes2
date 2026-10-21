@@ -134,8 +134,44 @@ struct SchedEvent {
     SchedTask task;
     uint32_t  cycles;
 
+    SchedEvent() : task((SchedTask)0), cycles(0) {}
     SchedEvent(SchedTask task, uint32_t cycles): task(task), cycles(cycles) {}
     bool operator<(const SchedEvent& e) const { return cycles < e.cycles; }
+};
+
+class EventQueue {
+public:
+    static constexpr uint32_t CAP  = 128;
+    static constexpr uint32_t MASK = CAP - 1;
+
+    SchedEvent buf[CAP];
+    uint32_t   head = 0;
+    uint32_t   sz   = 0;
+
+    inline SchedEvent&       operator[](size_t i)       { return buf[(head + (uint32_t)i) & MASK]; }
+    inline const SchedEvent& operator[](size_t i) const { return buf[(head + (uint32_t)i) & MASK]; }
+    inline size_t size()  const { return sz; }
+    inline bool   empty() const { return sz == 0; }
+    inline void   clear()       { head = 0; sz = 0; }
+    inline void   push_back(const SchedEvent& e) { buf[(head + sz) & MASK] = e; sz++; }
+    inline void   popFront()    { head = (head + 1u) & MASK; sz--; }
+
+    inline void eraseAt(size_t idx) {
+        if (idx == 0) { popFront(); return; }
+        for (size_t i = idx; i + 1 < sz; i++)
+            (*this)[i] = (*this)[i + 1];
+        sz--;
+    }
+
+    inline void insertUpperBound(const SchedEvent& e) {
+        uint32_t pos = sz;
+        while (pos > 0 && (*this)[pos - 1].cycles > e.cycles) {
+            (*this)[pos] = (*this)[pos - 1];
+            pos--;
+        }
+        (*this)[pos] = e;
+        sz++;
+    }
 };
 
 class Core {
@@ -178,7 +214,7 @@ public:
 
     volatile uint8_t running;
 
-    std::vector<SchedEvent> events;
+    EventQueue events;
 
     // Flat array of two-word callbacks — fits in two cache lines (32 tasks).
     // Each entry is 12 bytes on 32-bit PPC: fn(4) + obj(4) + arg(4).
@@ -206,8 +242,9 @@ private:
     bool realGbaBios;
     void (*runFunc)(Core&) = &Interpreter::runCoreNds;
 
-    uint64_t lastFpsTimeTicks = 0;
-    int      fpsCount         = 0;
+    uint64_t lastFpsTimeTicks      = 0;
+    uint64_t nextFrameDeadlineTicks = 0;
+    int      fpsCount              = 0;
 
     void updateRun();
     void resetCycles();

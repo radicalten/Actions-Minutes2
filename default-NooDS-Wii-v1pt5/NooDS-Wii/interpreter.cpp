@@ -135,12 +135,14 @@ void Interpreter::runCoreNone(Core &core) {
         uint32_t target = core.events[0].cycles;
         while (core.events[0].cycles <= target) {
             SchedEvent ev = core.events[0];
-            core.events.erase(core.events.begin());
+            core.events.popFront();
             core.globalCycles = ev.cycles;
 #if NOODS_JIT && NOODS_JIT_POLL_SKIP
             ArmPpcJit::pollEpoch++;
 #endif
             core.tasks[ev.task]();
+            if (ev.task == RESET_CYCLES)
+                target = 0;
         }
     }
 }
@@ -162,12 +164,20 @@ template <bool _arm7, int shift> void Interpreter::runCoreSingle(Core &core) {
         // Run a CPU until the next scheduled task
         core.globalCycles = std::max(core.globalCycles, arm.cycles);
         if (_arm7 && core.gbaMode) {
-            while (core.events[0].cycles > arm.cycles)
+            while (core.events[0].cycles > arm.cycles) {
+#if NOODS_JIT && NOODS_JIT_BLOCKS && NOODS_GBA_JIT
+                if (arm.pcData && core.gbaBus.nextSeq &&
+                    ArmPpcJit::tryExecuteGbaFast(&arm, core.memory.getWaitCnt(), core.events[0].cycles))
+                    continue;
+#endif
                 arm.runGbaOpcode();
+            }
         }
         else {
-            while (core.events[0].cycles > arm.cycles)
-                arm.cycles = (core.globalCycles += arm.runOpcode() << shift);
+            while (core.events[0].cycles > arm.cycles) {
+                uint32_t rem = (core.events[0].cycles - arm.cycles + shift) >> shift;
+                arm.cycles = (core.globalCycles += arm.runOpcode(rem, rem) << shift);
+            }
         }
 
         // Run all tasks scheduled up to the current timestamp, keeping mid-instruction GBA DMAs for runGbaOpcode Step 2!
@@ -179,12 +189,16 @@ template <bool _arm7, int shift> void Interpreter::runCoreSingle(Core &core) {
                 ev.task >= DMA7_TRANSFER0 && ev.task <= DMA7_TRANSFER3) {
                 break;
             }
-            core.events.erase(core.events.begin());
+            core.events.popFront();
             core.globalCycles = ev.cycles;
 #if NOODS_JIT && NOODS_JIT_POLL_SKIP
             ArmPpcJit::pollEpoch++;
 #endif
             core.tasks[ev.task]();
+            if (ev.task == RESET_CYCLES) {
+                initialTarget = 0;
+                limit = arm.halted ? 0u : arm.cycles;
+            }
             if (!arm.halted && arm.cycles > limit)
                 limit = arm.cycles;
         }
@@ -226,10 +240,19 @@ void Interpreter::runCoreNds(Core &core) {
         uint64_t cpuStart = PPCGetTickCount();
 #endif
         while (core.events[0].cycles > core.globalCycles) {
-            if (core.globalCycles >= arm9.cycles)
-                arm9.cycles = core.globalCycles + arm9.runOpcode();
-            if (core.globalCycles >= arm7.cycles)
-                arm7.cycles = core.globalCycles + (arm7.runOpcode() << 1);
+            const uint32_t evTarget = core.events[0].cycles;
+            if (core.globalCycles >= arm9.cycles) {
+                uint32_t remIndep9 = evTarget - core.globalCycles;
+                uint32_t safeEnd9 = arm7.halted ? evTarget : std::min<uint32_t>(evTarget, std::max<uint32_t>(core.globalCycles + 1u, arm7.cycles));
+                uint32_t remShared9 = safeEnd9 - core.globalCycles;
+                arm9.cycles = core.globalCycles + arm9.runOpcode(remIndep9, remShared9);
+            }
+            if (core.globalCycles >= arm7.cycles) {
+                uint32_t remIndep7 = (evTarget - core.globalCycles + 1u) >> 1;
+                uint32_t safeEnd7 = arm9.halted ? evTarget : std::min<uint32_t>(evTarget, std::max<uint32_t>(core.globalCycles + 2u, arm9.cycles));
+                uint32_t remShared7 = (safeEnd7 - core.globalCycles + 1u) >> 1;
+                arm7.cycles = core.globalCycles + (arm7.runOpcode(remIndep7, remShared7) << 1);
+            }
             core.globalCycles = std::min<uint32_t>(arm9.cycles, arm7.cycles);
         }
 
@@ -237,23 +260,24 @@ void Interpreter::runCoreNds(Core &core) {
         ndsCpuTicks += PPCGetTickCount() - cpuStart;
 #endif
         // Jump to the next task and run all that are scheduled now
-        core.globalCycles = core.events[0].cycles;
-        while (core.events[0].cycles <= core.globalCycles) {
-            {
+        uint32_t target = core.events[0].cycles;
+        core.globalCycles = target;
+        while (core.events[0].cycles <= target) {
+            SchedEvent ev = core.events[0];
+            core.events.popFront();
 #if NOODS_JIT && NOODS_JIT_POLL_SKIP
-                ArmPpcJit::pollEpoch++;
+            ArmPpcJit::pollEpoch++;
 #endif
 #if NOODS_NDS_TASK_PROFILE
-            SchedTask task = core.events[0].task;
             uint64_t taskStart = PPCGetTickCount();
-            core.tasks[task]();
-            ndsTaskTicks[task] += PPCGetTickCount() - taskStart;
-            ndsTaskCalls[task]++;
+            core.tasks[ev.task]();
+            ndsTaskTicks[ev.task] += PPCGetTickCount() - taskStart;
+            ndsTaskCalls[ev.task]++;
 #else
-            core.tasks[core.events[0].task]();
+            core.tasks[ev.task]();
 #endif
-            }
-            core.events.erase(core.events.begin());
+            if (ev.task == RESET_CYCLES)
+                target = 0;
         }
     }
 }
@@ -286,62 +310,71 @@ void Interpreter::runCoreDsi(Core &core) {
         }
 
         // Jump to the next task and run all that are scheduled now
-        core.globalCycles = core.events[0].cycles;
-        while (core.events[0].cycles <= core.globalCycles) {
-            {
+        uint32_t target = core.events[0].cycles;
+        core.globalCycles = target;
+        while (core.events[0].cycles <= target) {
+            SchedEvent ev = core.events[0];
+            core.events.popFront();
 #if NOODS_JIT && NOODS_JIT_POLL_SKIP
-                ArmPpcJit::pollEpoch++;
+            ArmPpcJit::pollEpoch++;
 #endif
-            core.tasks[core.events[0].task]();
-            }
-            core.events.erase(core.events.begin());
+            core.tasks[ev.task]();
+            if (ev.task == RESET_CYCLES)
+                target = 0;
         }
     }
 }
 
-FORCE_INLINE int Interpreter::runOpcode() {
+FORCE_INLINE int Interpreter::runOpcode(uint32_t remIndep, uint32_t remShared) {
     if (!arm7 && __builtin_expect(core->cp15.mpuRestricted, 0)) {
-        uint32_t faultPc = *registers[15] - ((cpsr & BIT(5)) ? 2 : 4);
-        if (!core->cp15.checkAccess(faultPc, false, false, isPrivileged()))
-            return takeAbort(0x0C, faultPc + 4);
+        const uint32_t faultPc = *registers[15] - ((cpsr & BIT(5)) ? 2u : 4u);
+        const bool priv = isPrivileged();
+        // Fast gate: standard privileged layout (e.g. libnds default MPU) with executable code page
+        // needs no per-instruction data check on mapped RAM/IO; only enter slow path on User mode,
+        // custom data restrictions, or non-executable PC page.
+        if (!priv || !core->cp15.mpuFastPriv ||
+            !(core->cp15.getPagePerm(faultPc >> 12) & 0x04)) {
+            if (!core->cp15.checkAccess(faultPc, false, false, priv))
+                return takeAbort(0x0C, faultPc + 4);
 
-        uint32_t savedRegs[15];
-        for (int i = 0; i < 15; i++)
-            savedRegs[i] = *registers[i];
-
-        uint32_t opcode = pipeline[0];
-        pipeline[0] = pipeline[1];
-        int cyc;
-        if (cpsr & BIT(5)) {
-            pipeline[1] = (((*registers[15] += 2) & 0xFFE) && pcData) ? U8TO16(pcData += 2, 0) : getOpcode16();
-            core->memory.mpuDataCheckActive = true;
-            dataAbort = false;
-            cyc = (this->*thumbInstrs[(opcode >> 6) & 0x3FF])(opcode);
-            core->memory.mpuDataCheckActive = false;
-        }
-        else {
-            pipeline[1] = (((*registers[15] += 4) & 0xFFC) && pcData) ? U8TO32(pcData += 4, 0) : getOpcode32();
-            switch (condition[((opcode >> 24) & 0xF0) | (cpsr >> 28)]) {
-                case 0: cyc = 1; break;
-                case 2:
-                    core->memory.mpuDataCheckActive = true; dataAbort = false;
-                    cyc = handleReserved(opcode);
-                    core->memory.mpuDataCheckActive = false;
-                    break;
-                default:
-                    core->memory.mpuDataCheckActive = true; dataAbort = false;
-                    cyc = (this->*armInstrs[((opcode >> 16) & 0xFF0) | ((opcode >> 4) & 0xF)])(opcode);
-                    core->memory.mpuDataCheckActive = false;
-                    break;
-            }
-        }
-        if (dataAbort) {
-            dataAbort = false;
+            uint32_t savedRegs[15];
             for (int i = 0; i < 15; i++)
-                *registers[i] = savedRegs[i];
-            return takeAbort(0x10, faultPc + 8);
+                savedRegs[i] = *registers[i];
+
+            uint32_t opcode = pipeline[0];
+            pipeline[0] = pipeline[1];
+            int cyc;
+            if (cpsr & BIT(5)) {
+                pipeline[1] = (((*registers[15] += 2) & 0xFFE) && pcData) ? U8TO16(pcData += 2, 0) : getOpcode16();
+                core->memory.mpuDataCheckActive = true;
+                dataAbort = false;
+                cyc = (this->*thumbInstrs[(opcode >> 6) & 0x3FF])(opcode);
+                core->memory.mpuDataCheckActive = false;
+            }
+            else {
+                pipeline[1] = (((*registers[15] += 4) & 0xFFC) && pcData) ? U8TO32(pcData += 4, 0) : getOpcode32();
+                switch (condition[((opcode >> 24) & 0xF0) | (cpsr >> 28)]) {
+                    case 0: cyc = 1; break;
+                    case 2:
+                        core->memory.mpuDataCheckActive = true; dataAbort = false;
+                        cyc = handleReserved(opcode);
+                        core->memory.mpuDataCheckActive = false;
+                        break;
+                    default:
+                        core->memory.mpuDataCheckActive = true; dataAbort = false;
+                        cyc = (this->*armInstrs[((opcode >> 16) & 0xFF0) | ((opcode >> 4) & 0xF)])(opcode);
+                        core->memory.mpuDataCheckActive = false;
+                        break;
+                }
+            }
+            if (dataAbort) {
+                dataAbort = false;
+                for (int i = 0; i < 15; i++)
+                    *registers[i] = savedRegs[i];
+                return takeAbort(0x10, faultPc + 8);
+            }
+            return cyc;
         }
-        return cyc;
     }
 
     // Push the next opcode through the pipeline
@@ -356,7 +389,7 @@ FORCE_INLINE int Interpreter::runOpcode() {
 
         // Execute a THUMB instruction
 #if NOODS_JIT
-        cyc = ArmPpcJit::executeThumb(this, opcode);
+        cyc = ArmPpcJit::executeThumb(this, opcode, remIndep, remShared);
 #else
         cyc = (this->*thumbInstrs[(opcode >> 6) & 0x3FF])(opcode);
 #endif
@@ -370,7 +403,7 @@ FORCE_INLINE int Interpreter::runOpcode() {
             case 0: cyc = 1; break; // False
             case 2: cyc = handleReserved(opcode); break; // Reserved
 #if NOODS_JIT
-            default: cyc = ArmPpcJit::executeArm(this, opcode); break;
+            default: cyc = ArmPpcJit::executeArm(this, opcode, remIndep, remShared); break;
 #else
             default: cyc = (this->*armInstrs[((opcode >> 16) & 0xFF0) | ((opcode >> 4) & 0xF)])(opcode); break;
 #endif
@@ -417,7 +450,7 @@ void Interpreter::runGbaOpcode() {
         for (size_t idx = 0; idx < core->events.size() && core->events[idx].cycles <= cycles; ) {
             SchedTask t = core->events[idx].task;
             if (t >= DMA7_TRANSFER0 && t <= DMA7_TRANSFER3) {
-                core->events.erase(core->events.begin() + idx);
+                core->events.eraseAt(idx);
                 core->globalCycles = cycles;
                 core->tasks[t]();
                 core->globalCycles = cycles;

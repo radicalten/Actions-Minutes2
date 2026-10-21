@@ -308,6 +308,7 @@ void Core::updateRun() {
 // resetCycles — prevent globalCycles overflow every ~2 billion ticks
 // ---------------------------------------------------------------------------
 void Core::resetCycles() {
+    spu.wakeSpuSchedule();
     divSqrt.resetCycles(globalCycles);
     const size_t n = events.size();
     for (size_t i = 0; i < n; i++)
@@ -326,9 +327,7 @@ void Core::resetCycles() {
 // schedule — insert a new event in sorted order (binary search insertion)
 // ---------------------------------------------------------------------------
 void Core::schedule(SchedTask task, uint32_t cycles) {
-    SchedEvent event(task, globalCycles + cycles);
-    auto it = std::upper_bound(events.cbegin(), events.cend(), event);
-    events.insert(it, event);
+    events.insertUpperBound(SchedEvent(task, globalCycles + cycles));
 }
 
 // ---------------------------------------------------------------------------
@@ -380,6 +379,25 @@ void Core::endFrame() {
 
     if (arm7Hle)
         hleArm7.runFrame();
+
+#if !NOODS_TEST_FAST
+    if (Settings::fpsLimiter) {
+        const uint64_t framePeriodTicks = PPCUsToTicks(16667);
+        uint64_t frameNow = PPCGetTickCount();
+        if (nextFrameDeadlineTicks == 0)
+            nextFrameDeadlineTicks = frameNow + framePeriodTicks;
+        if (frameNow < nextFrameDeadlineTicks) {
+            KThreadSleepTicks(nextFrameDeadlineTicks - frameNow);
+            nextFrameDeadlineTicks += framePeriodTicks;
+        } else {
+            nextFrameDeadlineTicks += framePeriodTicks;
+            if (frameNow > nextFrameDeadlineTicks + framePeriodTicks)
+                nextFrameDeadlineTicks = frameNow + framePeriodTicks;
+        }
+    } else {
+        nextFrameDeadlineTicks = 0;
+    }
+#endif
 
     uint64_t now     = PPCGetTickCount();
     uint64_t elapsed = now - lastFpsTimeTicks;

@@ -147,6 +147,7 @@ uint32_t DivSqrt::readSqrtResult() {
 }
 
 void DivSqrt::resetCycles(uint32_t elapsedCycles) {
+    updateSquareRoot();
     if (sqrtCnt & 0x8000) sqrtReadyCycle -= elapsedCycles;
 }
 

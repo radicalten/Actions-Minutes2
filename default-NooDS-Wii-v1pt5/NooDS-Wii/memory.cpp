@@ -284,7 +284,7 @@ void Memory::updateMap9(uint32_t start, uint32_t end, bool tcm) {
     // Update the ARM9 opcode pointer in case it was remapped
     core->interpreter[0].getOpcode16();
 #if NOODS_JIT
-    ArmPpcJit::invalidateCpu(false);
+    ArmPpcJit::invalidateMapRange(false, start, end);
 #endif
 }
 
@@ -371,7 +371,7 @@ void Memory::updateMap7(uint32_t start, uint32_t end) {
     // Update the ARM7 opcode pointer in case it was remapped
     core->interpreter[1].getOpcode16();
 #if NOODS_JIT
-    ArmPpcJit::invalidateCpu(true);
+    ArmPpcJit::invalidateMapRange(true, start, end);
 #endif
 }
 

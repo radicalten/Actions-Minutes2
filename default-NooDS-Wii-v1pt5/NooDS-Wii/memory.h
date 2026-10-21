@@ -255,7 +255,8 @@ template <typename T> FORCE_INLINE void Memory::write(bool arm7, uint32_t addres
                 data[i] = value >> (i * 8);
         }
 #if NOODS_JIT
-        ArmPpcJit::invalidateSharedAddr(address);
+        if (__builtin_expect((address >> 27) == 0 && ArmPpcJit::hasCodeAtAddr(address), 0))
+            ArmPpcJit::invalidateSharedAddr(address);
 #endif
         return;
     }

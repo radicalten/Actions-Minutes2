@@ -121,58 +121,49 @@ struct ProfGuard {
 
 void *Noods_MEM2_Alloc(size_t size);
 
-// R15 value (guest address of the instruction + 8) of the instruction being emitted; used by helper slow paths.
+// R15 value (guest address of the instruction + 2*step) of the instruction being emitted; used by helper slow paths.
 static uint32_t s_emitInstrR15 = 0;
+static uint32_t s_candPc[2][ArmPpcJit::BLOCK_TABLE_SIZE];
+static uint8_t  s_candHits[2][ArmPpcJit::BLOCK_TABLE_SIZE];
 
-// ---- Native guest load/store classification (ARM) ----
-// Single data transfer (LDR/LDRB, bits 27..26 == 01) or halfword transfer (LDRH: SH == 01).
+// ---- Native guest load/store classification (ARM & Thumb) ----
 static inline bool isMemClassArm(uint32_t op) {
     if ((op & 0x0C000000u) == 0x04000000u) return true;
-    return (op & 0x0E000090u) == 0x00000090u && (op & 0x60u) != 0;
+    if ((op & 0x0E000090u) == 0x00000090u && (op & 0x60u) != 0) return true;
+    if ((op & 0xFFFF8000u) == 0xE92D0000u || (op & 0xFFFF8000u) == 0xE8BD0000u) return true;
+    return false;
 }
 
-// Pre-indexed, no writeback, load to a non-PC register; register offsets are unshifted (LDRH) or LSL (LDR/LDRB).
-// Generic halfword-load translation remains opt-in; the guarded ARM9 DISPSTAT
-// path is enabled independently (verified against interpreter checkpoints).
-#ifndef NOODS_JIT_NATIVE_HALF_LOADS
-#define NOODS_JIT_NATIVE_HALF_LOADS 0
-#endif
 #ifndef NOODS_JIT_DISPSTAT_FAST
 #define NOODS_JIT_DISPSTAT_FAST 1
 #endif
 #ifndef NOODS_JIT_KEYINPUT_FAST
 #define NOODS_JIT_KEYINPUT_FAST 1
 #endif
-// ARM7 polls IPCSYNC (0x04000180) in its IPC wait loops; it is a plain register with no side effects.
-// Default OFF: enabling it also turns on native ARM7 halfword loads, which diverge from the interpreter in
-// GBA mode (G3 Timing-suite parity: 3522 vs 3506 passes; gbaout hash differs). Stage-1 regression, see
-// evidence/. Opt in with -DNOODS_JIT_IPCSYNC_FAST=1 only after fixing the native ARM7 halfword path.
 #ifndef NOODS_JIT_IPCSYNC_FAST
-#define NOODS_JIT_IPCSYNC_FAST 0
+#define NOODS_JIT_IPCSYNC_FAST 1
 #endif
-static constexpr bool kNativeHalfLoads = NOODS_JIT_NATIVE_HALF_LOADS != 0;
+
+// Pre-indexed, no writeback, load to a non-PC register (including PC-relative constant pools!).
 static inline bool isNativeLoadArm(bool arm7, uint32_t op) {
+    (void)arm7;
     if ((op >> 28) == 0xFu) return false;
     if (((op >> 12) & 0xFu) == 15u) return false;
-    if ((op & (1u << 20)) == 0) return false;   // L
-    if ((op & (1u << 24)) == 0) return false;   // P
-    if ((op & (1u << 21)) != 0) return false;   // W
+    if ((op & (1u << 20)) == 0) return false;   // L = 1
+    if ((op & (1u << 24)) == 0) return false;   // P = 1 (pre-indexed)
+    if ((op & (1u << 21)) != 0) return false;   // W = 0
     if ((op & 0x0C000000u) == 0x04000000u) {    // LDR / LDRB
-        if (((op >> 16) & 0xFu) == 15u) return false;     // PC-relative: left to the interpreter
         if ((op & (1u << 25)) != 0) {
+            if (((op >> 16) & 0xFu) == 15u) return false;
             if ((op & (1u << 4)) != 0) return false;
             if ((op & 0xFu) == 15u) return false;
             if (((op >> 5) & 3u) != 0u) return false;    // only LSL-scaled register offsets
         }
         return true;
     }
-    // Halfword loads are only translated by default for ARM9: guarded
-    // DISPSTAT reads avoid the interpreter, while ARM7 keeps its old path.
-    if (!kNativeHalfLoads && !((NOODS_JIT_DISPSTAT_FAST || NOODS_JIT_KEYINPUT_FAST) && !arm7)
-                         && !(NOODS_JIT_IPCSYNC_FAST && arm7)) return false;
-    if (((op >> 16) & 0xFu) == 15u) return false;
-    if ((op & 0x0E000090u) == 0x00000090u && (op & 0x60u) == 0x20u) { // LDRH (SH == 01)
+    if ((op & 0x0E000090u) == 0x00000090u && (op & 0x60u) != 0u) { // LDRH / LDRSB / LDRSH
         if ((op & (1u << 22)) == 0) {           // register offset
+            if (((op >> 16) & 0xFu) == 15u) return false;
             if ((op & 0xF00u) != 0) return false;
             if ((op & 0xFu) == 15u) return false;
         }
@@ -181,12 +172,8 @@ static inline bool isNativeLoadArm(bool arm7, uint32_t op) {
     return false;
 }
 
-// Native halfword store (STRH), pre- or post-indexed, immediate or unshifted register offsets,
-// with or without writeback, unconditional, Rn/Rd != PC. emitNativeStoreArm also handles the
-// STR/STRB single-data-transfer encodings, but accepting those still diverges from the interpreter
-// under block compilation on rockwrestler (see notes): a block containing a native STR/STRB ends
-// with a stale pipeline[0]/R15 pair, while the single-instruction build matches exactly, so only
-// the STRH subset is enabled until that is understood.
+// Native STR / STRB / STRH, pre- or post-indexed, immediate or LSL register offsets, unconditional, Rn/Rd != PC.
+// Excludes P=0, W=1 (unprivileged STRT/STRBT) so privilege-override instructions stay in the interpreter.
 static inline bool isNativeStoreArm(uint32_t op) {
     if ((op >> 28) != 0xEu) return false;
     if ((op & (1u << 20)) != 0) return false;            // L = 0 (store)
@@ -194,13 +181,53 @@ static inline bool isNativeStoreArm(uint32_t op) {
     if (((op >> 12) & 0xFu) == 15u) return false;
     const bool pre = (op & (1u << 24)) != 0;
     const bool wb  = (op & (1u << 21)) != 0;
-    if ((op & 0x0E000090u) != 0x00000090u || (op & 0xF0u) != 0xB0u) return false; // STRH only
-    if (!pre && !wb) { /* P=0,W=0: NooDS's STRH handler still post-updates Rn (see emitter) */ }
+    if ((op & 0x0C000000u) == 0x04000000u) {             // STR / STRB
+        if (!pre && wb) return false;                    // STRT / STRBT
+        if ((op & (1u << 25)) != 0) {
+            if ((op & (1u << 4)) != 0) return false;
+            if ((op & 0xFu) == 15u) return false;
+            if (((op >> 5) & 3u) != 0u) return false;
+        }
+        return true;
+    }
+    if ((op & 0x0E000090u) != 0x00000090u || (op & 0xF0u) != 0xB0u) return false; // STRH
     if ((op & (1u << 22)) == 0) {                        // register offset (unshifted)
         if ((op & 0xF00u) != 0) return false;
         if ((op & 0xFu) == 15u) return false;
     }
     return true;
+}
+
+static inline bool isNativePushPopArm(uint32_t op) {
+    if ((op & 0xFFFFu) == 0u) return false;
+    if ((op & (1u << 13)) != 0u) return false;           // SP not in list
+    if ((op & (1u << 15)) != 0u) return false;           // R15 not in list
+    return (op & 0xFFFF0000u) == 0xE92D0000u || (op & 0xFFFF0000u) == 0xE8BD0000u;
+}
+
+static inline bool isNativeLoadThumb(uint16_t op) {
+    if ((op & 0xF800u) == 0x4800u) return true; // LDR Rd, [PC, #imm8]
+    if ((op & 0xF000u) == 0x5000u && (op & 0x0E00u) >= 0x0600u) return true; // LDSB/LDR/LDRH/LDRB/LDSH Rd, [Rb, Ro]
+    if ((op & 0xF800u) == 0x6800u) return true; // LDR Rd, [Rb, #imm5]
+    if ((op & 0xF800u) == 0x7800u) return true; // LDRB Rd, [Rb, #imm5]
+    if ((op & 0xF800u) == 0x8800u) return true; // LDRH Rd, [Rb, #imm5]
+    if ((op & 0xF800u) == 0x9800u) return true; // LDR Rd, [SP, #imm8]
+    return false;
+}
+
+static inline bool isNativeStoreThumb(uint16_t op) {
+    if ((op & 0xF000u) == 0x5000u && (op & 0x0E00u) < 0x0600u) return true; // STR/STRH/STRB Rd, [Rb, Ro]
+    if ((op & 0xF800u) == 0x6000u) return true; // STR Rd, [Rb, #imm5]
+    if ((op & 0xF800u) == 0x7000u) return true; // STRB Rd, [Rb, #imm5]
+    if ((op & 0xF800u) == 0x8000u) return true; // STRH Rd, [Rb, #imm5]
+    if ((op & 0xF800u) == 0x9000u) return true; // STR Rd, [SP, #imm8]
+    return false;
+}
+
+static inline bool isNativePushPopThumb(uint16_t op) {
+    if ((op & 0xFE00u) == 0xB400u && (op & 0x01FFu) != 0u) return true; // PUSH {rlist[, lr]}
+    if ((op & 0xFF00u) == 0xBC00u && (op & 0x00FFu) != 0u) return true; // POP {rlist}
+    return false;
 }
 
 // ARM LDR/LDRB/LDRH with Rd == 15: a computed branch. Only pre-indexed forms are compiled natively;
@@ -231,8 +258,12 @@ static inline bool isPcDestLoadTerminatorArm(bool arm7, uint32_t op) {
 }
 
 
-// Small static BSS fallback pool if MEM2 allocation is unavailable
-alignas(32) static uint32_t s_bssPoolFallback[16384];
+// 4 MiB aligned executable code pool directly in fast Wii MEM1 1T-SRAM (0x80xxxxxx):
+// 1. Real Wii hardware: 4x lower I-cache refill latency than DDR2 MEM2 (0x90xxxxxx).
+// 2. Dolphin JIT64/JITArm64: FastBlockMap ONLY covers MEM1 (0x80000000..0x81FFFFFF)!
+//    Putting JIT code in MEM2 forced every single `bctr` block entry to miss FastBlockMap
+//    and trap out of native x86_64/ARM64 JIT into C++ slow lookup!
+alignas(32) static uint32_t s_mem1CodePool[1048576];
 
 uint32_t *ArmPpcJit::codePool = nullptr;
 size_t ArmPpcJit::poolWordsUsed = 0;
@@ -244,6 +275,7 @@ ArmPpcJit::StubEntry ArmPpcJit::stubTable[2][ArmPpcJit::STUB_TABLE_SIZE];
 ArmPpcJit::BlockEntry ArmPpcJit::blockTable[2][ArmPpcJit::BLOCK_TABLE_SIZE];
 uint32_t ArmPpcJit::pageEpoch[2][ArmPpcJit::PAGE_EPOCH_SIZE];
 uint32_t ArmPpcJit::pageHasBlockBits[2][ArmPpcJit::PAGE_EPOCH_SIZE / 32];
+uint32_t ArmPpcJit::codeLineBits[ArmPpcJit::CODE_LINE_WORDS];
 ArmPpcJit::Stats ArmPpcJit::stats = {};
 
 int ArmPpcJit::fallbackArm(Interpreter *cpu, uint32_t opcode) {
@@ -425,21 +457,19 @@ void ArmPpcJit::flushCodeRange(void *start, size_t byteCount) {
 
 void ArmPpcJit::init() {
     if (!codePool) {
-        void *mem2 = Noods_MEM2_Alloc(DEFAULT_POOL_BYTES);
-        if (mem2) {
-            codePool = static_cast<uint32_t *>(mem2);
-        } else {
-            codePool = s_bssPoolFallback;
-            poolLimitWords = sizeof(s_bssPoolFallback) / sizeof(uint32_t);
-        }
+        codePool = s_mem1CodePool;
+        poolLimitWords = sizeof(s_mem1CodePool) / sizeof(uint32_t);
     }
     poolWordsUsed = 0;
-    if (poolLimitWords == 0 || poolLimitWords > DEFAULT_POOL_WORDS)
-        poolLimitWords = DEFAULT_POOL_WORDS;
+    if (poolLimitWords == 0 || poolLimitWords > (sizeof(s_mem1CodePool) / sizeof(uint32_t)))
+        poolLimitWords = sizeof(s_mem1CodePool) / sizeof(uint32_t);
     currentEpoch = 1;
     std::memset(stubTable, 0, sizeof(stubTable));
     std::memset(blockTable, 0, sizeof(blockTable));
+    std::memset(s_candPc, 0, sizeof(s_candPc));
+    std::memset(s_candHits, 0, sizeof(s_candHits));
     std::memset(pageHasBlockBits, 0, sizeof(pageHasBlockBits));
+    std::memset(codeLineBits, 0, sizeof(codeLineBits));
     for (int c = 0; c < 2; c++) {
         for (size_t i = 0; i < PAGE_EPOCH_SIZE; i++)
             pageEpoch[c][i] = 1;
@@ -483,6 +513,7 @@ void ArmPpcJit::wrapPool() {
         std::memset(blockTable, 0, sizeof(blockTable));
     }
     std::memset(pageHasBlockBits, 0, sizeof(pageHasBlockBits));
+    std::memset(codeLineBits, 0, sizeof(codeLineBits));
     JIT_STAT(stats.poolWraps++);
     JIT_STAT(stats.poolWordsUsed = 0);
 }
@@ -575,7 +606,15 @@ void ArmPpcJit::emitUpdateSubNZCV(uint32_t *&p) {
 }
 
 bool ArmPpcJit::emitNativeThumb(uint32_t *&p, Interpreter *cpu, uint16_t opcode, int &outCycles, bool emitFlags) {
-    (void)cpu;
+    if (isNativeLoadThumb(opcode)) return emitNativeLoadThumb(p, cpu, opcode, outCycles);
+    if (isNativeStoreThumb(opcode)) return emitNativeStoreThumb(p, cpu, opcode, outCycles);
+    if (isNativePushPopThumb(opcode)) {
+        if ((opcode & 0xFE00u) == 0xB400u) {
+            uint16_t mask = (uint16_t)((opcode & 0xFFu) | ((opcode & 0x100u) ? (1u << 14) : 0u));
+            return emitNativePushPop(p, cpu, mask, false, opcode, true, outCycles);
+        }
+        return emitNativePushPop(p, cpu, (uint16_t)(opcode & 0xFFu), true, opcode, true, outCycles);
+    }
     const int16_t offCpsr = (int16_t)offsetof(Interpreter, cpsr);
     uint8_t top3 = (uint8_t)(opcode >> 13);
 
@@ -898,21 +937,96 @@ bool ArmPpcJit::emitNativeThumb(uint32_t *&p, Interpreter *cpu, uint16_t opcode,
 // Helper slow paths read R15 (open bus / BIOS reads depend on it). Blocks only sync R15 lazily, so set the
 // exact value of the current instruction around the helper call. Save: R28 = synced R15 (restored after).
 void ArmPpcJit::emitHelperR15Sync(uint32_t *&p, bool enter) {
-    const int16_t offR15 = (int16_t)(offsetof(Interpreter, registersUsr) + 15 * 4);
+    const int16_t offR15   = (int16_t)(offsetof(Interpreter, registersUsr) + 15 * 4);
+    const int16_t offPcDat = (int16_t)offsetof(Interpreter, pcData);
     if (enter) {
-        *p++ = JitPpc::lwz(JitPpc::R28, JitPpc::R31, offR15);
+        *p++ = JitPpc::li(JitPpc::R30, 1); // Slow-path MMIO/SMC exit: finish this iteration, then return to scheduler
+        *p++ = JitPpc::lwz(JitPpc::R0, JitPpc::R31, offR15);
+        *p++ = JitPpc::stw(JitPpc::R0, JitPpc::R1, 8);
+        *p++ = JitPpc::lwz(JitPpc::R0, JitPpc::R31, offPcDat);
+        *p++ = JitPpc::stw(JitPpc::R0, JitPpc::R1, 12);
         emitLoadImm32(p, JitPpc::R0, s_emitInstrR15);
         *p++ = JitPpc::stw(JitPpc::R0, JitPpc::R31, offR15);
     } else {
-        *p++ = JitPpc::stw(JitPpc::R28, JitPpc::R31, offR15);
+        *p++ = JitPpc::lwz(JitPpc::R0, JitPpc::R1, 8);
+        *p++ = JitPpc::stw(JitPpc::R0, JitPpc::R31, offR15);
+        *p++ = JitPpc::lwz(JitPpc::R0, JitPpc::R1, 12);
+        *p++ = JitPpc::stw(JitPpc::R0, JitPpc::R31, offPcDat);
     }
 }
 
-// Inline exit for an ARM B/BL whose target stays on the block's 4 KB page. Mirrors the same-page path of
-// execBranchArm: R15 = newR15, pcData/pipeline re-derived from block-entry pcData, BL writes LR, and the
-// block returns the same cycle count (taken: +3, not taken: +1). Returns false if not applicable.
+// Inline guarded fast-reads for hot read-only / poll MMIO halfword registers (DISPSTAT, VCOUNT, KEYINPUT, IPCSYNC)
+// used by BOTH ARM and Thumb native halfword loads with zero C++ helper overhead!
+void ArmPpcJit::emitGuardedPollHalfLoad(uint32_t *&p, Interpreter *cpu, uint8_t rd,
+                                        void (*storeFn)(uint32_t *&, uint8_t, uint8_t),
+                                        uint32_t **outJumpSlots, int &jumpCount) {
+    // 1. Combined (addr & ~3) == 0x04000004 covers BOTH REG_DISPSTAT (0x04000004) and REG_VCOUNT (0x04000006)!
+    *p++ = JitPpc::rlwinm(JitPpc::R4, JitPpc::R3, 0, 0, 29);
+    emitLoadImm32(p, JitPpc::R5, 0x04000004u);
+    *p++ = JitPpc::cmplw(0, JitPpc::R4, JitPpc::R5);
+    uint32_t *bNotGpu = p++;
+    *p++ = JitPpc::lwz(JitPpc::R4, JitPpc::R31, (int16_t)offsetof(Interpreter, core));
+    *p++ = JitPpc::andi_rc(JitPpc::R0, JitPpc::R3, 2u);
+    uint32_t *bIsDisp = p++;
+    const uint32_t offVcount = (uint32_t)(offsetof(Core, gpu) + offsetof(Gpu, vCount));
+    emitLoadImm32(p, JitPpc::R5, offVcount);
+    uint32_t *bGpuLoad = p++;
+    *bIsDisp = JitPpc::beq((int16_t)((p - bIsDisp) * 4));
+    const uint32_t offDispstat = (uint32_t)(offsetof(Core, gpu) + offsetof(Gpu, dispStat) + (cpu->arm7 ? sizeof(uint16_t) : 0u));
+    emitLoadImm32(p, JitPpc::R5, offDispstat);
+    *bGpuLoad = JitPpc::b((int32_t)((p - bGpuLoad) * 4));
+    *p++ = JitPpc::add(JitPpc::R4, JitPpc::R4, JitPpc::R5);
+    *p++ = JitPpc::lhz(JitPpc::R8, JitPpc::R4, 0);
+    if (cpu->arm7) {
+        *p++ = JitPpc::rlwinm(JitPpc::R9, JitPpc::R3, 3, 28, 28);
+        *p++ = JitPpc::subfic(JitPpc::R9, JitPpc::R9, 32);
+        *p++ = JitPpc::rlwnm(JitPpc::R8, JitPpc::R8, JitPpc::R9, 0, 31);
+    }
+    storeFn(p, JitPpc::R8, rd);
+    outJumpSlots[jumpCount++] = p++;
+    *bNotGpu = JitPpc::bne((int16_t)((p - bNotGpu) * 4));
+
+    // 2. REG_IPCSYNC (0x04000180) on BOTH ARM9 and ARM7
+    *p++ = JitPpc::rlwinm(JitPpc::R4, JitPpc::R3, 0, 0, 30);
+    emitLoadImm32(p, JitPpc::R5, 0x04000180u);
+    *p++ = JitPpc::cmplw(0, JitPpc::R4, JitPpc::R5);
+    uint32_t *bNotIpc = p++;
+    *p++ = JitPpc::lwz(JitPpc::R4, JitPpc::R31, (int16_t)offsetof(Interpreter, core));
+    const uint32_t offIpcSync = (uint32_t)(offsetof(Core, ipc) + offsetof(Ipc, ipcSync) + (cpu->arm7 ? sizeof(uint16_t) : 0u));
+    emitLoadImm32(p, JitPpc::R5, offIpcSync);
+    *p++ = JitPpc::add(JitPpc::R4, JitPpc::R4, JitPpc::R5);
+    *p++ = JitPpc::lhz(JitPpc::R8, JitPpc::R4, 0);
+    if (cpu->arm7) {
+        *p++ = JitPpc::rlwinm(JitPpc::R9, JitPpc::R3, 3, 28, 28);
+        *p++ = JitPpc::subfic(JitPpc::R9, JitPpc::R9, 32);
+        *p++ = JitPpc::rlwnm(JitPpc::R8, JitPpc::R8, JitPpc::R9, 0, 31);
+    }
+    storeFn(p, JitPpc::R8, rd);
+    outJumpSlots[jumpCount++] = p++;
+    *bNotIpc = JitPpc::bne((int16_t)((p - bNotIpc) * 4));
+
+    // 3. REG_KEYINPUT (0x04000130)
+    *p++ = JitPpc::rlwinm(JitPpc::R4, JitPpc::R3, 0, 0, 30);
+    emitLoadImm32(p, JitPpc::R5, 0x04000130u);
+    *p++ = JitPpc::cmplw(0, JitPpc::R4, JitPpc::R5);
+    uint32_t *bNotKey = p++;
+    *p++ = JitPpc::lwz(JitPpc::R4, JitPpc::R31, (int16_t)offsetof(Interpreter, core));
+    const uint32_t offKeyinput = (uint32_t)(offsetof(Core, input) + offsetof(Input, keyInput));
+    emitLoadImm32(p, JitPpc::R5, offKeyinput);
+    *p++ = JitPpc::add(JitPpc::R4, JitPpc::R4, JitPpc::R5);
+    *p++ = JitPpc::lhz(JitPpc::R8, JitPpc::R4, 0);
+    if (cpu->arm7) {
+        *p++ = JitPpc::rlwinm(JitPpc::R9, JitPpc::R3, 3, 28, 28);
+        *p++ = JitPpc::subfic(JitPpc::R9, JitPpc::R9, 32);
+        *p++ = JitPpc::rlwnm(JitPpc::R8, JitPpc::R8, JitPpc::R9, 0, 31);
+    }
+    storeFn(p, JitPpc::R8, rd);
+    outJumpSlots[jumpCount++] = p++;
+    *bNotKey = JitPpc::bne((int16_t)((p - bNotKey) * 4));
+}
+
 bool ArmPpcJit::emitInlineBranchArm(uint32_t *&p, Interpreter *cpu, uint32_t opcode, uint32_t instrPC,
-                                    int32_t totalDelta, int32_t prefixCycles, bool helperInBlock) {
+                                    int32_t totalDelta, int32_t prefixCycles, bool helperInBlock, uint32_t *loopTop) {
     (void)cpu;
     const uint8_t cond = (uint8_t)(opcode >> 28);
     if (cond == 0xFu) return false;
@@ -924,7 +1038,7 @@ bool ArmPpcJit::emitInlineBranchArm(uint32_t *&p, Interpreter *cpu, uint32_t opc
     const uint32_t newR15 = target + 4u;
     if ((((target ^ instrPC) | (newR15 ^ instrPC)) >> 12) != 0) return false;
     const bool link = (opcode & (1u << 24)) != 0;
-    const int32_t takenDelta = (int32_t)newR15 - (int32_t)(instrPC + 8u);   // relative to block-entry pcData
+    const int32_t takenDelta = (int32_t)newR15 - (int32_t)(instrPC + 8u);
     if (takenDelta > 0x7FF || takenDelta < -0x800) return false;
 
     const int16_t offR15   = (int16_t)(offsetof(Interpreter, registersUsr) + 15 * 4);
@@ -933,20 +1047,25 @@ bool ArmPpcJit::emitInlineBranchArm(uint32_t *&p, Interpreter *cpu, uint32_t opc
     const int16_t offPipe0 = (int16_t)offsetof(Interpreter, pipeline);
     const int16_t offPipe1 = (int16_t)(offsetof(Interpreter, pipeline) + 4);
     const int16_t offCpsr  = (int16_t)offsetof(Interpreter, cpsr);
+    const int16_t loopStep = (int16_t)(prefixCycles + 3);
 
-    // Writes pcData / pipeline for pd = pcData_entry + delta, then the epilogue.
-    auto emitExit = [&](int32_t delta, uint32_t r15Abs, int32_t cycles) {
+    auto emitExit = [&](int32_t delta, uint32_t r15Abs, int32_t baseCycles, bool addLoopCount) {
         emitLoadImm32(p, JitPpc::R5, r15Abs);
         *p++ = JitPpc::stw(JitPpc::R5, JitPpc::R31, offR15);
         *p++ = JitPpc::lwz(JitPpc::R4, JitPpc::R31, offPcDat);
-        *p++ = JitPpc::addi(JitPpc::R4, JitPpc::R4, (int16_t)delta);
+        if (delta != 0) *p++ = JitPpc::addi(JitPpc::R4, JitPpc::R4, (int16_t)delta);
         *p++ = JitPpc::stw(JitPpc::R4, JitPpc::R31, offPcDat);
         *p++ = JitPpc::addi(JitPpc::R5, JitPpc::R4, -4);
         *p++ = JitPpc::lwbrx(JitPpc::R6, 0, JitPpc::R5);
         *p++ = JitPpc::lwbrx(JitPpc::R7, 0, JitPpc::R4);
         *p++ = JitPpc::stw(JitPpc::R6, JitPpc::R31, offPipe0);
         *p++ = JitPpc::stw(JitPpc::R7, JitPpc::R31, offPipe1);
-        *p++ = JitPpc::li(JitPpc::R3, (int16_t)cycles);
+        if (addLoopCount) {
+            *p++ = JitPpc::mulli(JitPpc::R3, JitPpc::R29, loopStep);
+            if (baseCycles != 0) *p++ = JitPpc::addi(JitPpc::R3, JitPpc::R3, (int16_t)baseCycles);
+        } else {
+            *p++ = JitPpc::li(JitPpc::R3, (int16_t)baseCycles);
+        }
         if (helperInBlock) {
             *p++ = JitPpc::lwz(JitPpc::R0, JitPpc::R1, 36);
             *p++ = JitPpc::mtlr(JitPpc::R0);
@@ -957,37 +1076,400 @@ bool ArmPpcJit::emitInlineBranchArm(uint32_t *&p, Interpreter *cpu, uint32_t opc
     };
 
     if (cond == 0xEu) {
-        // Unconditional: always taken
         if (link) {
             *p++ = JitPpc::lwz(JitPpc::R4, JitPpc::R31, offRegs);
             emitLoadImm32(p, JitPpc::R5, brAddr + 4u);
             *p++ = JitPpc::stw(JitPpc::R5, JitPpc::R4, 0);
         }
-        emitExit(takenDelta, newR15, prefixCycles + 3);
+        if (loopTop) {
+            *p++ = JitPpc::addi(JitPpc::R29, JitPpc::R29, 1);
+            *p++ = JitPpc::addic_rc(JitPpc::R30, JitPpc::R30, -1);
+            int32_t backBytes = (int32_t)(loopTop - p) * 4;
+            assert(backBytes >= -32768 && backBytes <= 32764);
+            *p++ = JitPpc::bne((int16_t)backBytes);
+            emitExit(takenDelta, newR15, 0, true);
+            return true;
+        }
+        emitExit(takenDelta, newR15, prefixCycles + 3, false);
         return true;
     }
 
-    // Conditional: evaluate Interpreter::condition[(cond << 4) | (cpsr >> 28)]
     *p++ = JitPpc::lwz(JitPpc::R6, JitPpc::R31, offCpsr);
-    *p++ = JitPpc::rlwinm(JitPpc::R6, JitPpc::R6, 4, 28, 31);          // cpsr >> 28
+    *p++ = JitPpc::rlwinm(JitPpc::R6, JitPpc::R6, 4, 28, 31);
     *p++ = JitPpc::addi(JitPpc::R6, JitPpc::R6, (int16_t)(cond << 4));
     emitLoadImm32(p, JitPpc::R7, (uint32_t)(uintptr_t)Interpreter::condition);
     *p++ = JitPpc::add(JitPpc::R7, JitPpc::R7, JitPpc::R6);
     *p++ = JitPpc::lbz(JitPpc::R6, JitPpc::R7, 0);
     *p++ = JitPpc::cmpwi(0, JitPpc::R6, 0);
-    uint32_t *bFalse = p++;                                              // beq not-taken (patched)
+    uint32_t *bFalse = p++;
 
-    // Taken
     if (link) {
         *p++ = JitPpc::lwz(JitPpc::R4, JitPpc::R31, offRegs);
         emitLoadImm32(p, JitPpc::R5, brAddr + 4u);
         *p++ = JitPpc::stw(JitPpc::R5, JitPpc::R4, 0);
     }
-    emitExit(takenDelta, newR15, prefixCycles + 3);
+    if (loopTop) {
+        *p++ = JitPpc::addi(JitPpc::R29, JitPpc::R29, 1);
+        *p++ = JitPpc::addic_rc(JitPpc::R30, JitPpc::R30, -1);
+        int32_t backBytes = (int32_t)(loopTop - p) * 4;
+        assert(backBytes >= -32768 && backBytes <= 32764);
+        *p++ = JitPpc::bne((int16_t)backBytes);
+        emitExit(takenDelta, newR15, 0, true);
+        *bFalse = JitPpc::beq((int16_t)((p - bFalse) * 4));
+        emitExit((int32_t)totalDelta, brAddr + 8u, prefixCycles + 1, true);
+        return true;
+    }
 
-    // Not taken
+    emitExit(takenDelta, newR15, prefixCycles + 3, false);
     *bFalse = JitPpc::beq((int16_t)((p - bFalse) * 4));
-    emitExit((int32_t)totalDelta, brAddr + 8u, prefixCycles + 1);
+    emitExit((int32_t)totalDelta, brAddr + 8u, prefixCycles + 1, false);
+    return true;
+}
+
+bool ArmPpcJit::emitInlineBranchThumb(uint32_t *&p, Interpreter *cpu, uint16_t opcode, uint32_t instrPC,
+                                      int32_t totalDelta, int32_t prefixCycles, bool helperInBlock, uint32_t *loopTop) {
+    (void)cpu;
+    bool isCond = ((opcode & 0xF000u) == 0xD000u && (opcode & 0x0F00u) < 0x0E00u);
+    bool isUncond = ((opcode & 0xF800u) == 0xE000u);
+    if (!isCond && !isUncond) return false;
+
+    const uint32_t brAddr = instrPC + (uint32_t)totalDelta;
+    const uint32_t r15 = brAddr + 4u;
+    const int32_t offset = isCond ? ((int32_t)(int8_t)(opcode & 0xFFu) << 1)
+                                  : (((int32_t)(int16_t)(opcode << 5)) >> 4);
+    const uint32_t target = (r15 + (uint32_t)offset) & ~1u;
+    const uint32_t newR15 = target + 2u;
+    if ((((target ^ instrPC) | (newR15 ^ instrPC)) >> 12) != 0) return false;
+    const int32_t takenDelta = (int32_t)newR15 - (int32_t)(instrPC + 4u);
+    if (takenDelta > 0x7FF || takenDelta < -0x800) return false;
+
+    const int16_t offR15   = (int16_t)(offsetof(Interpreter, registersUsr) + 15 * 4);
+    const int16_t offPcDat = (int16_t)offsetof(Interpreter, pcData);
+    const int16_t offPipe0 = (int16_t)offsetof(Interpreter, pipeline);
+    const int16_t offPipe1 = (int16_t)(offsetof(Interpreter, pipeline) + 4);
+    const int16_t offCpsr  = (int16_t)offsetof(Interpreter, cpsr);
+    const int16_t loopStep = (int16_t)(prefixCycles + 3);
+
+    auto emitExit = [&](int32_t delta, uint32_t r15Abs, int32_t baseCycles, bool addLoopCount) {
+        emitLoadImm32(p, JitPpc::R5, r15Abs);
+        *p++ = JitPpc::stw(JitPpc::R5, JitPpc::R31, offR15);
+        *p++ = JitPpc::lwz(JitPpc::R4, JitPpc::R31, offPcDat);
+        if (delta != 0) *p++ = JitPpc::addi(JitPpc::R4, JitPpc::R4, (int16_t)delta);
+        *p++ = JitPpc::stw(JitPpc::R4, JitPpc::R31, offPcDat);
+        *p++ = JitPpc::addi(JitPpc::R5, JitPpc::R4, -2);
+        *p++ = JitPpc::lhbrx(JitPpc::R6, 0, JitPpc::R5);
+        *p++ = JitPpc::lhbrx(JitPpc::R7, 0, JitPpc::R4);
+        *p++ = JitPpc::stw(JitPpc::R6, JitPpc::R31, offPipe0);
+        *p++ = JitPpc::stw(JitPpc::R7, JitPpc::R31, offPipe1);
+        if (addLoopCount) {
+            *p++ = JitPpc::mulli(JitPpc::R3, JitPpc::R29, loopStep);
+            if (baseCycles != 0) *p++ = JitPpc::addi(JitPpc::R3, JitPpc::R3, (int16_t)baseCycles);
+        } else {
+            *p++ = JitPpc::li(JitPpc::R3, (int16_t)baseCycles);
+        }
+        if (helperInBlock) {
+            *p++ = JitPpc::lwz(JitPpc::R0, JitPpc::R1, 36);
+            *p++ = JitPpc::mtlr(JitPpc::R0);
+        }
+        *p++ = JitPpc::lmw(JitPpc::R28, JitPpc::R1, 16);
+        *p++ = JitPpc::addi(JitPpc::R1, JitPpc::R1, 32);
+        *p++ = JitPpc::blr();
+    };
+
+    if (isUncond) {
+        if (loopTop) {
+            *p++ = JitPpc::addi(JitPpc::R29, JitPpc::R29, 1);
+            *p++ = JitPpc::addic_rc(JitPpc::R30, JitPpc::R30, -1);
+            int32_t backBytes = (int32_t)(loopTop - p) * 4;
+            assert(backBytes >= -32768 && backBytes <= 32764);
+            *p++ = JitPpc::bne((int16_t)backBytes);
+            emitExit(takenDelta, newR15, 0, true);
+            return true;
+        }
+        emitExit(takenDelta, newR15, prefixCycles + 3, false);
+        return true;
+    }
+
+    uint8_t cond = (uint8_t)((opcode >> 8) & 0xF);
+    *p++ = JitPpc::lwz(JitPpc::R6, JitPpc::R31, offCpsr);
+    *p++ = JitPpc::rlwinm(JitPpc::R6, JitPpc::R6, 4, 28, 31);
+    *p++ = JitPpc::addi(JitPpc::R6, JitPpc::R6, (int16_t)(cond << 4));
+    emitLoadImm32(p, JitPpc::R7, (uint32_t)(uintptr_t)Interpreter::condition);
+    *p++ = JitPpc::add(JitPpc::R7, JitPpc::R7, JitPpc::R6);
+    *p++ = JitPpc::lbz(JitPpc::R6, JitPpc::R7, 0);
+    *p++ = JitPpc::cmpwi(0, JitPpc::R6, 0);
+    uint32_t *bFalse = p++;
+
+    if (loopTop) {
+        *p++ = JitPpc::addi(JitPpc::R29, JitPpc::R29, 1);
+        *p++ = JitPpc::addic_rc(JitPpc::R30, JitPpc::R30, -1);
+        int32_t backBytes = (int32_t)(loopTop - p) * 4;
+        assert(backBytes >= -32768 && backBytes <= 32764);
+        *p++ = JitPpc::bne((int16_t)backBytes);
+        emitExit(takenDelta, newR15, 0, true);
+        *bFalse = JitPpc::beq((int16_t)((p - bFalse) * 4));
+        emitExit((int32_t)totalDelta, brAddr + 4u, prefixCycles + 1, true);
+        return true;
+    }
+
+    emitExit(takenDelta, newR15, prefixCycles + 3, false);
+    *bFalse = JitPpc::beq((int16_t)((p - bFalse) * 4));
+    emitExit((int32_t)totalDelta, brAddr + 4u, prefixCycles + 1, false);
+    return true;
+}
+
+bool ArmPpcJit::emitInlineBxArm(uint32_t *&p, Interpreter *cpu, uint32_t opcode, uint32_t instrPC,
+                                int32_t totalDelta, int32_t prefixCycles, bool helperInBlock) {
+    const uint8_t cond = (uint8_t)(opcode >> 28);
+    if (cond == 0xFu) return false;
+    bool isBx = (opcode & 0x0FFFFFF0u) == 0x012FFF10u;
+    bool isBlx = !cpu->arm7 && (opcode & 0x0FFFFFF0u) == 0x012FFF30u;
+    if (!isBx && !isBlx) return false;
+
+    const uint8_t rm = (uint8_t)(opcode & 0xFu);
+    const uint32_t brAddr = instrPC + (uint32_t)totalDelta;
+    const int16_t offR15   = (int16_t)(offsetof(Interpreter, registersUsr) + 15 * 4);
+    const int16_t offPcDat = (int16_t)offsetof(Interpreter, pcData);
+    const int16_t offPipe0 = (int16_t)offsetof(Interpreter, pipeline);
+    const int16_t offPipe1 = (int16_t)(offsetof(Interpreter, pipeline) + 4);
+    const int16_t offCpsr  = (int16_t)offsetof(Interpreter, cpsr);
+    const int16_t offCore  = (int16_t)offsetof(Interpreter, core);
+    const uint32_t offReadMap = (uint32_t)(offsetof(Core, memory) + (cpu->arm7 ? offsetof(Memory, readMap7) : offsetof(Memory, readMap9A)));
+
+    auto emitRet = [&](int cycles) {
+        *p++ = JitPpc::li(JitPpc::R3, (int16_t)cycles);
+        if (helperInBlock) {
+            *p++ = JitPpc::lwz(JitPpc::R0, JitPpc::R1, 36);
+            *p++ = JitPpc::mtlr(JitPpc::R0);
+        }
+        *p++ = JitPpc::lmw(JitPpc::R28, JitPpc::R1, 16);
+        *p++ = JitPpc::addi(JitPpc::R1, JitPpc::R1, 32);
+        *p++ = JitPpc::blr();
+    };
+
+    uint32_t *bNotTaken = nullptr;
+    if (cond != 0xEu) {
+        *p++ = JitPpc::lwz(JitPpc::R6, JitPpc::R31, offCpsr);
+        *p++ = JitPpc::rlwinm(JitPpc::R6, JitPpc::R6, 4, 28, 31);
+        *p++ = JitPpc::addi(JitPpc::R6, JitPpc::R6, (int16_t)(cond << 4));
+        emitLoadImm32(p, JitPpc::R7, (uint32_t)(uintptr_t)Interpreter::condition);
+        *p++ = JitPpc::add(JitPpc::R7, JitPpc::R7, JitPpc::R6);
+        *p++ = JitPpc::lbz(JitPpc::R6, JitPpc::R7, 0);
+        *p++ = JitPpc::cmpwi(0, JitPpc::R6, 0);
+        bNotTaken = p++;
+    }
+
+    // Load target BEFORE writing LR (Rm may be R14!)
+    if (rm == 15) emitLoadImm32(p, JitPpc::R8, brAddr + 8u);
+    else emitLoadGuestReg(p, JitPpc::R8, rm);
+    if (isBlx) {
+        emitLoadImm32(p, JitPpc::R5, brAddr + 4u);
+        emitStoreGuestReg(p, JitPpc::R5, 14);
+    }
+
+    // Check mapped page fast refill for both ARM (bit0==0) and Thumb (bit0==1) targets!
+    uint32_t *slowFix[6];
+    uint8_t slowKind[6];
+    int slowCnt = 0;
+    auto fixSlow = [&](uint8_t k) { slowFix[slowCnt] = p++; slowKind[slowCnt] = k; slowCnt++; };
+
+    *p++ = JitPpc::rlwinm(JitPpc::R10, JitPpc::R8, 0, 20, 30); // target & 0xFFE
+    *p++ = JitPpc::cmpwi(0, JitPpc::R10, 8);
+    fixSlow(2); // blt slow
+    *p++ = JitPpc::cmplwi(0, JitPpc::R10, 0xFA0);
+    fixSlow(3); // bgt slow
+
+    *p++ = JitPpc::srwi(JitPpc::R5, JitPpc::R8, 12);
+    *p++ = JitPpc::slwi(JitPpc::R5, JitPpc::R5, 2);
+    *p++ = JitPpc::lwz(JitPpc::R4, JitPpc::R31, offCore);
+    emitLoadImm32(p, JitPpc::R7, offReadMap);
+    *p++ = JitPpc::add(JitPpc::R4, JitPpc::R4, JitPpc::R7);
+    *p++ = JitPpc::lwzx(JitPpc::R6, JitPpc::R4, JitPpc::R5);
+    *p++ = JitPpc::cmpwi(0, JitPpc::R6, 0);
+    fixSlow(0); // beq slow
+
+    // Update CPSR.T bit from bit 0 of target
+    *p++ = JitPpc::lwz(JitPpc::R9, JitPpc::R31, offCpsr);
+    emitInsertBit(p, JitPpc::R9, JitPpc::R8, 5, 0);
+    *p++ = JitPpc::stw(JitPpc::R9, JitPpc::R31, offCpsr);
+
+    *p++ = JitPpc::andi_rc(JitPpc::R0, JitPpc::R8, 1u);
+    uint32_t *bThumbTarget = p++;
+
+    // ARM return target
+    *p++ = JitPpc::rlwinm(JitPpc::R9, JitPpc::R8, 0, 0, 29);   // A = target & ~3
+    *p++ = JitPpc::rlwinm(JitPpc::R10, JitPpc::R9, 0, 20, 29); // A & 0xFFC
+    *p++ = JitPpc::add(JitPpc::R7, JitPpc::R6, JitPpc::R10);
+    *p++ = JitPpc::lwbrx(JitPpc::R11, 0, JitPpc::R7);
+    *p++ = JitPpc::addi(JitPpc::R7, JitPpc::R7, 4);
+    *p++ = JitPpc::lwbrx(JitPpc::R12, 0, JitPpc::R7);
+    *p++ = JitPpc::stw(JitPpc::R11, JitPpc::R31, offPipe0);
+    *p++ = JitPpc::stw(JitPpc::R12, JitPpc::R31, offPipe1);
+    *p++ = JitPpc::stw(JitPpc::R7, JitPpc::R31, offPcDat);
+    *p++ = JitPpc::addi(JitPpc::R9, JitPpc::R9, 4);
+    *p++ = JitPpc::stw(JitPpc::R9, JitPpc::R31, offR15);
+    emitRet(prefixCycles + 3);
+
+    // Thumb return target
+    *bThumbTarget = JitPpc::bne((int16_t)((p - bThumbTarget) * 4));
+    *p++ = JitPpc::rlwinm(JitPpc::R9, JitPpc::R8, 0, 0, 30);   // A = target & ~1
+    *p++ = JitPpc::add(JitPpc::R7, JitPpc::R6, JitPpc::R10);
+    *p++ = JitPpc::lhbrx(JitPpc::R11, 0, JitPpc::R7);
+    *p++ = JitPpc::addi(JitPpc::R7, JitPpc::R7, 2);
+    *p++ = JitPpc::lhbrx(JitPpc::R12, 0, JitPpc::R7);
+    *p++ = JitPpc::stw(JitPpc::R11, JitPpc::R31, offPipe0);
+    *p++ = JitPpc::stw(JitPpc::R12, JitPpc::R31, offPipe1);
+    *p++ = JitPpc::stw(JitPpc::R7, JitPpc::R31, offPcDat);
+    *p++ = JitPpc::addi(JitPpc::R9, JitPpc::R9, 2);
+    *p++ = JitPpc::stw(JitPpc::R9, JitPpc::R31, offR15);
+    emitRet(prefixCycles + 3);
+
+    // Slow fallback: flushPipeline via C helper (note LR already set if isBlx; write target & call flushPipeline via execBranchArm with safe non-link BX opcode!)
+    uint32_t *slow = p;
+    for (int i = 0; i < slowCnt; i++) {
+        int16_t d = (int16_t)((slow - slowFix[i]) * 4);
+        if (slowKind[i] == 0) *slowFix[i] = JitPpc::beq(d);
+        else if (slowKind[i] == 2) *slowFix[i] = JitPpc::blt(d);
+        else *slowFix[i] = JitPpc::bgt(d);
+    }
+    *p++ = JitPpc::lwz(JitPpc::R9, JitPpc::R31, offCpsr);
+    emitInsertBit(p, JitPpc::R9, JitPpc::R8, 5, 0);
+    *p++ = JitPpc::stw(JitPpc::R9, JitPpc::R31, offCpsr);
+    *p++ = JitPpc::stw(JitPpc::R8, JitPpc::R31, offR15);
+    *p++ = JitPpc::mr(JitPpc::R3, JitPpc::R31);
+    *p++ = JitPpc::li(JitPpc::R4, 0x0F); // bxReg with Rm = R15 already written to registersUsr[15]!
+    emitLoadImm32(p, JitPpc::R12, (uint32_t)resolveArmHandler(0xE12FFF1Fu));
+    *p++ = JitPpc::mtctr(JitPpc::R12);
+    *p++ = JitPpc::bctrl();
+    *p++ = JitPpc::lwz(JitPpc::R0, JitPpc::R1, 36);
+    *p++ = JitPpc::mtlr(JitPpc::R0);
+    emitRet(prefixCycles + 3);
+
+    if (bNotTaken) {
+        *bNotTaken = JitPpc::beq((int16_t)((p - bNotTaken) * 4));
+        emitLoadImm32(p, JitPpc::R5, brAddr + 8u);
+        *p++ = JitPpc::stw(JitPpc::R5, JitPpc::R31, offR15);
+        *p++ = JitPpc::lwz(JitPpc::R4, JitPpc::R31, offPcDat);
+        if (totalDelta != 0) *p++ = JitPpc::addi(JitPpc::R4, JitPpc::R4, (int16_t)totalDelta);
+        *p++ = JitPpc::stw(JitPpc::R4, JitPpc::R31, offPcDat);
+        *p++ = JitPpc::addi(JitPpc::R5, JitPpc::R4, -4);
+        *p++ = JitPpc::lwbrx(JitPpc::R6, 0, JitPpc::R5);
+        *p++ = JitPpc::lwbrx(JitPpc::R7, 0, JitPpc::R4);
+        *p++ = JitPpc::stw(JitPpc::R6, JitPpc::R31, offPipe0);
+        *p++ = JitPpc::stw(JitPpc::R7, JitPpc::R31, offPipe1);
+        emitRet(prefixCycles + 1);
+    }
+    return true;
+}
+
+bool ArmPpcJit::emitInlineBxThumb(uint32_t *&p, Interpreter *cpu, uint16_t opcode, uint32_t instrPC,
+                                  int32_t totalDelta, int32_t prefixCycles, bool helperInBlock) {
+    if ((opcode & 0xFF00u) != 0x4700u) return false;
+    bool isBlx = (opcode & 0x0080u) != 0u;
+    if (isBlx && cpu->arm7) return false;
+
+    const uint8_t rs = (uint8_t)((opcode >> 3) & 0xFu);
+    const uint32_t brAddr = instrPC + (uint32_t)totalDelta;
+    const int16_t offR15   = (int16_t)(offsetof(Interpreter, registersUsr) + 15 * 4);
+    const int16_t offPcDat = (int16_t)offsetof(Interpreter, pcData);
+    const int16_t offPipe0 = (int16_t)offsetof(Interpreter, pipeline);
+    const int16_t offPipe1 = (int16_t)(offsetof(Interpreter, pipeline) + 4);
+    const int16_t offCpsr  = (int16_t)offsetof(Interpreter, cpsr);
+    const int16_t offCore  = (int16_t)offsetof(Interpreter, core);
+    const uint32_t offReadMap = (uint32_t)(offsetof(Core, memory) + (cpu->arm7 ? offsetof(Memory, readMap7) : offsetof(Memory, readMap9A)));
+
+    auto emitRet = [&](int cycles) {
+        *p++ = JitPpc::li(JitPpc::R3, (int16_t)cycles);
+        if (helperInBlock) {
+            *p++ = JitPpc::lwz(JitPpc::R0, JitPpc::R1, 36);
+            *p++ = JitPpc::mtlr(JitPpc::R0);
+        }
+        *p++ = JitPpc::lmw(JitPpc::R28, JitPpc::R1, 16);
+        *p++ = JitPpc::addi(JitPpc::R1, JitPpc::R1, 32);
+        *p++ = JitPpc::blr();
+    };
+
+    if (rs == 15) emitLoadImm32(p, JitPpc::R8, (brAddr + 4u) & ~3u); // Thumb BX PC reads aligned PC!
+    else emitLoadGuestReg(p, JitPpc::R8, rs);
+    if (isBlx) {
+        emitLoadImm32(p, JitPpc::R5, (brAddr + 2u) | 1u);
+        emitStoreGuestReg(p, JitPpc::R5, 14);
+    }
+
+    uint32_t *slowFix[6];
+    uint8_t slowKind[6];
+    int slowCnt = 0;
+    auto fixSlow = [&](uint8_t k) { slowFix[slowCnt] = p++; slowKind[slowCnt] = k; slowCnt++; };
+
+    *p++ = JitPpc::rlwinm(JitPpc::R10, JitPpc::R8, 0, 20, 30);
+    *p++ = JitPpc::cmpwi(0, JitPpc::R10, 8);
+    fixSlow(2);
+    *p++ = JitPpc::cmplwi(0, JitPpc::R10, 0xFA0);
+    fixSlow(3);
+
+    *p++ = JitPpc::srwi(JitPpc::R5, JitPpc::R8, 12);
+    *p++ = JitPpc::slwi(JitPpc::R5, JitPpc::R5, 2);
+    *p++ = JitPpc::lwz(JitPpc::R4, JitPpc::R31, offCore);
+    emitLoadImm32(p, JitPpc::R7, offReadMap);
+    *p++ = JitPpc::add(JitPpc::R4, JitPpc::R4, JitPpc::R7);
+    *p++ = JitPpc::lwzx(JitPpc::R6, JitPpc::R4, JitPpc::R5);
+    *p++ = JitPpc::cmpwi(0, JitPpc::R6, 0);
+    fixSlow(0);
+
+    *p++ = JitPpc::lwz(JitPpc::R9, JitPpc::R31, offCpsr);
+    emitInsertBit(p, JitPpc::R9, JitPpc::R8, 5, 0);
+    *p++ = JitPpc::stw(JitPpc::R9, JitPpc::R31, offCpsr);
+
+    *p++ = JitPpc::andi_rc(JitPpc::R0, JitPpc::R8, 1u);
+    uint32_t *bArmTarget = p++;
+
+    // Thumb return target (most common case in Thumb!)
+    *p++ = JitPpc::rlwinm(JitPpc::R9, JitPpc::R8, 0, 0, 30);
+    *p++ = JitPpc::add(JitPpc::R7, JitPpc::R6, JitPpc::R10);
+    *p++ = JitPpc::lhbrx(JitPpc::R11, 0, JitPpc::R7);
+    *p++ = JitPpc::addi(JitPpc::R7, JitPpc::R7, 2);
+    *p++ = JitPpc::lhbrx(JitPpc::R12, 0, JitPpc::R7);
+    *p++ = JitPpc::stw(JitPpc::R11, JitPpc::R31, offPipe0);
+    *p++ = JitPpc::stw(JitPpc::R12, JitPpc::R31, offPipe1);
+    *p++ = JitPpc::stw(JitPpc::R7, JitPpc::R31, offPcDat);
+    *p++ = JitPpc::addi(JitPpc::R9, JitPpc::R9, 2);
+    *p++ = JitPpc::stw(JitPpc::R9, JitPpc::R31, offR15);
+    emitRet(prefixCycles + 3);
+
+    // ARM return target
+    *bArmTarget = JitPpc::beq((int16_t)((p - bArmTarget) * 4));
+    *p++ = JitPpc::rlwinm(JitPpc::R9, JitPpc::R8, 0, 0, 29);
+    *p++ = JitPpc::rlwinm(JitPpc::R10, JitPpc::R9, 0, 20, 29);
+    *p++ = JitPpc::add(JitPpc::R7, JitPpc::R6, JitPpc::R10);
+    *p++ = JitPpc::lwbrx(JitPpc::R11, 0, JitPpc::R7);
+    *p++ = JitPpc::addi(JitPpc::R7, JitPpc::R7, 4);
+    *p++ = JitPpc::lwbrx(JitPpc::R12, 0, JitPpc::R7);
+    *p++ = JitPpc::stw(JitPpc::R11, JitPpc::R31, offPipe0);
+    *p++ = JitPpc::stw(JitPpc::R12, JitPpc::R31, offPipe1);
+    *p++ = JitPpc::stw(JitPpc::R7, JitPpc::R31, offPcDat);
+    *p++ = JitPpc::addi(JitPpc::R9, JitPpc::R9, 4);
+    *p++ = JitPpc::stw(JitPpc::R9, JitPpc::R31, offR15);
+    emitRet(prefixCycles + 3);
+
+    uint32_t *slow = p;
+    for (int i = 0; i < slowCnt; i++) {
+        int16_t d = (int16_t)((slow - slowFix[i]) * 4);
+        if (slowKind[i] == 0) *slowFix[i] = JitPpc::beq(d);
+        else if (slowKind[i] == 2) *slowFix[i] = JitPpc::blt(d);
+        else *slowFix[i] = JitPpc::bgt(d);
+    }
+    *p++ = JitPpc::lwz(JitPpc::R9, JitPpc::R31, offCpsr);
+    emitInsertBit(p, JitPpc::R9, JitPpc::R8, 5, 0);
+    *p++ = JitPpc::stw(JitPpc::R9, JitPpc::R31, offCpsr);
+    *p++ = JitPpc::stw(JitPpc::R8, JitPpc::R31, offR15);
+    *p++ = JitPpc::mr(JitPpc::R3, JitPpc::R31);
+    *p++ = JitPpc::li(JitPpc::R4, 0x0F); // bxReg with Rm = R15 already written to registersUsr[15]!
+    emitLoadImm32(p, JitPpc::R12, (uint32_t)resolveArmHandler(0xE12FFF1Fu));
+    *p++ = JitPpc::mtctr(JitPpc::R12);
+    *p++ = JitPpc::bctrl();
+    *p++ = JitPpc::lwz(JitPpc::R0, JitPpc::R1, 36);
+    *p++ = JitPpc::mtlr(JitPpc::R0);
+    emitRet(prefixCycles + 3);
     return true;
 }
 
@@ -1173,96 +1655,48 @@ bool ArmPpcJit::emitPcDestLoadTerminatorArm(uint32_t *&p, Interpreter *cpu, uint
     return true;
 }
 
-bool ArmPpcJit::emitNativeLoadArm(uint32_t *&p, Interpreter *cpu, uint32_t opcode, int &outCycles) {
-    const bool single = (opcode & 0x0C000000u) == 0x04000000u;
-    const bool isByte = single && (opcode & (1u << 22)) != 0;
-    const bool isHalf = !single;
-    const bool up     = (opcode & (1u << 23)) != 0;
-    const uint8_t rn = (uint8_t)((opcode >> 16) & 0xF);
-    const uint8_t rd = (uint8_t)((opcode >> 12) & 0xF);
-    const bool immOff = single ? ((opcode & (1u << 25)) == 0) : ((opcode & (1u << 22)) != 0);
+bool ArmPpcJit::emitNativeLoadThumb(uint32_t *&p, Interpreter *cpu, uint16_t opcode, int &outCycles) {
+    bool isByte = false, isHalf = false, isSigned = false;
+    uint8_t rd = 0;
 
-    // R3 = guest address (Rn +/- offset)
-    emitLoadGuestReg(p, JitPpc::R3, rn);
-    if (immOff) {
-        uint32_t off = single ? (opcode & 0xFFFu) : (((opcode >> 4) & 0xF0u) | (opcode & 0xFu));
-        if (off != 0) {
-            *p++ = JitPpc::addi(JitPpc::R3, JitPpc::R3, (int16_t)(up ? (int32_t)off : -(int32_t)off));
-        }
+    if ((opcode & 0xF800u) == 0x4800u) { // LDR Rd, [PC, #imm8<<2]
+        rd = (uint8_t)((opcode >> 8) & 7u);
+        uint32_t addr = (s_emitInstrR15 & ~3u) + ((opcode & 0xFFu) << 2);
+        emitLoadImm32(p, JitPpc::R3, addr);
+    } else if ((opcode & 0xF800u) == 0x9800u) { // LDR Rd, [SP, #imm8<<2]
+        rd = (uint8_t)((opcode >> 8) & 7u);
+        uint32_t off = (opcode & 0xFFu) << 2;
+        emitLoadGuestReg(p, JitPpc::R3, 13);
+        if (off) *p++ = JitPpc::addi(JitPpc::R3, JitPpc::R3, (int16_t)off);
+    } else if ((opcode & 0xF000u) == 0x5000u) { // Reg offset
+        rd = (uint8_t)(opcode & 7u);
+        uint8_t rb = (uint8_t)((opcode >> 3) & 7u);
+        uint8_t ro = (uint8_t)((opcode >> 6) & 7u);
+        uint8_t sub = (uint8_t)((opcode >> 9) & 7u);
+        if (sub == 3) { isByte = true; isSigned = true; }       // LDSB
+        else if (sub == 5) { isHalf = true; }                   // LDRH
+        else if (sub == 6) { isByte = true; }                   // LDRB
+        else if (sub == 7) { isHalf = true; isSigned = true; }  // LDSH
+        emitLoadGuestReg(p, JitPpc::R3, rb);
+        emitLoadGuestReg(p, JitPpc::R4, ro);
+        *p++ = JitPpc::add(JitPpc::R3, JitPpc::R3, JitPpc::R4);
     } else {
-        uint8_t rm = (uint8_t)(opcode & 0xF);
-        uint8_t sh = single ? (uint8_t)((opcode >> 7) & 0x1F) : (uint8_t)0;
-        emitLoadGuestReg(p, JitPpc::R4, rm);
-        if (sh) *p++ = JitPpc::slwi(JitPpc::R4, JitPpc::R4, sh);
-        if (up) *p++ = JitPpc::add(JitPpc::R3, JitPpc::R3, JitPpc::R4);
-        else    *p++ = JitPpc::subf(JitPpc::R3, JitPpc::R4, JitPpc::R3);   // R3 = R3 - R4
+        rd = (uint8_t)(opcode & 7u);
+        uint8_t rb = (uint8_t)((opcode >> 3) & 7u);
+        uint32_t imm5 = (opcode >> 6) & 0x1Fu;
+        if ((opcode & 0xF800u) == 0x7800u) { isByte = true; }
+        else if ((opcode & 0xF800u) == 0x8800u) { isHalf = true; imm5 <<= 1; }
+        else { imm5 <<= 2; }
+        emitLoadGuestReg(p, JitPpc::R3, rb);
+        if (imm5) *p++ = JitPpc::addi(JitPpc::R3, JitPpc::R3, (int16_t)imm5);
     }
 
-#if NOODS_JIT_DISPSTAT_FAST
-    uint32_t *bNotDispstat = nullptr, *bDispstatDone = nullptr;
-    if (isHalf && !cpu->arm7) {
-        // ARM9's common LDRH [Rn, #4] VBlank poll targets unmapped MMIO.
-        // Compare the ALIGNED address, exactly as Memory::readFallback<uint16_t> does.
-        // All other addresses still use the original mapped/handler paths below.
-        *p++ = JitPpc::rlwinm(JitPpc::R4, JitPpc::R3, 0, 0, 30);
-        emitLoadImm32(p, JitPpc::R5, 0x04000004u);
-        *p++ = JitPpc::cmplw(0, JitPpc::R4, JitPpc::R5);
-        bNotDispstat = p++;
-        *p++ = JitPpc::lwz(JitPpc::R4, JitPpc::R31, (int16_t)offsetof(Interpreter, core));
-        const uint32_t offDispstat = (uint32_t)(offsetof(Core, gpu) + offsetof(Gpu, dispStat));
-        emitLoadImm32(p, JitPpc::R5, offDispstat);
-        *p++ = JitPpc::add(JitPpc::R4, JitPpc::R4, JitPpc::R5);
-        *p++ = JitPpc::lhz(JitPpc::R8, JitPpc::R4, 0);
-        emitStoreGuestReg(p, JitPpc::R8, rd);
-        bDispstatDone = p++;
-        *bNotDispstat = JitPpc::bne((int16_t)((p - bNotDispstat) * 4));
+    uint32_t *fastJumps[4];
+    int fastJumpCnt = 0;
+    if (isHalf && !isSigned) {
+        emitGuardedPollHalfLoad(p, cpu, rd, &ArmPpcJit::emitStoreGuestReg, fastJumps, fastJumpCnt);
     }
-#endif
-#if NOODS_JIT_IPCSYNC_FAST
-    uint32_t *bIpcSyncDone = nullptr;
-    if (isHalf && cpu->arm7) {
-        // ARM7's IPC wait loops poll IPCSYNC with LDRH; readIpcSync(1) is a plain member read.
-        // Compare the ALIGNED address: Memory::readFallback<uint16_t> aligns before dispatching,
-        // and that value is a diagnostic only, since the interpreter handler is not involved.
-        *p++ = JitPpc::rlwinm(JitPpc::R4, JitPpc::R3, 0, 0, 30);
-        emitLoadImm32(p, JitPpc::R5, 0x04000180u);
-        *p++ = JitPpc::cmplw(0, JitPpc::R4, JitPpc::R5);
-        uint32_t *bNotIpcSync = p++;
-        *p++ = JitPpc::lwz(JitPpc::R4, JitPpc::R31, (int16_t)offsetof(Interpreter, core));
-        const uint32_t offIpcSync = (uint32_t)(offsetof(Core, ipc) + offsetof(Ipc, ipcSync) + sizeof(uint16_t));
-        emitLoadImm32(p, JitPpc::R5, offIpcSync);
-        *p++ = JitPpc::add(JitPpc::R4, JitPpc::R4, JitPpc::R5);
-        *p++ = JitPpc::lhz(JitPpc::R8, JitPpc::R4, 0);
-        // ARM7 misaligned halfword reads rotate the aligned value right by 8 (see ldrhOf)
-        *p++ = JitPpc::rlwinm(JitPpc::R9, JitPpc::R3, 3, 28, 28);
-        *p++ = JitPpc::subfic(JitPpc::R9, JitPpc::R9, 32);
-        *p++ = JitPpc::rlwnm(JitPpc::R8, JitPpc::R8, JitPpc::R9, 0, 31);
-        emitStoreGuestReg(p, JitPpc::R8, rd);
-        bIpcSyncDone = p++;
-        *bNotIpcSync = JitPpc::bne((int16_t)((p - bNotIpcSync) * 4));
-    }
-#endif
-#if NOODS_JIT_KEYINPUT_FAST
-    uint32_t *bKeyinputDone = nullptr;
-    if (isHalf && !cpu->arm7) {
-        // KEYINPUT is read-only, has no side effects, and is not mapped RAM.
-        // ARM9 LDRH aligns the address; everything else retains its old path.
-        *p++ = JitPpc::rlwinm(JitPpc::R4, JitPpc::R3, 0, 0, 30);
-        emitLoadImm32(p, JitPpc::R5, 0x04000130u);
-        *p++ = JitPpc::cmplw(0, JitPpc::R4, JitPpc::R5);
-        uint32_t *bNotKeyinput = p++;
-        *p++ = JitPpc::lwz(JitPpc::R4, JitPpc::R31, (int16_t)offsetof(Interpreter, core));
-        const uint32_t offKeyinput = (uint32_t)(offsetof(Core, input) + offsetof(Input, keyInput));
-        emitLoadImm32(p, JitPpc::R5, offKeyinput);
-        *p++ = JitPpc::add(JitPpc::R4, JitPpc::R4, JitPpc::R5);
-        *p++ = JitPpc::lhz(JitPpc::R8, JitPpc::R4, 0);
-        emitStoreGuestReg(p, JitPpc::R8, rd);
-        bKeyinputDone = p++;
-        *bNotKeyinput = JitPpc::bne((int16_t)((p - bNotKeyinput) * 4));
-    }
-#endif
-    // R6 = read page pointer for the address's 4 KB page (NULL -> slow path)
-    // Table base resolved at run time from the live Core (cpu->core->memory.readMap{7,9A}); never cached
+
     const uint32_t offTblOff = (uint32_t)(offsetof(Core, memory) + (cpu->arm7 ? offsetof(Memory, readMap7) : offsetof(Memory, readMap9A)));
     *p++ = JitPpc::srwi(JitPpc::R5, JitPpc::R3, 12);
     *p++ = JitPpc::slwi(JitPpc::R5, JitPpc::R5, 2);
@@ -1271,36 +1705,309 @@ bool ArmPpcJit::emitNativeLoadArm(uint32_t *&p, Interpreter *cpu, uint32_t opcod
     *p++ = JitPpc::add(JitPpc::R4, JitPpc::R4, JitPpc::R7);
     *p++ = JitPpc::lwzx(JitPpc::R6, JitPpc::R4, JitPpc::R5);
     *p++ = JitPpc::cmpwi(0, JitPpc::R6, 0);
-    uint32_t *bSlow = p++;                                   // beq slow (patched)
+    uint32_t *bSlow = p++;
 
-    // Fast path: R7 = host pointer to the value, R8 = loaded value
-    if (isByte)      *p++ = JitPpc::rlwinm(JitPpc::R7, JitPpc::R3, 0, 20, 31);  // addr & 0xFFF
-    else if (isHalf) *p++ = JitPpc::rlwinm(JitPpc::R7, JitPpc::R3, 0, 20, 30);  // addr & 0xFFE
-    else             *p++ = JitPpc::rlwinm(JitPpc::R7, JitPpc::R3, 0, 20, 29);  // addr & 0xFFC
+    *p++ = JitPpc::rlwinm(JitPpc::R7, JitPpc::R3, 0, 20, (uint8_t)(isByte ? 31 : (isHalf ? 30 : 29)));
     *p++ = JitPpc::add(JitPpc::R7, JitPpc::R6, JitPpc::R7);
     if (isByte) {
         *p++ = JitPpc::lbz(JitPpc::R8, JitPpc::R7, 0);
+        if (isSigned) *p++ = JitPpc::extsb(JitPpc::R8, JitPpc::R8);
     } else if (isHalf) {
         *p++ = JitPpc::lhbrx(JitPpc::R8, 0, JitPpc::R7);
+        if (isSigned) {
+            *p++ = JitPpc::extsh(JitPpc::R8, JitPpc::R8);
+            if (cpu->arm7) {
+                *p++ = JitPpc::rlwinm(JitPpc::R9, JitPpc::R3, 3, 28, 28);
+                *p++ = JitPpc::sraw(JitPpc::R8, JitPpc::R8, JitPpc::R9);
+            }
+        } else if (cpu->arm7) {
+            *p++ = JitPpc::rlwinm(JitPpc::R9, JitPpc::R3, 3, 28, 28);
+            *p++ = JitPpc::subfic(JitPpc::R9, JitPpc::R9, 32);
+            *p++ = JitPpc::rlwnm(JitPpc::R8, JitPpc::R8, JitPpc::R9, 0, 31);
+        }
     } else {
         *p++ = JitPpc::lwbrx(JitPpc::R8, 0, JitPpc::R7);
-    }
-    if (!isByte) {
-        // Misaligned rotate. LDR: rotate right by 8*(addr&3). LDRH on ARM7: rotate right by 8 if addr&1.
-        if (!isHalf) {
-            *p++ = JitPpc::rlwinm(JitPpc::R9, JitPpc::R3, 3, 27, 28);   // (addr & 3) << 3
-        } else if (cpu->arm7) {
-            *p++ = JitPpc::rlwinm(JitPpc::R9, JitPpc::R3, 3, 28, 28);   // (addr & 1) << 3
-        }
-        if (!isHalf || cpu->arm7) {
-            *p++ = JitPpc::subfic(JitPpc::R9, JitPpc::R9, 32);          // rotate-left amount = 32 - shift
+        if ((opcode & 0xF800u) != 0x4800u) {
+            *p++ = JitPpc::rlwinm(JitPpc::R9, JitPpc::R3, 3, 27, 28);
+            *p++ = JitPpc::subfic(JitPpc::R9, JitPpc::R9, 32);
             *p++ = JitPpc::rlwnm(JitPpc::R8, JitPpc::R8, JitPpc::R9, 0, 31);
         }
     }
     emitStoreGuestReg(p, JitPpc::R8, rd);
-    uint32_t *bOver = p++;                                   // b join (patched)
+    uint32_t *bOver = p++;
 
-    // Slow path: interpreter handler performs the original access and writes Rd itself
+    uint32_t *slow = p;
+    uintptr_t helper = resolveThumbHandler(opcode);
+    emitHelperR15Sync(p, true);
+    *p++ = JitPpc::mr(JitPpc::R3, JitPpc::R31);
+    emitLoadImm32(p, JitPpc::R4, opcode);
+    emitLoadImm32(p, JitPpc::R12, (uint32_t)helper);
+    *p++ = JitPpc::mtctr(JitPpc::R12);
+    *p++ = JitPpc::bctrl();
+    emitHelperR15Sync(p, false);
+
+    uint32_t *join = p;
+    *bSlow = JitPpc::beq((int16_t)((slow - bSlow) * 4));
+    *bOver = JitPpc::b((int32_t)((join - bOver) * 4));
+    for (int i = 0; i < fastJumpCnt; i++)
+        *fastJumps[i] = JitPpc::b((int32_t)((join - fastJumps[i]) * 4));
+
+    outCycles = cpu->arm7 ? 3 : 1;
+    return true;
+}
+
+bool ArmPpcJit::emitNativeStoreThumb(uint32_t *&p, Interpreter *cpu, uint16_t opcode, int &outCycles) {
+    bool isByte = false, isHalf = false;
+    uint8_t rd = 0;
+
+    if ((opcode & 0xF800u) == 0x9000u) { // STR Rd, [SP, #imm8<<2]
+        rd = (uint8_t)((opcode >> 8) & 7u);
+        uint32_t off = (opcode & 0xFFu) << 2;
+        emitLoadGuestReg(p, JitPpc::R3, 13);
+        if (off) *p++ = JitPpc::addi(JitPpc::R3, JitPpc::R3, (int16_t)off);
+    } else if ((opcode & 0xF000u) == 0x5000u) { // STR/STRH/STRB Rd, [Rb, Ro]
+        rd = (uint8_t)(opcode & 7u);
+        uint8_t rb = (uint8_t)((opcode >> 3) & 7u);
+        uint8_t ro = (uint8_t)((opcode >> 6) & 7u);
+        uint8_t sub = (uint8_t)((opcode >> 9) & 7u);
+        if (sub == 1) isHalf = true;
+        else if (sub == 2) isByte = true;
+        emitLoadGuestReg(p, JitPpc::R3, rb);
+        emitLoadGuestReg(p, JitPpc::R4, ro);
+        *p++ = JitPpc::add(JitPpc::R3, JitPpc::R3, JitPpc::R4);
+    } else {
+        rd = (uint8_t)(opcode & 7u);
+        uint8_t rb = (uint8_t)((opcode >> 3) & 7u);
+        uint32_t imm5 = (opcode >> 6) & 0x1Fu;
+        if ((opcode & 0xF800u) == 0x7000u) { isByte = true; }
+        else if ((opcode & 0xF800u) == 0x8000u) { isHalf = true; imm5 <<= 1; }
+        else { imm5 <<= 2; }
+        emitLoadGuestReg(p, JitPpc::R3, rb);
+        if (imm5) *p++ = JitPpc::addi(JitPpc::R3, JitPpc::R3, (int16_t)imm5);
+    }
+    emitLoadGuestReg(p, JitPpc::R8, rd);
+
+    *p++ = JitPpc::srwi(JitPpc::R5, JitPpc::R3, 27);
+    *p++ = JitPpc::cmpwi(0, JitPpc::R5, 0);
+    uint32_t *bNoCode = p++;
+    *p++ = JitPpc::rlwinm(JitPpc::R9, JitPpc::R3, 26, 27, 31);
+    *p++ = JitPpc::li(JitPpc::R11, 1);
+    *p++ = JitPpc::slw(JitPpc::R11, JitPpc::R11, JitPpc::R9);
+    *p++ = JitPpc::rlwinm(JitPpc::R12, JitPpc::R3, 23, 14, 29);
+    emitLoadImm32(p, JitPpc::R6, (uint32_t)(uintptr_t)&codeLineBits[0]);
+    *p++ = JitPpc::lwzx(JitPpc::R9, JitPpc::R6, JitPpc::R12);
+    *p++ = JitPpc::and_(JitPpc::R9, JitPpc::R9, JitPpc::R11);
+    *p++ = JitPpc::cmpwi(0, JitPpc::R9, 0);
+    uint32_t *bBusy = p++;
+    *bNoCode = JitPpc::bne((int16_t)((p - bNoCode) * 4));
+
+    const uint32_t wmTblOff = (uint32_t)(offsetof(Core, memory) + (cpu->arm7 ? offsetof(Memory, writeMap7) : offsetof(Memory, writeMap9A)));
+    *p++ = JitPpc::srwi(JitPpc::R5, JitPpc::R3, 12);
+    *p++ = JitPpc::slwi(JitPpc::R5, JitPpc::R5, 2);
+    *p++ = JitPpc::lwz(JitPpc::R4, JitPpc::R31, (int16_t)offsetof(Interpreter, core));
+    emitLoadImm32(p, JitPpc::R7, wmTblOff);
+    *p++ = JitPpc::add(JitPpc::R4, JitPpc::R4, JitPpc::R7);
+    *p++ = JitPpc::lwzx(JitPpc::R6, JitPpc::R4, JitPpc::R5);
+    *p++ = JitPpc::cmpwi(0, JitPpc::R6, 0);
+    uint32_t *bSlow = p++;
+
+    *p++ = JitPpc::rlwinm(JitPpc::R7, JitPpc::R3, 0, 20, (uint8_t)(isByte ? 31 : (isHalf ? 30 : 29)));
+    *p++ = JitPpc::add(JitPpc::R7, JitPpc::R6, JitPpc::R7);
+    if (isByte)      *p++ = JitPpc::stb(JitPpc::R8, JitPpc::R7, 0);
+    else if (isHalf) *p++ = JitPpc::sthbrx(JitPpc::R8, 0, JitPpc::R7);
+    else             *p++ = JitPpc::stwbrx(JitPpc::R8, 0, JitPpc::R7);
+    uint32_t *bOver = p++;
+
+    uint32_t *slow = p;
+    uintptr_t helper = resolveThumbHandler(opcode);
+    emitHelperR15Sync(p, true);
+    *p++ = JitPpc::mr(JitPpc::R3, JitPpc::R31);
+    emitLoadImm32(p, JitPpc::R4, opcode);
+    emitLoadImm32(p, JitPpc::R12, (uint32_t)helper);
+    *p++ = JitPpc::mtctr(JitPpc::R12);
+    *p++ = JitPpc::bctrl();
+    emitHelperR15Sync(p, false);
+
+    uint32_t *join = p;
+    *bBusy = JitPpc::bne((int16_t)((slow - bBusy) * 4));
+    *bSlow = JitPpc::beq((int16_t)((slow - bSlow) * 4));
+    *bOver = JitPpc::b((int32_t)((join - bOver) * 4));
+
+    outCycles = cpu->arm7 ? 2 : 1;
+    return true;
+}
+
+bool ArmPpcJit::emitNativePushPop(uint32_t *&p, Interpreter *cpu, uint16_t regMask, bool isLoad,
+                                  uint32_t rawOpcode, bool isThumb, int &outCycles) {
+    int m = __builtin_popcount((unsigned)regMask);
+    if (m <= 0) return false;
+
+    uint32_t *slowFix[6];
+    int slowCnt = 0;
+
+    // Load SP into R3; for PUSH pre-decrement by 4*m
+    emitLoadGuestReg(p, JitPpc::R3, 13);
+    if (!isLoad) {
+        *p++ = JitPpc::addi(JitPpc::R3, JitPpc::R3, (int16_t)(-4 * m));
+    }
+    // Require word alignment & all m words inside the same 2 KB codeLineBits / 4 KB page window!
+    *p++ = JitPpc::andi_rc(JitPpc::R0, JitPpc::R3, 3u);
+    slowFix[slowCnt++] = p++; // bne slow
+    if (m > 1) {
+        *p++ = JitPpc::addi(JitPpc::R4, JitPpc::R3, (int16_t)(4 * (m - 1)));
+        *p++ = JitPpc::xor_(JitPpc::R5, JitPpc::R3, JitPpc::R4);
+        *p++ = JitPpc::srwi(JitPpc::R5, JitPpc::R5, 11);
+        *p++ = JitPpc::cmpwi(0, JitPpc::R5, 0);
+        slowFix[slowCnt++] = p++; // bne slow
+    }
+    if (!isLoad) {
+        *p++ = JitPpc::srwi(JitPpc::R5, JitPpc::R3, 27);
+        *p++ = JitPpc::cmpwi(0, JitPpc::R5, 0);
+        uint32_t *bNoCode = p++;
+        *p++ = JitPpc::rlwinm(JitPpc::R12, JitPpc::R3, 23, 14, 29);
+        emitLoadImm32(p, JitPpc::R6, (uint32_t)(uintptr_t)&codeLineBits[0]);
+        *p++ = JitPpc::lwzx(JitPpc::R9, JitPpc::R6, JitPpc::R12);
+        *p++ = JitPpc::cmpwi(0, JitPpc::R9, 0);
+        slowFix[slowCnt++] = p++; // bne slow
+        *bNoCode = JitPpc::bne((int16_t)((p - bNoCode) * 4));
+    }
+
+    const uint32_t tblOff = (uint32_t)(offsetof(Core, memory) + (isLoad
+        ? (cpu->arm7 ? offsetof(Memory, readMap7) : offsetof(Memory, readMap9A))
+        : (cpu->arm7 ? offsetof(Memory, writeMap7) : offsetof(Memory, writeMap9A))));
+    *p++ = JitPpc::srwi(JitPpc::R5, JitPpc::R3, 12);
+    *p++ = JitPpc::slwi(JitPpc::R5, JitPpc::R5, 2);
+    *p++ = JitPpc::lwz(JitPpc::R4, JitPpc::R31, (int16_t)offsetof(Interpreter, core));
+    emitLoadImm32(p, JitPpc::R7, tblOff);
+    *p++ = JitPpc::add(JitPpc::R4, JitPpc::R4, JitPpc::R7);
+    *p++ = JitPpc::lwzx(JitPpc::R6, JitPpc::R4, JitPpc::R5);
+    *p++ = JitPpc::cmpwi(0, JitPpc::R6, 0);
+    uint32_t *bNull = p++;
+
+    // R7 = host stack pointer inside the mapped 4 KB page!
+    *p++ = JitPpc::rlwinm(JitPpc::R7, JitPpc::R3, 0, 20, 29);
+    *p++ = JitPpc::add(JitPpc::R7, JitPpc::R6, JitPpc::R7);
+
+    int slot = 0;
+    for (int reg = 0; reg < 15; reg++) {
+        if (!(regMask & (1u << reg))) continue;
+        if (slot > 0) *p++ = JitPpc::addi(JitPpc::R7, JitPpc::R7, 4);
+        if (isLoad) {
+            *p++ = JitPpc::lwbrx(JitPpc::R8, 0, JitPpc::R7);
+            emitStoreGuestReg(p, JitPpc::R8, (uint8_t)reg);
+        } else {
+            emitLoadGuestReg(p, JitPpc::R8, (uint8_t)reg);
+            *p++ = JitPpc::stwbrx(JitPpc::R8, 0, JitPpc::R7);
+        }
+        slot++;
+    }
+    if (isLoad) {
+        *p++ = JitPpc::addi(JitPpc::R3, JitPpc::R3, (int16_t)(4 * m));
+    }
+    emitStoreGuestReg(p, JitPpc::R3, 13);
+    uint32_t *bOver = p++;
+
+    // Slow path: invoke exact original interpreter handler
+    uint32_t *slow = p;
+    uintptr_t helper = isThumb ? resolveThumbHandler((uint16_t)rawOpcode) : resolveArmHandler(rawOpcode);
+    emitHelperR15Sync(p, true);
+    *p++ = JitPpc::mr(JitPpc::R3, JitPpc::R31);
+    emitLoadImm32(p, JitPpc::R4, rawOpcode);
+    emitLoadImm32(p, JitPpc::R12, (uint32_t)helper);
+    *p++ = JitPpc::mtctr(JitPpc::R12);
+    *p++ = JitPpc::bctrl();
+    emitHelperR15Sync(p, false);
+
+    uint32_t *join = p;
+    for (int i = 0; i < slowCnt; i++)
+        *slowFix[i] = JitPpc::bne((int16_t)((slow - slowFix[i]) * 4));
+    *bNull = JitPpc::beq((int16_t)((slow - bNull) * 4));
+    *bOver = JitPpc::b((int32_t)((join - bOver) * 4));
+
+    outCycles = isLoad ? (m + (cpu->arm7 ? 2 : (m < 2))) : (m + (cpu->arm7 || m < 2));
+    return true;
+}
+
+bool ArmPpcJit::emitNativeLoadArm(uint32_t *&p, Interpreter *cpu, uint32_t opcode, int &outCycles) {
+    const bool single = (opcode & 0x0C000000u) == 0x04000000u;
+    const uint8_t shField = (uint8_t)((opcode >> 5) & 3u);
+    const bool isByte = single ? ((opcode & (1u << 22)) != 0) : (shField == 2u);
+    const bool isHalf = !single && (shField == 1u || shField == 3u);
+    const bool isSigned = !single && (shField >= 2u);
+    const bool up     = (opcode & (1u << 23)) != 0;
+    const uint8_t rn = (uint8_t)((opcode >> 16) & 0xF);
+    const uint8_t rd = (uint8_t)((opcode >> 12) & 0xF);
+    const bool immOff = single ? ((opcode & (1u << 25)) == 0) : ((opcode & (1u << 22)) != 0);
+
+    // R3 = guest address (compile-time constant for [PC, +/-#imm]!)
+    if (rn == 15) {
+        uint32_t off = single ? (opcode & 0xFFFu) : (((opcode >> 4) & 0xF0u) | (opcode & 0xFu));
+        uint32_t addr = up ? (s_emitInstrR15 + off) : (s_emitInstrR15 - off);
+        emitLoadImm32(p, JitPpc::R3, addr);
+    } else {
+        emitLoadGuestReg(p, JitPpc::R3, rn);
+        if (immOff) {
+            uint32_t off = single ? (opcode & 0xFFFu) : (((opcode >> 4) & 0xF0u) | (opcode & 0xFu));
+            if (off != 0) {
+                *p++ = JitPpc::addi(JitPpc::R3, JitPpc::R3, (int16_t)(up ? (int32_t)off : -(int32_t)off));
+            }
+        } else {
+            uint8_t rm = (uint8_t)(opcode & 0xF);
+            uint8_t sh = single ? (uint8_t)((opcode >> 7) & 0x1F) : (uint8_t)0;
+            emitLoadGuestReg(p, JitPpc::R4, rm);
+            if (sh) *p++ = JitPpc::slwi(JitPpc::R4, JitPpc::R4, sh);
+            if (up) *p++ = JitPpc::add(JitPpc::R3, JitPpc::R3, JitPpc::R4);
+            else    *p++ = JitPpc::subf(JitPpc::R3, JitPpc::R4, JitPpc::R3);
+        }
+    }
+
+    uint32_t *fastJumps[4];
+    int fastJumpCnt = 0;
+    if (isHalf && !isSigned) {
+        emitGuardedPollHalfLoad(p, cpu, rd, &ArmPpcJit::emitStoreGuestReg, fastJumps, fastJumpCnt);
+    }
+
+    const uint32_t offTblOff = (uint32_t)(offsetof(Core, memory) + (cpu->arm7 ? offsetof(Memory, readMap7) : offsetof(Memory, readMap9A)));
+    *p++ = JitPpc::srwi(JitPpc::R5, JitPpc::R3, 12);
+    *p++ = JitPpc::slwi(JitPpc::R5, JitPpc::R5, 2);
+    *p++ = JitPpc::lwz(JitPpc::R4, JitPpc::R31, (int16_t)offsetof(Interpreter, core));
+    emitLoadImm32(p, JitPpc::R7, offTblOff);
+    *p++ = JitPpc::add(JitPpc::R4, JitPpc::R4, JitPpc::R7);
+    *p++ = JitPpc::lwzx(JitPpc::R6, JitPpc::R4, JitPpc::R5);
+    *p++ = JitPpc::cmpwi(0, JitPpc::R6, 0);
+    uint32_t *bSlow = p++;
+
+    if (isByte)      *p++ = JitPpc::rlwinm(JitPpc::R7, JitPpc::R3, 0, 20, 31);
+    else if (isHalf) *p++ = JitPpc::rlwinm(JitPpc::R7, JitPpc::R3, 0, 20, 30);
+    else             *p++ = JitPpc::rlwinm(JitPpc::R7, JitPpc::R3, 0, 20, 29);
+    *p++ = JitPpc::add(JitPpc::R7, JitPpc::R6, JitPpc::R7);
+    if (isByte) {
+        *p++ = JitPpc::lbz(JitPpc::R8, JitPpc::R7, 0);
+        if (isSigned) *p++ = JitPpc::extsb(JitPpc::R8, JitPpc::R8);
+    } else if (isHalf) {
+        *p++ = JitPpc::lhbrx(JitPpc::R8, 0, JitPpc::R7);
+        if (isSigned) {
+            *p++ = JitPpc::extsh(JitPpc::R8, JitPpc::R8);
+            if (cpu->arm7) {
+                *p++ = JitPpc::rlwinm(JitPpc::R9, JitPpc::R3, 3, 28, 28);
+                *p++ = JitPpc::sraw(JitPpc::R8, JitPpc::R8, JitPpc::R9);
+            }
+        } else if (cpu->arm7) {
+            *p++ = JitPpc::rlwinm(JitPpc::R9, JitPpc::R3, 3, 28, 28);
+            *p++ = JitPpc::subfic(JitPpc::R9, JitPpc::R9, 32);
+            *p++ = JitPpc::rlwnm(JitPpc::R8, JitPpc::R8, JitPpc::R9, 0, 31);
+        }
+    } else {
+        *p++ = JitPpc::lwbrx(JitPpc::R8, 0, JitPpc::R7);
+        if (!(rn == 15 && (((s_emitInstrR15 + (up ? (opcode & 0xFFFu) : -(opcode & 0xFFFu))) & 3u) == 0u))) {
+            *p++ = JitPpc::rlwinm(JitPpc::R9, JitPpc::R3, 3, 27, 28);
+            *p++ = JitPpc::subfic(JitPpc::R9, JitPpc::R9, 32);
+            *p++ = JitPpc::rlwnm(JitPpc::R8, JitPpc::R8, JitPpc::R9, 0, 31);
+        }
+    }
+    emitStoreGuestReg(p, JitPpc::R8, rd);
+    uint32_t *bOver = p++;
+
     uint32_t *slow = p;
     uintptr_t helper = resolveArmHandler(opcode);
     emitHelperR15Sync(p, true);
@@ -1314,18 +2021,8 @@ bool ArmPpcJit::emitNativeLoadArm(uint32_t *&p, Interpreter *cpu, uint32_t opcod
     uint32_t *join = p;
     *bSlow = JitPpc::beq((int16_t)((slow - bSlow) * 4));
     *bOver = JitPpc::b((int32_t)((join - bOver) * 4));
-#if NOODS_JIT_DISPSTAT_FAST
-    if (bDispstatDone)
-        *bDispstatDone = JitPpc::b((int32_t)((join - bDispstatDone) * 4));
-#endif
-#if NOODS_JIT_KEYINPUT_FAST
-    if (bKeyinputDone)
-        *bKeyinputDone = JitPpc::b((int32_t)((join - bKeyinputDone) * 4));
-#endif
-#if NOODS_JIT_IPCSYNC_FAST
-    if (bIpcSyncDone)
-        *bIpcSyncDone = JitPpc::b((int32_t)((join - bIpcSyncDone) * 4));
-#endif
+    for (int i = 0; i < fastJumpCnt; i++)
+        *fastJumps[i] = JitPpc::b((int32_t)((join - fastJumps[i]) * 4));
 
     outCycles = cpu->arm7 ? 3 : 1;
     return true;
@@ -1338,7 +2035,6 @@ bool ArmPpcJit::emitNativeStoreArm(uint32_t *&p, Interpreter *cpu, uint32_t opco
     const bool isHalf = !single;
     const bool pre = (opcode & (1u << 24)) != 0;
     const bool up  = (opcode & (1u << 23)) != 0;
-    // Post-indexed halfword stores post-update the base even when W=0, matching Interpreter::strhPt*
     const bool wb  = ((opcode & (1u << 21)) != 0) || !pre;
     const bool immOff = single ? ((opcode & (1u << 25)) == 0) : ((opcode & (1u << 22)) != 0);
     const uint8_t rn = (uint8_t)((opcode >> 16) & 0xF);
@@ -1347,8 +2043,6 @@ bool ArmPpcJit::emitNativeStoreArm(uint32_t *&p, Interpreter *cpu, uint32_t opco
     const uint8_t shift = single ? (uint8_t)((opcode >> 7) & 0x1F) : 0;
     const uint32_t imm = single ? (opcode & 0xFFFu) : (uint32_t)(((opcode >> 4) & 0xF0u) | (opcode & 0xFu));
 
-    // R3 = store address, R28 = writeback value (post-index), R8 = stored value
-    // R8 is loaded before R11 can be used, since guest regs 8..14 are reached through R11
     emitLoadGuestReg(p, JitPpc::R3, rn);
     if (pre) {
         if (immOff) {
@@ -1359,38 +2053,34 @@ bool ArmPpcJit::emitNativeStoreArm(uint32_t *&p, Interpreter *cpu, uint32_t opco
             if (up) *p++ = JitPpc::add(JitPpc::R3, JitPpc::R3, JitPpc::R4);
             else    *p++ = JitPpc::subf(JitPpc::R3, JitPpc::R4, JitPpc::R3);
         }
-        if (wb) *p++ = JitPpc::mr(JitPpc::R28, JitPpc::R3);            // writeback = effective address
+        if (wb) *p++ = JitPpc::mr(JitPpc::R28, JitPpc::R3);
     } else {
-        // Post-index: the store targets the base, and the base is updated afterwards
         if (immOff) {
             *p++ = JitPpc::addi(JitPpc::R28, JitPpc::R3, (int16_t)(up ? (int32_t)imm : -(int32_t)imm));
         } else {
             emitLoadGuestReg(p, JitPpc::R4, rm);
             if (shift) *p++ = JitPpc::slwi(JitPpc::R4, JitPpc::R4, shift);
             if (up) *p++ = JitPpc::add(JitPpc::R28, JitPpc::R3, JitPpc::R4);
-            else    *p++ = JitPpc::subf(JitPpc::R28, JitPpc::R4, JitPpc::R3);  // R28 = R3 - R4
+            else    *p++ = JitPpc::subf(JitPpc::R28, JitPpc::R4, JitPpc::R3);
         }
     }
     emitLoadGuestReg(p, JitPpc::R8, rd);
 
-    // Fast path only if no compiled block lives on this page for either CPU (same test as invalidateSharedAddr).
-    // R5 = page index, R9 = bit number, R11 = bit mask, R12 = &pageHasBlockBits[0][word]
-    *p++ = JitPpc::rlwinm(JitPpc::R5, JitPpc::R3, 20, 20, 31);       // (addr >> 12) & (PAGE_EPOCH_SIZE-1)
-    *p++ = JitPpc::rlwinm(JitPpc::R9, JitPpc::R5, 0, 27, 31);        // pageIdx & 31
+    // Exact 64-byte line SMC check (zero false invalidations on same-page stack / globals!)
+    *p++ = JitPpc::srwi(JitPpc::R5, JitPpc::R3, 27);
+    *p++ = JitPpc::cmpwi(0, JitPpc::R5, 0);
+    uint32_t *bNoCode = p++;
+    *p++ = JitPpc::rlwinm(JitPpc::R9, JitPpc::R3, 26, 27, 31);
     *p++ = JitPpc::li(JitPpc::R11, 1);
     *p++ = JitPpc::slw(JitPpc::R11, JitPpc::R11, JitPpc::R9);
-    *p++ = JitPpc::rlwinm(JitPpc::R12, JitPpc::R5, 27, 5, 31);       // pageIdx >> 5
-    *p++ = JitPpc::slwi(JitPpc::R12, JitPpc::R12, 2);
-    emitLoadImm32(p, JitPpc::R6, (uint32_t)(uintptr_t)&pageHasBlockBits[0][0]);
-    *p++ = JitPpc::add(JitPpc::R12, JitPpc::R12, JitPpc::R6);
-    *p++ = JitPpc::lwz(JitPpc::R9, JitPpc::R12, 0);
-    *p++ = JitPpc::lwz(JitPpc::R10, JitPpc::R12, (int16_t)(sizeof(uint32_t) * (PAGE_EPOCH_SIZE / 32)));
-    *p++ = JitPpc::or_(JitPpc::R9, JitPpc::R9, JitPpc::R10);
+    *p++ = JitPpc::rlwinm(JitPpc::R12, JitPpc::R3, 23, 14, 29);
+    emitLoadImm32(p, JitPpc::R6, (uint32_t)(uintptr_t)&codeLineBits[0]);
+    *p++ = JitPpc::lwzx(JitPpc::R9, JitPpc::R6, JitPpc::R12);
     *p++ = JitPpc::and_(JitPpc::R9, JitPpc::R9, JitPpc::R11);
     *p++ = JitPpc::cmpwi(0, JitPpc::R9, 0);
-    uint32_t *bBusy = p++;                                           // bne slow (patched)
+    uint32_t *bBusy = p++;
+    *bNoCode = JitPpc::bne((int16_t)((p - bNoCode) * 4));
 
-    // R6 = write page pointer for the address's 4 KB page (NULL -> slow path)
     const uint32_t wmTblOff = (uint32_t)(offsetof(Core, memory) + (cpu->arm7 ? offsetof(Memory, writeMap7) : offsetof(Memory, writeMap9A)));
     *p++ = JitPpc::srwi(JitPpc::R5, JitPpc::R3, 12);
     *p++ = JitPpc::slwi(JitPpc::R5, JitPpc::R5, 2);
@@ -1399,18 +2089,16 @@ bool ArmPpcJit::emitNativeStoreArm(uint32_t *&p, Interpreter *cpu, uint32_t opco
     *p++ = JitPpc::add(JitPpc::R4, JitPpc::R4, JitPpc::R7);
     *p++ = JitPpc::lwzx(JitPpc::R6, JitPpc::R4, JitPpc::R5);
     *p++ = JitPpc::cmpwi(0, JitPpc::R6, 0);
-    uint32_t *bSlow = p++;                                           // beq slow (patched)
+    uint32_t *bSlow = p++;
 
-    // Fast path: value at (addr & page mask) in the page, stored little-endian
     *p++ = JitPpc::rlwinm(JitPpc::R7, JitPpc::R3, 0, 20, (uint8_t)(isByte ? 31 : (isHalf ? 30 : 29)));
     *p++ = JitPpc::add(JitPpc::R7, JitPpc::R6, JitPpc::R7);
     if (isByte)      *p++ = JitPpc::stb(JitPpc::R8, JitPpc::R7, 0);
     else if (isHalf) *p++ = JitPpc::sthbrx(JitPpc::R8, 0, JitPpc::R7);
     else             *p++ = JitPpc::stwbrx(JitPpc::R8, 0, JitPpc::R7);
-    if (wb) emitStoreGuestReg(p, JitPpc::R28, rn);                   // writeback only on the fast path
-    uint32_t *bOver = p++;                                           // b join (patched)
+    if (wb) emitStoreGuestReg(p, JitPpc::R28, rn);
+    uint32_t *bOver = p++;
 
-    // Slow path: interpreter handler performs the store
     uint32_t *slow = p;
     uintptr_t helper = resolveArmHandler(opcode);
     emitHelperR15Sync(p, true);
@@ -1426,13 +2114,16 @@ bool ArmPpcJit::emitNativeStoreArm(uint32_t *&p, Interpreter *cpu, uint32_t opco
     *bSlow = JitPpc::beq((int16_t)((slow - bSlow) * 4));
     *bOver = JitPpc::b((int32_t)((join - bOver) * 4));
 
-    outCycles = cpu->arm7 ? 2 : 1;   // matches Interpreter::strhPr (arm7 + 1)
+    outCycles = cpu->arm7 ? 2 : 1;
     return true;
 }
 
 bool ArmPpcJit::emitNativeArm(uint32_t *&p, Interpreter *cpu, uint32_t opcode, int &outCycles, bool emitFlags) {
     if (isNativeLoadArm(cpu->arm7, opcode)) return emitNativeLoadArm(p, cpu, opcode, outCycles);
     if (isNativeStoreArm(opcode)) return emitNativeStoreArm(p, cpu, opcode, outCycles);
+    if (isNativePushPopArm(opcode)) {
+        return emitNativePushPop(p, cpu, (uint16_t)(opcode & 0xFFFFu), (opcode & (1u << 20)) != 0u, opcode, false, outCycles);
+    }
     // ARM9 CP15 instructions always exit to interpreter
     if (!cpu->arm7 && (opcode & 0x0F000010u) == 0x0E000010u) {
         return false;
@@ -1689,11 +2380,14 @@ void *ArmPpcJit::compileStub(Interpreter *cpu, uint32_t instrPC, uint32_t opcode
 
 #if NOODS_JIT_BLOCKS
     int nativeCycles = 0;
-    // Native loads call their slow-path helper with bctrl, which clobbers LR. Blocks restore LR in
-    // their epilogue; single-instruction stubs do not, so loads in stubs take the plain helper tail call.
-    s_emitInstrR15 = instrPC + 8u;
-    bool ok = thumb ? emitNativeThumb(p, cpu, (uint16_t)opcode, nativeCycles)
-                    : (!isNativeLoadArm(cpu->arm7, opcode) && !isNativeStoreArm(opcode) && emitNativeArm(p, cpu, opcode, nativeCycles));
+    // Native loads/stores/push/pop call slow-path helpers with bctrl, which clobbers LR. Blocks restore LR in
+    // their epilogue; single-instruction stubs do not, so memory ops in stubs take the plain helper tail call.
+    s_emitInstrR15 = instrPC + (thumb ? 4u : 8u);
+    bool memStub = thumb
+        ? (isNativeLoadThumb((uint16_t)opcode) || isNativeStoreThumb((uint16_t)opcode) || isNativePushPopThumb((uint16_t)opcode))
+        : (isNativeLoadArm(cpu->arm7, opcode) || isNativeStoreArm(opcode) || isNativePushPopArm(opcode));
+    bool ok = !memStub && (thumb ? emitNativeThumb(p, cpu, (uint16_t)opcode, nativeCycles)
+                                 : emitNativeArm(p, cpu, opcode, nativeCycles));
     if (ok) {
         *p++ = JitPpc::li(JitPpc::R3, (int16_t)nativeCycles);
         *p++ = JitPpc::lmw(JitPpc::R28, JitPpc::R1, 16);
@@ -1778,12 +2472,21 @@ static inline bool isUncondBranchArm(uint32_t op) {
     return (op >> 28) == 0xEu && (op & 0x0E000000u) == 0x0A000000u;
 }
 
-// ARM B/BL with any condition except the reserved 0xF space (cond=0xF is BLX-imm / reserved, handled by the
-// interpreter). Conditional branches may START a block: the block is branch-only, and the inline exit
-// (emitInlineBranchArm) evaluates Interpreter::condition natively on both edges; the C helper fallback
-// (execBranchArm) already implements the same condition-false path.
-static inline bool isBranchHeadArm(uint32_t op) {
-    return (op >> 28) != 0xFu && (op & 0x0E000000u) == 0x0A000000u;
+// Conditional or unconditional branch/BX/BLX may START a block (branch-only block).
+static inline bool isBranchHeadArm(bool arm7, uint32_t op) {
+    if ((op >> 28) == 0xFu) return false;
+    if ((op & 0x0E000000u) == 0x0A000000u) return true;
+    if ((op & 0x0FFFFFF0u) == 0x012FFF10u) return true;
+    if (!arm7 && (op & 0x0FFFFFF0u) == 0x012FFF30u) return true;
+    return false;
+}
+
+static inline bool isBranchHeadThumb(bool arm7, uint16_t op) {
+    if ((op & 0xF000u) == 0xD000u && (op & 0x0F00u) < 0x0E00u) return true;
+    if ((op & 0xF800u) == 0xE000u) return true;
+    if ((op & 0xFF80u) == 0x4700u) return true;
+    if (!arm7 && (op & 0xFF80u) == 0x4780u) return true;
+    return false;
 }
 
 
@@ -1825,6 +2528,9 @@ static inline bool isSingleLoadArm(uint32_t op) {
 }
 
 static inline bool canTranslateNativeThumb(uint16_t opcode) {
+    if (isNativeLoadThumb(opcode)) return true;
+    if (isNativeStoreThumb(opcode)) return true;
+    if (isNativePushPopThumb(opcode)) return true;
     switch (opcode >> 13) {
     case 0:
     case 1:
@@ -1857,6 +2563,7 @@ static inline bool canTranslateNativeThumb(uint16_t opcode) {
 static inline bool canTranslateNativeArm(bool arm7, uint32_t opcode) {
     if (isNativeLoadArm(arm7, opcode)) return true;
     if (isNativeStoreArm(opcode)) return true;
+    if (isNativePushPopArm(opcode)) return true;
     if ((opcode & 0x0C000000u) != 0x00000000u) return false;
     bool isImm = (opcode & (1u << 25)) != 0;
     if (!isImm) {
@@ -1976,11 +2683,9 @@ static inline bool armReadsCarry(uint32_t opcode) {
     return (aluOp == 0x5 || aluOp == 0x6 || aluOp == 0x7);
 }
 
-#if NOODS_JIT_POLL_SKIP
-#define BLK_N(x) ((x) & 0x7FFF)   // block instruction count (bit 15 = pure flag)
-#else
-#define BLK_N(x) (x)
-#endif
+#define BLK_N(x)    ((x) & 0xFFu)
+#define BLK_PREF(x) ((x) & 0xFFu)
+#define BLK_LOOP(x) (((x) >> 8) & 0xFFu)
 
 // Purity classification for poll-loop skipping. 1 = pure (register-only), 2 = pure iff the load address is
 // side-effect free (checked at runtime), 0 = impure (stores, system/coprocessor, exception return, MSR/MRS, etc.).
@@ -2031,6 +2736,62 @@ static inline bool armPure(uint32_t op, uint32_t base) {
     return p == 1 || (p == 2 && armLoadAddrOk(op, base));
 }
 
+static inline bool isAnyMemThumb(uint16_t op) {
+    return isNativeLoadThumb(op) || isNativeStoreThumb(op) || isNativePushPopThumb(op);
+}
+
+static inline bool isAnyStoreOp(bool arm7, uint32_t op, bool thumb) {
+    (void)arm7;
+    if (thumb) {
+        return isNativeStoreThumb((uint16_t)op) || ((op & 0xFE00u) == 0xB400u && (op & 0x01FFu) != 0u);
+    }
+    return isNativeStoreArm(op) || ((op & 0xFFFF0000u) == 0xE92D0000u && (op & 0xFFFFu) != 0u);
+}
+
+static inline uint32_t writtenGuestRegsMask(uint32_t op, bool thumb) {
+    if (thumb) {
+        uint16_t t = (uint16_t)op;
+        if (isNativeStoreThumb(t)) return 0u;
+        if ((t & 0xFE00u) == 0xB400u) return (1u << 13);
+        if ((t & 0xFF00u) == 0xBC00u) return (t & 0xFFu) | (1u << 13);
+        if ((t & 0xF800u) == 0x4800u || (t & 0xF800u) == 0x9800u) return 1u << ((t >> 8) & 7u);
+        if (isNativeLoadThumb(t)) return 1u << (t & 7u);
+        switch (t >> 13) {
+        case 0: return 1u << (t & 7u);
+        case 1: return (((t >> 11) & 3u) == 1u) ? 0u : (1u << ((t >> 8) & 7u));
+        case 2:
+            if ((t & 0xFC00u) == 0x4000u) {
+                uint8_t a = (uint8_t)((t >> 6) & 0xFu);
+                return (a == 8u || a == 10u || a == 11u) ? 0u : (1u << (t & 7u));
+            }
+            if ((t & 0xFC00u) == 0x4400u) {
+                uint8_t o = (uint8_t)((t >> 8) & 3u);
+                return (o == 1u) ? 0u : (1u << ((((t >> 4) & 8u) | (t & 7u))));
+            }
+            return 0u;
+        case 5:
+            if ((t & 0xFF00u) == 0xB000u) return (1u << 13);
+            return 1u << ((t >> 8) & 7u);
+        case 7:
+            return (1u << 14);
+        default:
+            return 0xFFFFu;
+        }
+    }
+    if ((op & 0xFFFF0000u) == 0xE92D0000u) return (1u << 13);
+    if ((op & 0xFFFF0000u) == 0xE8BD0000u) return (op & 0xFFFFu) | (1u << 13);
+    if (isNativeStoreArm(op)) {
+        bool pre = (op & (1u << 24)) != 0;
+        bool wb = ((op & (1u << 21)) != 0) || !pre;
+        return wb ? (1u << ((op >> 16) & 0xFu)) : 0u;
+    }
+    if (isMemClassArm(op)) return 1u << ((op >> 12) & 0xFu);
+    if ((op & 0x0FFF0FF0u) == 0x016F0F10u) return 1u << ((op >> 12) & 0xFu);
+    uint8_t aluOp = (uint8_t)((op >> 21) & 0xFu);
+    if (aluOp >= 8u && aluOp <= 11u) return 0u;
+    return 1u << ((op >> 12) & 0xFu);
+}
+
 bool ArmPpcJit::compileBlock(Interpreter *cpu, uint32_t instrPC, uint32_t opcode0, bool thumb, BlockEntry &entry) {
     int cpuIdx = cpu->arm7 ? 1 : 0;
     const int16_t step = thumb ? 2 : 4;
@@ -2042,12 +2803,11 @@ bool ArmPpcJit::compileBlock(Interpreter *cpu, uint32_t instrPC, uint32_t opcode
     // Pass 1: Scan guest instruction stream before touching codePool
     bool firstIsNative = thumb ? canTranslateNativeThumb((uint16_t)opcode0) : canTranslateNativeArm(cpu->arm7, opcode0);
     bool firstIsLoad   = !firstIsNative && (thumb ? isSingleLoadThumb((uint16_t)opcode0) : isSingleLoadArm(opcode0));
-    bool firstIsBranch = !thumb && !firstIsNative && !firstIsLoad && isBranchHeadArm(opcode0);
+    bool firstIsBranch = !firstIsNative && !firstIsLoad && (thumb ? isBranchHeadThumb(cpu->arm7, (uint16_t)opcode0) : isBranchHeadArm(cpu->arm7, opcode0));
     bool firstIsPcLoad = !thumb && !firstIsNative && !firstIsLoad && !firstIsBranch && isPcDestLoadTerminatorArm(cpu->arm7, opcode0);
     if (!firstIsNative && !firstIsLoad && !firstIsBranch && !firstIsPcLoad) {
         return false;
     }
-    // Blocks that begin with a terminator (branch or PC-destination load) execute only that instruction
     const bool firstIsTerm = firstIsBranch || firstIsPcLoad;
 
     uint32_t opcode1 = cpu->pipeline[0];
@@ -2061,18 +2821,18 @@ bool ArmPpcJit::compileBlock(Interpreter *cpu, uint32_t instrPC, uint32_t opcode
     bool hasBranchTerm = false;
     bool hasPcLoadTerm = false;
     uint32_t branchOpcode = 0;
+    bool sawStore = !firstIsTerm && isAnyStoreOp(cpu->arm7, opcode0, thumb);
+    int postStoreLeft = sawStore ? 2 : 99;
+
     if (firstIsBranch) {
-        // Branch-only block: the branch itself is the terminator; instructions after it never execute.
         hasBranchTerm = true;
         branchOpcode = opcode0;
     } else if (firstIsPcLoad) {
-        // PC-destination load as the block's only instruction (computed branch / dispatch table)
         hasPcLoadTerm = true;
         branchOpcode = opcode0;
     }
 
-    for (uint16_t m = 1; m < (firstIsTerm ? 1 : MAX_BLOCK_INSTRS); m++) {
-        // Ensure we stay strictly inside the 4 KB page so pcData never crosses a page boundary
+    for (uint16_t m = 1; m < (firstIsTerm ? 1 : MAX_BLOCK_INSTRS) && postStoreLeft > 0; m++) {
         uint32_t simR15 = r15After0 + m * (uint32_t)step;
         if ((simR15 & 0xFFFu) < 8u || (simR15 & 0xFFFu) > 0xFA0u) break;
 
@@ -2080,12 +2840,10 @@ bool ArmPpcJit::compileBlock(Interpreter *cpu, uint32_t instrPC, uint32_t opcode
                                 : (thumb ? (uint32_t)U8TO16(pcData0 + (m - 2) * 2, 0)
                                          : (uint32_t)U8TO32(pcData0 + (m - 2) * 4, 0));
 
-        // Gate G6: Never include ARM9 CP15 instructions inside a block
         if (!thumb && !cpu->arm7 && (opM & 0x0F000010u) == 0x0E000010u) {
             break;
         }
 
-        // In ARM mode, non-initial native instructions in a block must be unconditional (0xE)
         if (!thumb && (opM >> 28) != 0xEu) {
             if (isTerminatorBranchArm(cpu->arm7, opM)) {
                 hasBranchTerm = true;
@@ -2101,6 +2859,11 @@ bool ArmPpcJit::compileBlock(Interpreter *cpu, uint32_t instrPC, uint32_t opcode
 
         if (thumb ? canTranslateNativeThumb((uint16_t)opM) : canTranslateNativeArm(cpu->arm7, opM)) {
             opList[count++] = opM;
+            if (sawStore) postStoreLeft--;
+            if (!sawStore && isAnyStoreOp(cpu->arm7, opM, thumb)) {
+                sawStore = true;
+                postStoreLeft = 2; // Match real ARM 2-stage instruction prefetch across self-modifying stores!
+            }
             continue;
         }
 
@@ -2128,7 +2891,7 @@ bool ArmPpcJit::compileBlock(Interpreter *cpu, uint32_t instrPC, uint32_t opcode
         return false;
     }
     bool emitFlagsList[MAX_BLOCK_INSTRS];
-    uint8_t liveFlags = 0xFu; // N,Z,C,V are all considered live exiting the native sequence
+    uint8_t liveFlags = 0xFu;
     for (int m = (int)nativeCount - 1; m >= (int)nativeStart; m--) {
         uint32_t opM = opList[m];
         uint8_t w = thumb ? thumbWrittenFlagsMask((uint16_t)opM) : armWrittenFlagsMask(opM);
@@ -2139,6 +2902,66 @@ bool ArmPpcJit::compileBlock(Interpreter *cpu, uint32_t instrPC, uint32_t opcode
         }
     }
 
+    int16_t totalDelta = (int16_t)((count - 1) * step);
+
+    // Analyse memory properties & self-loop eligibility
+    bool anyMemInPrefix = firstIsLoad;
+    int memLoadCount = firstIsLoad ? 1 : 0;
+    int singleHalfPollBaseReg = -1;
+    uint32_t bodyWrittenRegs = 0;
+    for (uint16_t m = nativeStart; m < nativeCount; m++) {
+        uint32_t opM = opList[m];
+        bodyWrittenRegs |= writtenGuestRegsMask(opM, thumb);
+        bool isMem = thumb ? isAnyMemThumb((uint16_t)opM) : isMemClassArm(opM);
+        if (isMem) {
+            anyMemInPrefix = true;
+            memLoadCount++;
+            if (thumb && (opM & 0xF800u) == 0x8800u) {
+                singleHalfPollBaseReg = (int)((opM >> 3) & 7u);
+            } else if (!thumb && (opM & 0x0E5000F0u) == 0x005000B0u) {
+                uint8_t rn = (uint8_t)((opM >> 16) & 0xFu);
+                if (rn < 8u) singleHalfPollBaseReg = (int)rn;
+                else singleHalfPollBaseReg = -2;
+            } else {
+                singleHalfPollBaseReg = -2;
+            }
+        }
+    }
+
+    // Check if block ends with a backward branch right back to instrPC (hardware self-loop!)
+    bool wantSelfLoop = false;
+    bool isInlineSamePageBr = false;
+    if (hasBranchTerm) {
+        if (!thumb && (branchOpcode & 0x0E000000u) == 0x0A000000u && (branchOpcode >> 28) != 0xFu) {
+            uint32_t brAddr = instrPC + (uint32_t)totalDelta;
+            int32_t off = (int32_t)(branchOpcode << 8) >> 6;
+            uint32_t target = (brAddr + 8u + (uint32_t)off) & ~3u;
+            uint32_t newR15 = target + 4u;
+            int32_t tDelta = (int32_t)newR15 - (int32_t)(instrPC + 8u);
+            if ((((target ^ instrPC) | (newR15 ^ instrPC)) >> 12) == 0 && tDelta >= -0x800 && tDelta <= 0x7FF) {
+                isInlineSamePageBr = true;
+                if (target == instrPC && !firstIsLoad && !sawStore && (branchOpcode & (1u << 24)) == 0u) {
+                    wantSelfLoop = true;
+                }
+            }
+        } else if (thumb && (((branchOpcode & 0xF000u) == 0xD000u && (branchOpcode & 0x0F00u) < 0x0E00u) ||
+                             (branchOpcode & 0xF800u) == 0xE000u)) {
+            uint32_t brAddr = instrPC + (uint32_t)totalDelta;
+            bool isCond = (branchOpcode & 0xF000u) == 0xD000u;
+            int32_t off = isCond ? ((int32_t)(int8_t)(branchOpcode & 0xFFu) << 1)
+                                 : (((int32_t)(int16_t)((uint16_t)branchOpcode << 5)) >> 4);
+            uint32_t target = (brAddr + 4u + (uint32_t)off) & ~1u;
+            uint32_t newR15 = target + 2u;
+            int32_t tDelta = (int32_t)newR15 - (int32_t)(instrPC + 4u);
+            if ((((target ^ instrPC) | (newR15 ^ instrPC)) >> 12) == 0 && tDelta >= -0x800 && tDelta <= 0x7FF) {
+                isInlineSamePageBr = true;
+                if (target == instrPC && !firstIsLoad && !sawStore) {
+                    wantSelfLoop = true;
+                }
+            }
+        }
+    }
+
     // Pass 3: Emit PowerPC code into codePool
     ensureSpace(MAX_BLOCK_WORDS);
     uint32_t *start = codePool + poolWordsUsed;
@@ -2146,11 +2969,12 @@ bool ArmPpcJit::compileBlock(Interpreter *cpu, uint32_t instrPC, uint32_t opcode
     uint16_t prefixCycles = firstIsLoad ? (uint16_t)(cpu->arm7 ? 3 : 1) : 0;
     int16_t appliedPcDelta = 0;
 
-
-    // Any bctrl helper call inside the block clobbers LR; the epilogues restore it from the frame.
-    bool helperInBlock = firstIsLoad || hasPcLoadTerm;
-    for (uint16_t m = nativeStart; m < nativeCount && !thumb; m++) {
-        if (isNativeLoadArm(cpu->arm7, opList[m]) || isNativeStoreArm(opList[m])) helperInBlock = true;
+    bool helperInBlock = firstIsLoad || hasPcLoadTerm || anyMemInPrefix;
+    if (hasBranchTerm) {
+        if (!thumb && ((branchOpcode & 0x0FFFFFF0u) == 0x012FFF10u || (branchOpcode & 0x0FFFFFF0u) == 0x012FFF30u))
+            helperInBlock = true;
+        if (thumb && (branchOpcode & 0xFF00u) == 0x4700u)
+            helperInBlock = true;
     }
 
     if (firstIsLoad) {
@@ -2163,20 +2987,31 @@ bool ArmPpcJit::compileBlock(Interpreter *cpu, uint32_t instrPC, uint32_t opcode
         *p++ = JitPpc::bctrl();
     }
 
+    uint32_t *loopTop = nullptr;
+    if (wantSelfLoop) {
+        *p++ = JitPpc::li(JitPpc::R29, 0); // taken iteration accumulator = 0
+        loopTop = p;
+    }
+
     for (uint16_t m = nativeStart; m < nativeCount; m++) {
         uint32_t opM = opList[m];
-        if (m > 0) {
-            int16_t neededDelta = (int16_t)(m * step);
-            bool readsPC = thumb ? instrReadsPCThumb((uint16_t)opM) : instrReadsPCArm(opM);
-            if (readsPC && appliedPcDelta != neededDelta) {
-                *p++ = JitPpc::lwz(JitPpc::R3, JitPpc::R31, offR15);
-                *p++ = JitPpc::addi(JitPpc::R3, JitPpc::R3, (int16_t)(neededDelta - appliedPcDelta));
+        bool readsPC = thumb ? instrReadsPCThumb((uint16_t)opM) : instrReadsPCArm(opM);
+        if (readsPC) {
+            if (loopTop) {
+                emitLoadImm32(p, JitPpc::R3, instrPC + (uint32_t)((m + 2) * step));
                 *p++ = JitPpc::stw(JitPpc::R3, JitPpc::R31, offR15);
-                appliedPcDelta = neededDelta;
+            } else if (m > 0) {
+                int16_t neededDelta = (int16_t)(m * step);
+                if (appliedPcDelta != neededDelta) {
+                    *p++ = JitPpc::lwz(JitPpc::R3, JitPpc::R31, offR15);
+                    *p++ = JitPpc::addi(JitPpc::R3, JitPpc::R3, (int16_t)(neededDelta - appliedPcDelta));
+                    *p++ = JitPpc::stw(JitPpc::R3, JitPpc::R31, offR15);
+                    appliedPcDelta = neededDelta;
+                }
             }
         }
         int cm = 0;
-        s_emitInstrR15 = instrPC + 8u + (uint32_t)m * 4u;
+        s_emitInstrR15 = instrPC + (uint32_t)((m + 2) * step);
         bool okM = thumb ? emitNativeThumb(p, cpu, (uint16_t)opM, cm, emitFlagsList[m])
                          : emitNativeArm(p, cpu, opM, cm, emitFlagsList[m]);
         assert(okM);
@@ -2184,19 +3019,22 @@ bool ArmPpcJit::compileBlock(Interpreter *cpu, uint32_t instrPC, uint32_t opcode
         prefixCycles = (uint16_t)(prefixCycles + cm);
     }
 
-    int16_t totalDelta = (int16_t)((count - 1) * step);
     int16_t remDelta = (int16_t)(totalDelta - appliedPcDelta);
+    bool emittedLoop = false;
 
     if (hasPcLoadTerm) {
-        // PC-destination load compiled inline (computed branch); no C round-trip.
-        // The scan predicate and the emitter accept exactly the same encodings, so this cannot fail.
         if (!emitPcDestLoadTerminatorArm(p, cpu, branchOpcode, instrPC, totalDelta, prefixCycles, helperInBlock)) {
             return false;
         }
-    } else if (hasBranchTerm && !thumb && emitInlineBranchArm(p, cpu, branchOpcode, instrPC, totalDelta, prefixCycles, helperInBlock)) {
-        // Branch exit compiled inline (same-page ARM B/BL); no C round-trip
+    } else if (hasBranchTerm && !thumb && emitInlineBranchArm(p, cpu, branchOpcode, instrPC, totalDelta, prefixCycles, helperInBlock, loopTop)) {
+        emittedLoop = (loopTop != nullptr);
+    } else if (hasBranchTerm && thumb && emitInlineBranchThumb(p, cpu, (uint16_t)branchOpcode, instrPC, totalDelta, prefixCycles, helperInBlock, loopTop)) {
+        emittedLoop = (loopTop != nullptr);
+    } else if (hasBranchTerm && !thumb && emitInlineBxArm(p, cpu, branchOpcode, instrPC, totalDelta, prefixCycles, helperInBlock)) {
+        // Inline ARM BX / BLX refill
+    } else if (hasBranchTerm && thumb && emitInlineBxThumb(p, cpu, (uint16_t)branchOpcode, instrPC, totalDelta, prefixCycles, helperInBlock)) {
+        // Inline Thumb BX / BLX refill
     } else if (hasBranchTerm) {
-        // Tail-call execBranchThumb / execBranchArm directly without touching LR or syncing dead pipeline state on taken branches
         *p++ = JitPpc::mr(JitPpc::R3, JitPpc::R31);
         emitLoadImm32(p, JitPpc::R4, branchOpcode);
         *p++ = JitPpc::li(JitPpc::R5, remDelta);
@@ -2214,7 +3052,6 @@ bool ArmPpcJit::compileBlock(Interpreter *cpu, uint32_t instrPC, uint32_t opcode
         *p++ = JitPpc::addi(JitPpc::R1, JitPpc::R1, 32);
         *p++ = JitPpc::bctr();
     } else {
-        // Pure native block: synchronize R15, pcData, pipeline[0], pipeline[1] and return prefixCycles directly
         if (remDelta != 0) {
             *p++ = JitPpc::lwz(JitPpc::R3, JitPpc::R31, offR15);
             *p++ = JitPpc::addi(JitPpc::R3, JitPpc::R3, remDelta);
@@ -2250,7 +3087,6 @@ bool ArmPpcJit::compileBlock(Interpreter *cpu, uint32_t instrPC, uint32_t opcode
     JIT_STAT(stats.blockCompiles[cpuIdx]++);
     JIT_STAT(stats.nativeInstrs[cpuIdx] += (nativeCount - nativeStart));
     JIT_STAT(if (firstIsLoad) stats.fallbackInstrs[cpuIdx]++);
-    JIT_STAT(if (hasTerm) stats.fallbackInstrs[cpuIdx]++);
 
     JIT_STAT(if (!stats.firstBlockAddr) {
         stats.firstBlockAddr = start;
@@ -2259,8 +3095,32 @@ bool ArmPpcJit::compileBlock(Interpreter *cpu, uint32_t instrPC, uint32_t opcode
     });
     flushCodeRange(start, words * sizeof(uint32_t));
 
+    // Mark exact 64-byte code lines covered by [instrPC .. instrPC + (count + 2) * step]
+    if ((instrPC >> 27) == 0u) {
+        uint32_t endCodeAddr = instrPC + (uint32_t)((count + 2) * step);
+        for (uint32_t line = (instrPC >> 6); line <= (endCodeAddr >> 6); line++) {
+            codeLineBits[line & (CODE_LINE_WORDS - 1)] |= (1u << (line & 31u));
+        }
+    }
     size_t pageIdx = (instrPC >> 12) & (PAGE_EPOCH_SIZE - 1);
     pageHasBlockBits[cpuIdx][pageIdx >> 5] |= (1u << (pageIdx & 31));
+
+    uint8_t loopCyclesVal = emittedLoop ? (uint8_t)(prefixCycles + 3u) : 0u;
+    uint16_t loopKindFlags = 0u;
+    if (emittedLoop) {
+        if (!anyMemInPrefix) {
+            loopKindFlags = (1u << 10); // Pure register loop: independent of other CPU!
+        } else if (memLoadCount == 1 && singleHalfPollBaseReg >= 0 &&
+                   (bodyWrittenRegs & (1u << singleHalfPollBaseReg)) == 0u) {
+            loopKindFlags = (uint16_t)((3u << 10) | ((uint16_t)singleHalfPollBaseReg << 12));
+        } else {
+            loopKindFlags = (2u << 10); // Shared RAM / IPCSYNC loop
+        }
+    }
+    bool gbaPureAlu = !anyMemInPrefix && !sawStore && !hasPcLoadTerm && (!hasBranchTerm || isInlineSamePageBr);
+    uint16_t metaFlags = (gbaPureAlu ? 0x0100u : 0u) |
+                         (hasBranchTerm ? 0x0200u : 0u) |
+                         loopKindFlags;
 
     entry.pc = instrPC;
     entry.opcode0 = opcode0;
@@ -2278,14 +3138,16 @@ bool ArmPpcJit::compileBlock(Interpreter *cpu, uint32_t instrPC, uint32_t opcode
         }
     }
 #endif
-    entry.instrCount = (uint16_t)(count | (blockPure ? 0x8000u : 0u));
-    entry.prefixCycles = hasTerm ? prefixCycles : (uint16_t)(prefixCycles - 1);
+    entry.instrCount = (uint16_t)((count & 0xFFu) | metaFlags | (blockPure ? 0x8000u : 0u));
+    uint16_t basePref = hasTerm ? prefixCycles : (uint16_t)(prefixCycles - 1);
+    entry.prefixCycles = (uint16_t)((basePref & 0xFFu) | ((uint16_t)loopCyclesVal << 8));
     entry.code = start;
     return true;
 }
 
 template <bool Track>
-FORCE_INLINE int ArmPpcJit::tryExecuteBlock(Interpreter *cpu, uint32_t instrPC, uint32_t opcode, bool thumb, bool &outIsNative0, bool *outPure) {
+FORCE_INLINE int ArmPpcJit::tryExecuteBlock(Interpreter *cpu, uint32_t instrPC, uint32_t opcode, bool thumb,
+                                            bool &outIsNative0, bool *outPure, uint32_t remIndep, uint32_t remShared) {
     if (Track && outPure) *outPure = false;
     if (!cpu->pcData) {
         outIsNative0 = thumb ? canTranslateNativeThumb((uint16_t)opcode) : canTranslateNativeArm(cpu->arm7, opcode);
@@ -2306,7 +3168,6 @@ FORCE_INLINE int ArmPpcJit::tryExecuteBlock(Interpreter *cpu, uint32_t instrPC, 
 
     if (__builtin_expect(hit, 1)) {
         if (__builtin_expect(bEntry.pageEpoch != curPageEpoch, 0)) {
-            // Check if actual instruction words I_2..I_{K-1} changed or if the write was to stack/data on the same page
             if (BLK_N(bEntry.instrCount) <= 2 || computeTailHash(cpu->pcData, BLK_N(bEntry.instrCount), thumb) == bEntry.tailHash) {
                 bEntry.pageEpoch = curPageEpoch;
             } else {
@@ -2316,25 +3177,64 @@ FORCE_INLINE int ArmPpcJit::tryExecuteBlock(Interpreter *cpu, uint32_t instrPC, 
     }
 
     if (__builtin_expect(!hit, 0)) {
+        if (s_candPc[cpuIdx][bIdx] != instrPC) {
+            s_candPc[cpuIdx][bIdx] = instrPC;
+            s_candHits[cpuIdx][bIdx] = 1;
+            return 0;
+        }
+        uint8_t ch = s_candHits[cpuIdx][bIdx];
+        if (ch == 0xFFu)
+            return 0;
+        if (++ch < 3u) {
+            s_candHits[cpuIdx][bIdx] = ch;
+            return 0;
+        }
+
         bool firstIsNative = thumb ? canTranslateNativeThumb((uint16_t)opcode) : canTranslateNativeArm(cpu->arm7, opcode);
         outIsNative0 = firstIsNative;
         bool firstIsLoad   = !firstIsNative && (thumb ? isSingleLoadThumb((uint16_t)opcode) : isSingleLoadArm(opcode));
-        bool firstIsBranch = !thumb && !firstIsNative && !firstIsLoad && isBranchHeadArm(opcode);
+        bool firstIsBranch = !firstIsNative && !firstIsLoad && (thumb ? isBranchHeadThumb(cpu->arm7, (uint16_t)opcode) : isBranchHeadArm(cpu->arm7, opcode));
         bool firstIsPcLoad = !thumb && !firstIsNative && !firstIsLoad && !firstIsBranch && isPcDestLoadTerminatorArm(cpu->arm7, opcode);
-        if (!firstIsNative && !firstIsLoad && !firstIsBranch && !firstIsPcLoad) return 0;
+        if (!firstIsNative && !firstIsLoad && !firstIsBranch && !firstIsPcLoad) {
+            s_candHits[cpuIdx][bIdx] = 0xFFu;
+            return 0;
+        }
         const bool firstIsTerm = firstIsBranch || firstIsPcLoad;
-
-        uint32_t r15After0 = cpu->registersUsr[15];
-        if ((r15After0 & 0xFFFu) < 8u || (r15After0 & 0xFFFu) > 0xF80u) return 0;
-
-        if (thumb) {
-            if (!canTranslateNativeThumb((uint16_t)opcode1) && !isTerminatorBranchThumb(cpu->arm7, (uint16_t)opcode1)) return 0;
-        } else if (!firstIsTerm) {
-            // A branch-first block never executes I_1, so its successor is irrelevant
-            if (((opcode1 >> 28) != 0xEu || !canTranslateNativeArm(cpu->arm7, opcode1)) && !isTerminatorBranchArm(cpu->arm7, opcode1)) return 0;
+        if (firstIsTerm) {
+            bool selfLoop = thumb
+                ? ((opcode & 0xFFFFu) == 0xE7FEu || ((opcode & 0xF0FFu) == 0xD0FEu && ((opcode >> 8) & 0xFu) < 0xEu))
+                : ((opcode & 0x0FFFFFFFu) == 0x0AFFFFFEu);
+            if (!selfLoop) {
+                s_candHits[cpuIdx][bIdx] = 0xFFu;
+                return 0;
+            }
         }
 
+        uint32_t r15After0 = cpu->registersUsr[15];
+        if ((r15After0 & 0xFFFu) < 8u || (r15After0 & 0xFFFu) > 0xF80u) {
+            s_candHits[cpuIdx][bIdx] = 0xFFu;
+            return 0;
+        }
+
+        if (!firstIsTerm) {
+            if (thumb) {
+                if (!canTranslateNativeThumb((uint16_t)opcode1) && !isTerminatorBranchThumb(cpu->arm7, (uint16_t)opcode1)) {
+                    s_candHits[cpuIdx][bIdx] = 0xFFu;
+                    return 0;
+                }
+            } else {
+                if (((opcode1 >> 28) != 0xEu || !canTranslateNativeArm(cpu->arm7, opcode1)) &&
+                    !isTerminatorBranchArm(cpu->arm7, opcode1) &&
+                    !isPcDestLoadTerminatorArm(cpu->arm7, opcode1)) {
+                    s_candHits[cpuIdx][bIdx] = 0xFFu;
+                    return 0;
+                }
+            }
+        }
+
+        s_candHits[cpuIdx][bIdx] = 3u;
         if (!compileBlock(cpu, instrPC, opcode, thumb, bEntry)) {
+            s_candHits[cpuIdx][bIdx] = 0xFFu;
             JIT_STAT(stats.blockCompileFails[cpuIdx]++);
             return 0;
         }
@@ -2344,39 +3244,220 @@ FORCE_INLINE int ArmPpcJit::tryExecuteBlock(Interpreter *cpu, uint32_t instrPC, 
     Core *core = cpu->core;
     uint32_t nextEventCycles = core->events[0].cycles;
     uint32_t shift = (cpu->arm7 && !core->gbaMode) ? 1u : 0u;
-    uint32_t scaledPrefix = (uint32_t)bEntry.prefixCycles << shift;
-    if (__builtin_expect(cpu->cycles + scaledPrefix >= nextEventCycles, 0)) {
+    uint32_t scaledPrefix = (uint32_t)BLK_PREF(bEntry.prefixCycles) << shift;
+    uint32_t startCycles = core->gbaMode ? cpu->cycles : core->globalCycles;
+    if (__builtin_expect(startCycles + scaledPrefix >= nextEventCycles, 0)) {
         outIsNative0 = thumb ? canTranslateNativeThumb((uint16_t)opcode) : canTranslateNativeArm(cpu->arm7, opcode);
         return 0;
     }
 
+    uint32_t maxIters = 1u;
+    uint8_t loopCyc = (uint8_t)BLK_LOOP(bEntry.prefixCycles);
+    if (loopCyc != 0u) {
+        uint8_t kind = (uint8_t)((bEntry.instrCount >> 10) & 3u);
+        bool useIndep = (kind == 1u);
+        if (kind == 3u) {
+            uint32_t baseAddr = cpu->registersUsr[(bEntry.instrCount >> 12) & 7u];
+            useIndep = ((baseAddr - 0x04000000u) < 0x140u); // DISPSTAT / VCOUNT / KEYINPUT!
+        }
+        uint32_t rem = useIndep ? remIndep : remShared;
+        if (rem > 1u) {
+            maxIters = (rem - 1u) / (uint32_t)loopCyc + 1u;
+            if (maxIters > 4096u) maxIters = 4096u;
+        }
+    }
+
     JIT_STAT(stats.blockHits[cpuIdx]++);
     JIT_STAT(stats.blockInstrsExecuted[cpuIdx] += BLK_N(bEntry.instrCount));
-#if NOODS_JIT_LOAD_HIST
-    if (!thumb && isSingleLoadArm(opcode) && !canTranslateNativeArm(cpu->arm7, opcode)) {
-        unsigned bucket = (opcode >> 20) & 0xFFu;
-        s_leadingLoadCount[cpuIdx][bucket]++;
-        s_leadingLoadLast[cpuIdx][bucket] = opcode;
-    }
-#endif
     PROF_MARK(thumb ? 0 : (isSingleLoadArm(opcode) ? 8 : 0));
     if (Track && outPure) {
         int p = thumb ? 0 : armPurity(opcode);
         *outPure = (bEntry.instrCount & 0x8000) && (p == 1 || (p == 2 && armLoadAddrOk(opcode, cpu->registersUsr[(opcode >> 16) & 0xFu])));
     }
-    return jit_enter(bEntry.code, cpu);
+    return jit_enter(bEntry.code, cpu, maxIters);
 }
 
-int ArmPpcJit::executeArm(Interpreter *cpu, uint32_t opcode) {
+bool ArmPpcJit::tryExecuteGbaFast(Interpreter *cpu, uint16_t waitCnt, uint32_t targetCycles) {
+    if (!initialized) init();
+    Core *core = cpu->core;
+
+    bool thumb = (cpu->cpsr & (1u << 5)) != 0u;
+    uint32_t r15Before = cpu->registersUsr[15];
+    uint32_t instrPC = r15Before - (thumb ? 2u : 4u);
+    size_t bIdx = ((instrPC >> (thumb ? 1 : 2)) ^ (instrPC >> 11)) & (BLOCK_TABLE_SIZE - 1);
+    if (s_candPc[1][bIdx] == instrPC && s_candHits[1][bIdx] == 0xFFu)
+        return false;
+
+    uint8_t region = (uint8_t)(instrPC >> 24);
+
+    uint32_t seqCost = 1u;
+    uint32_t deltaTaken = 0u;
+    if (region >= 0x08u) {
+        if ((waitCnt & (1u << 14)) || region >= 0x0Eu) return false;
+        if ((instrPC & 0x1F000u) == 0u || ((instrPC + 64u) & 0x1F000u) == 0u) return false;
+        uint32_t s = (uint32_t)GbaBus::romWaitS(instrPC, waitCnt);
+        uint32_t n = (uint32_t)GbaBus::romWaitN(instrPC, waitCnt);
+        seqCost = thumb ? s : (2u * s);
+        deltaTaken = n - s; // n >= s? Note: romWaitN can be 3 while romWaitS is 5 for WS1/2! Handle signed below!
+        int32_t signedDelta = (int32_t)n - (int32_t)s;
+        if (signedDelta < 0) return false; // Rare inverted waitstate config: fall back cleanly to runGbaOpcode
+        deltaTaken = (uint32_t)signedDelta;
+    } else {
+        if (region == 0x04u) return false;
+        if (region == 0x02u) seqCost = thumb ? 3u : 6u;
+        else if (region == 0x05u || region == 0x06u) seqCost = thumb ? 1u : 2u;
+        else seqCost = 1u;
+    }
+
+    // Must ensure r15 increment for instruction 0 stays inside the mapped page!
+    uint32_t nextR15 = r15Before + (thumb ? 2u : 4u);
+    if ((nextR15 & 0xFFFu) < 8u || (nextR15 & 0xFFFu) > 0xF80u) return false;
+
+    uint32_t opcode0 = cpu->pipeline[0];
+    if (!thumb && (opcode0 >> 28) != 0xEu) {
+        uint8_t c = Interpreter::condition[((opcode0 >> 24) & 0xF0u) | (cpu->cpsr >> 28)];
+        if (c != 1u) return false;
+    }
+
+    // Lookup existing block (or compile if eligible pure ALU!)
+    uint32_t opcode1 = cpu->pipeline[1];
+    BlockEntry &bEntry = blockTable[1][bIdx];
+    uint32_t curPageEpoch = pageEpoch[1][(instrPC >> 12) & (PAGE_EPOCH_SIZE - 1)];
+    uint32_t expectedFlags = (currentEpoch << 2) | (thumb ? 3u : 1u);
+
+    bool hit = (bEntry.pc == instrPC &&
+                bEntry.opcode0 == opcode0 &&
+                bEntry.opcode1 == opcode1 &&
+                bEntry.epochAndFlags == expectedFlags);
+    if (hit && bEntry.pageEpoch != curPageEpoch) {
+        // Note: cpu->pcData currently points to instrPC + step (pipeline[1]); after step 0 advance it points to instrPC + 2*step!
+        uint8_t *pcDataAfter0 = cpu->pcData + (thumb ? 2 : 4);
+        if (BLK_N(bEntry.instrCount) <= 2 || computeTailHash(pcDataAfter0, BLK_N(bEntry.instrCount), thumb) == bEntry.tailHash) {
+            bEntry.pageEpoch = curPageEpoch;
+        } else {
+            hit = false;
+        }
+    }
+
+    if (!hit) {
+        if (s_candPc[1][bIdx] != instrPC) {
+            s_candPc[1][bIdx] = instrPC;
+            s_candHits[1][bIdx] = 1;
+            return false;
+        }
+        uint8_t ch = s_candHits[1][bIdx];
+        if (++ch < 8u) {
+            s_candHits[1][bIdx] = ch;
+            return false;
+        }
+
+        // Quick precheck: reject memory instructions at slot 0 or slot 1 before compiling!
+        bool mem0 = thumb ? isAnyMemThumb((uint16_t)opcode0) : isMemClassArm(opcode0);
+        bool branch0 = thumb ? isBranchHeadThumb(true, (uint16_t)opcode0) : isBranchHeadArm(true, opcode0);
+        bool mem1 = !branch0 && (thumb ? isAnyMemThumb((uint16_t)opcode1) : isMemClassArm(opcode1));
+        if (mem0 || mem1) {
+            s_candHits[1][bIdx] = 0xFFu;
+            return false;
+        }
+        // Temporarily advance pipeline by 1 step (exact same state as runOpcode entry), compile, and if rejected roll back!
+        uint8_t *savedPcData = cpu->pcData;
+        uint32_t savedP0 = cpu->pipeline[0];
+        uint32_t savedP1 = cpu->pipeline[1];
+        cpu->registersUsr[15] = nextR15;
+        cpu->pcData = savedPcData + (thumb ? 2 : 4);
+        cpu->pipeline[0] = savedP1;
+        cpu->pipeline[1] = thumb ? U8TO16(cpu->pcData, 0) : U8TO32(cpu->pcData, 0);
+        bool ok = compileBlock(cpu, instrPC, opcode0, thumb, bEntry);
+        bool worthwhile = ok && (bEntry.instrCount & 0x0100u) &&
+                          (BLK_LOOP(bEntry.prefixCycles) != 0u || BLK_N(bEntry.instrCount) >= 4u);
+        if (!worthwhile) {
+            if (ok) bEntry.epochAndFlags = 0u;
+            s_candHits[1][bIdx] = 0xFFu;
+            cpu->registersUsr[15] = r15Before;
+            cpu->pcData = savedPcData;
+            cpu->pipeline[0] = savedP0;
+            cpu->pipeline[1] = savedP1;
+            return false;
+        }
+        s_candHits[1][bIdx] = 3u;
+    } else {
+        if (!(bEntry.instrCount & 0x0100u) || (BLK_LOOP(bEntry.prefixCycles) == 0u && BLK_N(bEntry.instrCount) < 4u))
+            return false;
+        if (core->gbaBus.active && (bEntry.instrCount & 0x0200u)) return false;
+        // Advance pipeline for instruction 0 before entering block!
+        cpu->registersUsr[15] = nextR15;
+        cpu->pcData += (thumb ? 2 : 4);
+        cpu->pipeline[0] = opcode1;
+        cpu->pipeline[1] = thumb ? U8TO16(cpu->pcData, 0) : U8TO32(cpu->pcData, 0);
+    }
+
+    if (core->gbaBus.active && (bEntry.instrCount & 0x0200u)) {
+        // Rollback pre-advanced pipeline if active prefetcher meets a branch block right after compile
+        cpu->registersUsr[15] = r15Before;
+        cpu->pcData -= (thumb ? 2 : 4);
+        cpu->pipeline[1] = cpu->pipeline[0];
+        cpu->pipeline[0] = opcode0;
+        return false;
+    }
+
+    uint32_t maxSingleCyc = ((uint32_t)BLK_PREF(bEntry.prefixCycles) + 3u) * seqCost + deltaTaken;
+    if (cpu->cycles + maxSingleCyc >= targetCycles) {
+        cpu->registersUsr[15] = r15Before;
+        cpu->pcData -= (thumb ? 2 : 4);
+        cpu->pipeline[1] = cpu->pipeline[0];
+        cpu->pipeline[0] = opcode0;
+        return false;
+    }
+
+    uint32_t maxIters = 1u;
+    uint8_t loopCyc = (uint8_t)BLK_LOOP(bEntry.prefixCycles);
+    if (loopCyc != 0u) {
+        uint32_t iterGbaCyc = (uint32_t)loopCyc * seqCost + deltaTaken;
+        uint32_t rem = targetCycles - cpu->cycles;
+        if (rem > 1u && iterGbaCyc > 0u) {
+            maxIters = (rem - 1u) / iterGbaCyc + 1u;
+            if (maxIters > 4096u) maxIters = 4096u;
+        }
+    }
+
+    JIT_STAT(stats.dispatches[1]++);
+    JIT_STAT(stats.blockHits[1]++);
+    JIT_STAT(stats.blockInstrsExecuted[1] += BLK_N(bEntry.instrCount));
+
+    int rawCyc = jit_enter(bEntry.code, cpu, maxIters);
+    uint32_t taken = 0u;
+    if (loopCyc != 0u) {
+        taken = (uint32_t)rawCyc / (uint32_t)loopCyc;
+    } else if ((bEntry.instrCount & 0x0200u) && rawCyc == (int)BLK_PREF(bEntry.prefixCycles) + 3) {
+        taken = 1u;
+    }
+    uint32_t totalGbaCyc = (uint32_t)rawCyc * seqCost + taken * deltaTaken;
+
+    core->gbaBus.lastFetchUsedDuty = false;
+    if (taken > 0u) {
+        core->gbaBus.active = false;
+        core->gbaBus.count = 0;
+        core->gbaBus.duty = 0;
+    } else if (region < 0x08u) {
+        core->gbaBus.advancePrefetchOnly((int)totalGbaCyc, waitCnt);
+    }
+    core->gbaBus.nextSeq = true;
+    cpu->cycles = (core->globalCycles += totalGbaCyc);
+    core->memory.clearGbaDmaOpenBus();
+    return true;
+}
+
+int ArmPpcJit::executeArm(Interpreter *cpu, uint32_t opcode, uint32_t remIndep, uint32_t remShared) {
 #if NOODS_JIT_POLL_SKIP
+    (void)remIndep; (void)remShared;
     return pollExecArm(cpu, opcode);
 #else
-    return executeArmCore<false>(cpu, opcode, nullptr);
+    return executeArmCore<false>(cpu, opcode, nullptr, remIndep, remShared);
 #endif
 }
 
 template <bool Track>
-int ArmPpcJit::executeArmCore(Interpreter *cpu, uint32_t opcode, bool *outPure) {
+int ArmPpcJit::executeArmCore(Interpreter *cpu, uint32_t opcode, bool *outPure, uint32_t remIndep, uint32_t remShared) {
     if (Track && outPure) *outPure = false;
     PROF_GUARD(cpu->arm7, opcode, false);
     if (!initialized) init();
@@ -2389,9 +3470,9 @@ int ArmPpcJit::executeArmCore(Interpreter *cpu, uint32_t opcode, bool *outPure) 
 #endif
 
 #if NOODS_JIT_BLOCKS
-    // Instructions with bit 27 == 1 (B/BL, LDM/STM, SWI, Coprocessor/CP15) or Rd == 15 never start a block
-    const bool uncondBranch = isBranchHeadArm(opcode); // B/BL (any non-reserved cond) may start a block
-    if ((opcode & 0x08000000u) != 0 && !uncondBranch) {
+    const bool headBranch = isBranchHeadArm(cpu->arm7, opcode);
+    const bool headPushPop = isNativePushPopArm(opcode);
+    if ((opcode & 0x08000000u) != 0 && !headBranch && !headPushPop) {
         if (!cpu->arm7 && (opcode & 0x0F000010u) == 0x0E000010u) {
             JIT_STAT(stats.cp15Exits[0]++);
         } else {
@@ -2403,7 +3484,7 @@ int ArmPpcJit::executeArmCore(Interpreter *cpu, uint32_t opcode, bool *outPure) 
 #endif
         { if (Track && outPure) *outPure = armPure(opcode, cpu->registersUsr[(opcode >> 16) & 0xFu]); return fallbackArm(cpu, opcode); }
     }
-    if ((opcode & 0x0000F000u) == 0x0000F000u && !uncondBranch && !isPcDestLoadTerminatorArm(cpu->arm7, opcode)) {
+    if ((opcode & 0x0000F000u) == 0x0000F000u && !headBranch && !headPushPop && !isPcDestLoadTerminatorArm(cpu->arm7, opcode)) {
         JIT_STAT(stats.fallbackInstrs[cpuIdx]++);
         JIT_STAT(stats.fbClassArm[cpuIdx][(opcode >> 25) & 7]++);
         if (cpuIdx == 1) JIT_STAT({ stats.fbOpc7[(opcode >> 20) & 0xFF]++; stats.fbLast7[(opcode >> 20) & 0xFF] = opcode; });
@@ -2418,19 +3499,17 @@ int ArmPpcJit::executeArmCore(Interpreter *cpu, uint32_t opcode, bool *outPure) 
 
 #if NOODS_JIT_BLOCKS
     bool isNative0 = false;
-    if (int blockCycles = tryExecuteBlock<Track>(cpu, instrPC, opcode, false, isNative0, outPure)) {
+    if (int blockCycles = tryExecuteBlock<Track>(cpu, instrPC, opcode, false, isNative0, outPure, remIndep, remShared)) {
         return blockCycles;
     }
-    if (!isNative0) {
-        JIT_STAT(stats.fallbackInstrs[cpuIdx]++);
-        JIT_STAT(stats.fbClassArm[cpuIdx][(opcode >> 25) & 7]++);
-        if (cpuIdx == 1) JIT_STAT({ stats.fbOpc7[(opcode >> 20) & 0xFF]++; stats.fbLast7[(opcode >> 20) & 0xFF] = opcode; });
+    JIT_STAT(stats.fallbackInstrs[cpuIdx]++);
+    JIT_STAT(stats.fbClassArm[cpuIdx][(opcode >> 25) & 7]++);
+    if (cpuIdx == 1) JIT_STAT({ stats.fbOpc7[(opcode >> 20) & 0xFF]++; stats.fbLast7[(opcode >> 20) & 0xFF] = opcode; });
 #if NOODS_JIT_HOTPC
-        fbSiteRecord(fbHistIdx, fbHistPC, opcode, FBK_FALLBACK);
+    fbSiteRecord(fbHistIdx, fbHistPC, opcode, FBK_FALLBACK);
 #endif
-        { if (Track && outPure) *outPure = armPure(opcode, cpu->registersUsr[(opcode >> 16) & 0xFu]); return fallbackArm(cpu, opcode); }
-    }
-#endif
+    { if (Track && outPure) *outPure = armPure(opcode, cpu->registersUsr[(opcode >> 16) & 0xFu]); return fallbackArm(cpu, opcode); }
+#else
 
     size_t idx = ((instrPC >> 2) ^ (instrPC >> 11)) & (STUB_TABLE_SIZE - 1);
     StubEntry &entry = stubTable[cpuIdx][idx];
@@ -2440,7 +3519,7 @@ int ArmPpcJit::executeArmCore(Interpreter *cpu, uint32_t opcode, bool *outPure) 
         JIT_STAT(stats.stubHits[cpuIdx]++);
     } else {
         void *code = compileStub(cpu, instrPC, opcode, false);
-        expectedFlags = (currentEpoch << 2) | 1u; // Re-read in case compileStub wrapped the pool
+        expectedFlags = (currentEpoch << 2) | 1u;
         entry.pc = instrPC;
         entry.opcode = opcode;
         entry.epochAndFlags = expectedFlags;
@@ -2452,10 +3531,11 @@ int ArmPpcJit::executeArmCore(Interpreter *cpu, uint32_t opcode, bool *outPure) 
     fbSiteRecord(fbHistIdx, fbHistPC, opcode, FBK_STUB);
 #endif
     PROF_MARK(1);
-    return jit_enter(entry.code, cpu);
+    return jit_enter(entry.code, cpu, 1u);
+#endif
 }
 
-int ArmPpcJit::executeThumb(Interpreter *cpu, uint32_t opcode) {
+int ArmPpcJit::executeThumb(Interpreter *cpu, uint32_t opcode, uint32_t remIndep, uint32_t remShared) {
 #if NOODS_JIT_POLL_SKIP
     pollEpoch++;
 #endif
@@ -2471,21 +3551,19 @@ int ArmPpcJit::executeThumb(Interpreter *cpu, uint32_t opcode) {
 
 #if NOODS_JIT_BLOCKS
     bool isNative0 = false;
-    if (int blockCycles = tryExecuteBlock(cpu, instrPC, opcode, true, isNative0)) {
+    if (int blockCycles = tryExecuteBlock(cpu, instrPC, opcode, true, isNative0, nullptr, remIndep, remShared)) {
         return blockCycles;
     }
-    if (!isNative0) {
-        JIT_STAT(stats.fallbackInstrs[cpuIdx]++);
-        JIT_STAT(stats.fbClassThumb[cpuIdx][(opcode >> 13) & 7]++);
+    JIT_STAT(stats.fallbackInstrs[cpuIdx]++);
+    JIT_STAT(stats.fbClassThumb[cpuIdx][(opcode >> 13) & 7]++);
 #if NOODS_JIT_HOTPC
-        fbSiteRecord(2 + cpuIdx, cpu->registersUsr[15] - 4, opcode & 0xFFFFu, FBK_FALLBACK);
+    fbSiteRecord(2 + cpuIdx, cpu->registersUsr[15] - 4, opcode & 0xFFFFu, FBK_FALLBACK);
 #endif
 #if NOODS_JIT_THUMB_HIST
-        if (cpu->arm7) s_thumbFallback7[((uint16_t)opcode >> 10) & 63u]++;
+    if (cpu->arm7) s_thumbFallback7[((uint16_t)opcode >> 10) & 63u]++;
 #endif
-        return fallbackThumb(cpu, opcode);
-    }
-#endif
+    return fallbackThumb(cpu, opcode);
+#else
 
     size_t idx = ((instrPC >> 1) ^ (instrPC >> 11) ^ 0x1357u) & (STUB_TABLE_SIZE - 1);
     StubEntry &entry = stubTable[cpuIdx][idx];
@@ -2503,15 +3581,17 @@ int ArmPpcJit::executeThumb(Interpreter *cpu, uint32_t opcode) {
     }
 
     PROF_MARK(1);
-    return jit_enter(entry.code, cpu);
+    return jit_enter(entry.code, cpu, 1u);
+#endif
 }
 
 void ArmPpcJit::invalidateAddr(bool arm7, uint32_t addr) {
     if (!initialized) return;
+    if ((addr >> 27) != 0u || !hasCodeAtAddr(addr)) return;
     int cpuIdx = arm7 ? 1 : 0;
     size_t pageIdx = (addr >> 12) & (PAGE_EPOCH_SIZE - 1);
-    JIT_STAT(stats.smcInvalidations[cpuIdx]++);
     if (pageHasBlockBits[cpuIdx][pageIdx >> 5] & (1u << (pageIdx & 31))) {
+        JIT_STAT(stats.smcInvalidations[cpuIdx]++);
         pageEpoch[cpuIdx][pageIdx]++;
         if (pageEpoch[cpuIdx][pageIdx] == 0) pageEpoch[cpuIdx][pageIdx] = 1;
     }
@@ -2519,12 +3599,13 @@ void ArmPpcJit::invalidateAddr(bool arm7, uint32_t addr) {
 
 void ArmPpcJit::invalidateSharedAddr(uint32_t addr) {
     if (!initialized) return;
+    if ((addr >> 27) != 0u || !hasCodeAtAddr(addr)) return;
     size_t pageIdx = (addr >> 12) & (PAGE_EPOCH_SIZE - 1);
     size_t wordIdx = pageIdx >> 5;
     uint32_t bitMask = 1u << (pageIdx & 31);
     for (int c = 0; c < 2; c++) {
-        JIT_STAT(stats.smcInvalidations[c]++);
         if (pageHasBlockBits[c][wordIdx] & bitMask) {
+            JIT_STAT(stats.smcInvalidations[c]++);
             pageEpoch[c][pageIdx]++;
             if (pageEpoch[c][pageIdx] == 0) pageEpoch[c][pageIdx] = 1;
         }
@@ -2532,15 +3613,61 @@ void ArmPpcJit::invalidateSharedAddr(uint32_t addr) {
 }
 
 void ArmPpcJit::invalidateRange(bool arm7, uint32_t startAddr, uint32_t endAddr) {
-    if (!initialized) return;
-    uint32_t startPage = startAddr >> 12;
-    uint32_t endPage = endAddr >> 12;
-    if (endPage - startPage > 64) {
-        invalidateCpu(arm7);
+    (void)arm7;
+    if (!initialized || endAddr < startAddr) return;
+    if ((startAddr >> 27) != 0u) return;
+    uint32_t clampedEnd = (endAddr >= 0x08000000u) ? 0x07FFFFFFu : endAddr;
+    uint32_t wStart = startAddr >> 11; // 2 KB chunks (1 word of codeLineBits = 32 x 64B lines)
+    uint32_t wEnd   = clampedEnd >> 11;
+    for (uint32_t w = wStart; w <= wEnd; w++) {
+        uint32_t bits = codeLineBits[w & (CODE_LINE_WORDS - 1)];
+        if (!bits) continue;
+        // At least one 64B code line exists in this 2 KB half-page: bump its 4 KB pageEpoch!
+        size_t pageIdx = (w >> 1) & (PAGE_EPOCH_SIZE - 1);
+        for (int c = 0; c < 2; c++) {
+            if (pageHasBlockBits[c][pageIdx >> 5] & (1u << (pageIdx & 31))) {
+                JIT_STAT(stats.smcInvalidations[c]++);
+                pageEpoch[c][pageIdx]++;
+                if (pageEpoch[c][pageIdx] == 0) pageEpoch[c][pageIdx] = 1;
+            }
+        }
+        w |= 1u; // Skip second half of same 4 KB page since pageEpoch already bumped!
+    }
+    // Clear negative-cache entries on self-modifying code writes so modified instructions can recompile
+    if (startAddr < 0x04000000u)
+        std::memset(s_candHits, 0, sizeof(s_candHits));
+}
+
+void ArmPpcJit::invalidateMapRange(bool arm7, uint32_t startAddr, uint32_t endAddr) {
+    if (!initialized || endAddr <= startAddr) return;
+    int cpuIdx = arm7 ? 1 : 0;
+    // Check 128 KB chunks via pageHasBlockBits words; if no code lives in [startAddr..endAddr) (e.g. VRAMCNT!), zero cost!
+    if (startAddr >= 0x08000000u) {
+        // High BIOS / cartridge window: only invalidate if any block exists at all and PC could alias
         return;
     }
-    for (uint32_t p = startPage; p <= endPage; p++) {
-        invalidateSharedAddr(p << 12);
+    uint32_t clampedEnd = (endAddr > 0x08000000u) ? 0x08000000u : endAddr;
+    uint32_t pStart = startAddr >> 12;
+    uint32_t pEnd   = (clampedEnd - 1u) >> 12;
+    uint32_t wStart = pStart >> 5;
+    uint32_t wEnd   = pEnd >> 5;
+    bool any = false;
+    for (uint32_t w = wStart; w <= wEnd; w++) {
+        uint32_t mask = pageHasBlockBits[cpuIdx][w];
+        if (!mask) continue;
+        for (uint32_t b = 0; b < 32u; b++) {
+            if (!(mask & (1u << b))) continue;
+            uint32_t p = (w << 5) | b;
+            if (p < pStart || p > pEnd) continue;
+            pageEpoch[cpuIdx][p]++;
+            if (pageEpoch[cpuIdx][p] == 0) pageEpoch[cpuIdx][p] = 1;
+            // Invalidate matching entries in blockTable only when code was actually remapped (e.g. TCM/WRAM banking)
+            any = true;
+        }
+    }
+    if (any) {
+        std::memset(blockTable[cpuIdx], 0, sizeof(blockTable[cpuIdx]));
+        JIT_STAT(stats.mapInvalidations[cpuIdx]++);
     }
 }
 

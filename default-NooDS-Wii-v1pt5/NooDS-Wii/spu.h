@@ -52,6 +52,7 @@ public:
     void runGbaSample();
     void runSample();
     void gbaFifoTimer(int timer);
+    void wakeSpuSchedule();
 
     // GBA register accessors
     uint8_t  readGbaSoundCntL(int channel);
@@ -113,7 +114,7 @@ private:
     //   2. Copy from buffers[readIdx] (the buffer NOT currently being written).
     //   3. Clear ready under lock.
     // ---------------------------------------------------------------------------
-    static const int  SPU_BUF_FRAMES = 548;   // == WIIAUD_NDS_FRAMES == WIIAUD_GBA_FRAMES
+    static const int  SPU_BUF_FRAMES = 700;   // == WIIAUD_NDS_FRAMES == WIIAUD_GBA_FRAMES (46.875 Hz * 700 = 32,812.5 Hz -> 60.0 FPS)
     uint32_t          buffers[2][SPU_BUF_FRAMES];
     int               writeIdx    = 0;         // index emulator thread writes to
     uint32_t          bufferPointer = 0;       // how many samples written so far
@@ -132,9 +133,26 @@ private:
     int8_t   gbaWaveDigit         = 0;
     uint16_t gbaNoiseValue        = 0;
 
+    struct GbaAudioFifo {
+        int8_t data[64] = {};
+        uint8_t head = 0;
+        uint8_t sz = 0;
+        inline size_t size() const { return sz; }
+        inline bool empty() const { return sz == 0; }
+        inline void clear() { head = 0; sz = 0; }
+        inline int8_t front() const { return data[head & 63]; }
+        inline void pop_front() { head = (head + 1) & 63; sz--; }
+        inline void push_back(int8_t v) {
+            if (sz < 64) { data[(head + sz) & 63] = v; sz++; }
+        }
+        inline const int8_t& operator[](size_t i) const { return data[(head + i) & 63]; }
+    };
+
     uint8_t  gbaWaveRam[2][16]    = {};
-    std::deque<int8_t> gbaFifos[2];
+    GbaAudioFifo gbaFifos[2];
     int8_t   gbaSampleA = 0, gbaSampleB = 0;
+    uint32_t spuSilentNextCycle   = 0;
+    uint32_t spuSilentBatch       = 1;
 
     uint16_t enabled              = 0;
 

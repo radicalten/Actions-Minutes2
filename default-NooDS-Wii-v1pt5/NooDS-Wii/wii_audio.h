@@ -26,15 +26,15 @@ extern "C" {
 
 #define WIIAUD_OUT_RATE           48000
 #define WIIAUD_FRAMES_PER_BUF     1024
-#define WIIAUD_BUF_BYTES_STEREO   (WIIAUD_FRAMES_PER_BUF * 4)   // 1024 * 2ch * 2bytes
+#define WIIAUD_BUF_BYTES_STEREO   (WIIAUD_FRAMES_PER_BUF * 4)   // 1024 * 2ch * 2bytes (46.875 Hz ASND slice)
 #define WIIAUD_BUF_BYTES_MONO     (WIIAUD_FRAMES_PER_BUF * 2)
 
 #define WIIAUD_NDS_RATE              32768
-#define WIIAUD_NDS_FRAMES_PER_VFRAME 548
+#define WIIAUD_NDS_FRAMES_PER_VFRAME 700
 #define WIIAUD_NDS_FRAMES            WIIAUD_NDS_FRAMES_PER_VFRAME
 
 #define WIIAUD_GBA_RATE              32768
-#define WIIAUD_GBA_FRAMES_PER_VFRAME 548
+#define WIIAUD_GBA_FRAMES_PER_VFRAME 700
 #define WIIAUD_GBA_FRAMES            WIIAUD_GBA_FRAMES_PER_VFRAME
 
 // Compile-time assert: both paths must use identical frame counts so
