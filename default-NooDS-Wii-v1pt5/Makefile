@@ -1,25 +1,22 @@
 .SUFFIXES:
 export DEVKITPRO ?= /opt/devkitpro
 export DEVKITPPC	:= $(DEVKITPRO)/devkitPPC
+export PATH := $(DEVKITPRO)/tools/bin:$(DEVKITPPC)/bin:$(PATH)
 include $(DEVKITPPC)/wii_rules
 
-JIT    ?= 0
-BLOCKS ?= 0
+JIT       ?= 1
+BLOCKS    ?= 1
+POLL_SKIP ?= 0
+JIT_STATS ?= 0
+BROWSER   ?= 0
 FULL_RAM_DUMP ?= 0
 G2_SCRIPTED_INPUT ?= 0
-
-ifeq ($(origin BROWSER),undefined)
-  ifeq ($(JIT),1)
-    BROWSER := 1
-  else
-    BROWSER := 0
-  endif
-endif
+TEST_FAST ?= 0
 
 CC      := $(DEVKITPPC)/bin/powerpc-eabi-g++
 MACHDEP := -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions
 INCLUDES += -I$(DEVKITPRO)/portlibs/wii/include -I$(DEVKITPRO)/portlibs/ppc/include -I$(DEVKITPRO)/libogc/include
-JIT_DEFS := -DNOODS_JIT=$(JIT) -DNOODS_JIT_BLOCKS=$(BLOCKS)
+JIT_DEFS := -DNOODS_JIT=$(JIT) -DNOODS_JIT_BLOCKS=$(BLOCKS) -DNOODS_JIT_POLL_SKIP=$(POLL_SKIP) -DNOODS_JIT_STATS=$(JIT_STATS)
 BROWSER_DEFS := -DNOODS_FORCE_BROWSER=$(BROWSER)
 TEST_DEFS :=
 ifeq ($(FULL_RAM_DUMP),1)
@@ -28,7 +25,10 @@ endif
 ifeq ($(G2_SCRIPTED_INPUT),1)
   TEST_DEFS += -DNOODS_G2_SCRIPTED_INPUT=1
 endif
-CXXFLAGS += -O2 -MMD -MP \
+ifeq ($(TEST_FAST),1)
+  TEST_DEFS += -DNOODS_TEST_FAST=1
+endif
+CXXFLAGS += -O3 -fno-rtti -MMD -MP \
 -DENDIAN_BIG \
 $(JIT_DEFS) \
 $(BROWSER_DEFS) \
