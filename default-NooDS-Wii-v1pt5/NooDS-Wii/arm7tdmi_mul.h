@@ -1,9 +1,8 @@
 /*
     ARM7TDMI Radix-4 Booth Multiplier Carry Flag Model
 
-    Adapted for C++ / NooDS-Wii from zaydlang's reference implementation
-    (https://github.com/zaydlang/multiplication-algorithm), used under the
-    zlib license:
+    Adapted for C++ / NooDS-Wii from zaydlang's multiplication-algorithm
+    reference implementation, used under the zlib license:
 
     Copyright (C) 2024 zaydlang
     Copyright (C) 2026 radicalten
