@@ -31,10 +31,13 @@ ifeq ($(TEST_FAST),1)
 endif
 CXXFLAGS += -O3 -fno-rtti -MMD -MP \
 -DENDIAN_BIG \
+-DNOODS_V172_OPT -DNOODS_V174_OPT -DNOODS_V175_OPT -DNOODS_V176_OPT -DNOODS_V177_OPT -DNOODS_V178_OPT \
 $(JIT_DEFS) \
 $(BROWSER_DEFS) \
 $(TEST_DEFS) \
-$(INCLUDES) $(MACHDEP)
+$(INCLUDES) $(MACHDEP) \
+-finline-limit=1000 -fgcse-after-reload -fpredictive-commoning -ftree-vectorize -flto=auto -fno-stack-protector
+LDFLAGS += -flto=auto -fuse-linker-plugin -Wl,--gc-sections
 
 CONFIG_TAG := jit$(JIT)_blocks$(BLOCKS)_gba$(GBA_JIT)_stats$(JIT_STATS)_browser$(BROWSER)
 ifeq ($(FULL_RAM_DUMP),1)
