@@ -19,5 +19,4 @@ jobs:
       with:
         name: NooDS-Wii
         path: |
-          cd default-NooDS-Wii-v1pt5
-          NooDS-Wii.dol
+          .
