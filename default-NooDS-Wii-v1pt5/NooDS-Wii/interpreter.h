@@ -113,6 +113,44 @@ private:
     static int (Interpreter::*armInstrs[0x1000])(uint32_t);
     static int (Interpreter::*thumbInstrs[0x400])(uint16_t);
 
+    // ── Subroutine-threaded dispatch (v1.980) ───────────────────────────────
+    // Flattened 4-byte direct function pointers, indexed exactly like the
+    // pointer-to-member tables above but callable with a plain load + bctr.
+    // See interpreter_dispatch.cpp for the generated-code comparison.
+    static int (*armInstrsFlat[0x1000])(Interpreter *, uint32_t);
+    static int (*thumbInstrsFlat[0x400])(Interpreter *, uint16_t);
+    static bool dispatchTablesReady;
+    static void buildDispatchTables();
+    static int armLegacyFallback(Interpreter *cpu, uint32_t opcode);
+    static int thumbLegacyFallback(Interpreter *cpu, uint16_t opcode);
+
+    static inline int armIndex(uint32_t opcode) {
+        return ((opcode >> 16) & 0xFF0) | ((opcode >> 4) & 0xF);
+    }
+    static inline int thumbIndex(uint32_t opcode) {
+        return (opcode >> 6) & 0x3FF;
+    }
+
+    // Dispatch one ARM instruction through the threaded table.
+    static inline int execArm(Interpreter *cpu, uint32_t opcode) {
+#if NOODS_THREADED_DISPATCH
+        return armInstrsFlat[armIndex(opcode)](cpu, opcode);
+#else
+        return (cpu->*armInstrs[armIndex(opcode)])(opcode);
+#endif
+    }
+
+    // Dispatch one THUMB instruction through the threaded table.  The handler
+    // signature is (uint16_t); opcode is passed unmodified because every call
+    // site already hands over a 32-bit value whose low half is the opcode.
+    static inline int execThumb(Interpreter *cpu, uint32_t opcode) {
+#if NOODS_THREADED_DISPATCH
+        return thumbInstrsFlat[thumbIndex(opcode)](cpu, (uint16_t)opcode);
+#else
+        return (cpu->*thumbInstrs[thumbIndex(opcode)])((uint16_t)opcode);
+#endif
+    }
+
     static const uint8_t condition[0x100];
     static const uint8_t bitCount[0x100];
 

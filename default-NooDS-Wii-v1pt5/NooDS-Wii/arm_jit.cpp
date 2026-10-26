@@ -279,11 +279,13 @@ uint32_t ArmPpcJit::codeLineBits[ArmPpcJit::CODE_LINE_WORDS];
 ArmPpcJit::Stats ArmPpcJit::stats = {};
 
 int ArmPpcJit::fallbackArm(Interpreter *cpu, uint32_t opcode) {
-    return (cpu->*Interpreter::armInstrs[((opcode >> 16) & 0xFF0) | ((opcode >> 4) & 0xF)])(opcode);
+    // v1.980: routed through the flattened subroutine-threaded table.
+    return Interpreter::execArm(cpu, opcode);
 }
 
 int ArmPpcJit::fallbackThumb(Interpreter *cpu, uint32_t opcode) {
-    return (cpu->*Interpreter::thumbInstrs[(opcode >> 6) & 0x3FF])((uint16_t)opcode);
+    // v1.980: routed through the flattened subroutine-threaded table.
+    return Interpreter::execThumb(cpu, opcode);
 }
 
 uintptr_t ArmPpcJit::resolveArmHandler(uint32_t opcode) {
@@ -306,7 +308,7 @@ int ArmPpcJit::condBranchArm(Interpreter *cpu, uint32_t opcode) {
     switch (Interpreter::condition[((opcode >> 24) & 0xF0) | (cpu->cpsr >> 28)]) {
         case 0: return 1;
         case 2: return cpu->handleReserved(opcode);
-        default: return (cpu->*Interpreter::armInstrs[((opcode >> 16) & 0xFF0) | ((opcode >> 4) & 0xF)])(opcode);
+        default: return Interpreter::execArm(cpu, opcode);
     }
 }
 

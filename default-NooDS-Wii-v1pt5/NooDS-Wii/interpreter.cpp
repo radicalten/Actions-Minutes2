@@ -84,6 +84,8 @@ void Interpreter::loadState(FILE *file) {
 }
 
 void Interpreter::init() {
+    // v1.980: build the flattened subroutine-threaded dispatch tables once.
+    buildDispatchTables();
     // Prepare to boot the BIOS
     spsrFiq = spsrSvc = spsrAbt = spsrIrq = spsrUnd = 0x10;
     setCpsr(0x000000D3); // Supervisor, interrupts off
@@ -348,7 +350,7 @@ FORCE_INLINE int Interpreter::runOpcode(uint32_t remIndep, uint32_t remShared) {
                 pipeline[1] = (((*registers[15] += 2) & 0xFFE) && pcData) ? U8TO16(pcData += 2, 0) : getOpcode16();
                 core->memory.mpuDataCheckActive = true;
                 dataAbort = false;
-                cyc = (this->*thumbInstrs[(opcode >> 6) & 0x3FF])(opcode);
+                cyc = execThumb(this, opcode);
                 core->memory.mpuDataCheckActive = false;
             }
             else {
@@ -362,7 +364,7 @@ FORCE_INLINE int Interpreter::runOpcode(uint32_t remIndep, uint32_t remShared) {
                         break;
                     default:
                         core->memory.mpuDataCheckActive = true; dataAbort = false;
-                        cyc = (this->*armInstrs[((opcode >> 16) & 0xFF0) | ((opcode >> 4) & 0xF)])(opcode);
+                        cyc = execArm(this, opcode);
                         core->memory.mpuDataCheckActive = false;
                         break;
                 }
@@ -390,9 +392,9 @@ FORCE_INLINE int Interpreter::runOpcode(uint32_t remIndep, uint32_t remShared) {
         // Execute a THUMB instruction
 #if NOODS_JIT
         cyc = Settings::armJit ? ArmPpcJit::executeThumb(this, opcode, remIndep, remShared)
-                               : (this->*thumbInstrs[(opcode >> 6) & 0x3FF])(opcode);
+                               : execThumb(this, opcode);
 #else
-        cyc = (this->*thumbInstrs[(opcode >> 6) & 0x3FF])(opcode);
+        cyc = execThumb(this, opcode);
 #endif
     }
     else { // ARM mode
@@ -405,9 +407,9 @@ FORCE_INLINE int Interpreter::runOpcode(uint32_t remIndep, uint32_t remShared) {
             case 2: cyc = handleReserved(opcode); break; // Reserved
 #if NOODS_JIT
             default: cyc = Settings::armJit ? ArmPpcJit::executeArm(this, opcode, remIndep, remShared)
-                                            : (this->*armInstrs[((opcode >> 16) & 0xFF0) | ((opcode >> 4) & 0xF)])(opcode); break;
+                                            : execArm(this, opcode); break;
 #else
-            default: cyc = (this->*armInstrs[((opcode >> 16) & 0xFF0) | ((opcode >> 4) & 0xF)])(opcode); break;
+            default: cyc = execArm(this, opcode); break;
 #endif
         }
     }
@@ -475,13 +477,13 @@ void Interpreter::runGbaOpcode() {
     core->memory.gbaCpuExecActive = true;
     int baseCyc;
     if (thumb) {
-        baseCyc = (this->*thumbInstrs[(opcode >> 6) & 0x3FF])(opcode);
+        baseCyc = execThumb(this, opcode);
     }
     else {
         switch (condition[((opcode >> 24) & 0xF0) | (cpsr >> 28)]) {
             case 0: baseCyc = 1; break;
             case 2: baseCyc = handleReserved(opcode); break;
-            default: baseCyc = (this->*armInstrs[((opcode >> 16) & 0xFF0) | ((opcode >> 4) & 0xF)])(opcode); break;
+            default: baseCyc = execArm(this, opcode); break;
         }
     }
     core->memory.gbaCpuExecActive = false;
