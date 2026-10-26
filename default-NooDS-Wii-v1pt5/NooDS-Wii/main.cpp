@@ -634,12 +634,8 @@ alignas(32) static uint32_t tempBuffer[NDS_SCREEN_WIDTH * NDS_SCREEN_HEIGHT * 8]
 #include "arm_jit.h"
 #endif
 
-// Defined below; the emulator thread raises this flag when a test finishes.
-static void requestCleanShutdown();
-
 struct NoodsTestHarness {
     static uint32_t maxFrames;
-    static bool holdOpenAfterTest;
     static std::vector<uint32_t> checkpoints;
     static uint32_t poolLimitWords;
 #if NOODS_G2_SCRIPTED_INPUT
@@ -681,7 +677,6 @@ struct NoodsTestHarness {
 
     static void tryAutoboot() {
         maxFrames = 0;
-        holdOpenAfterTest = false;
         checkpoints.clear();
         poolLimitWords = 0;
 #if NOODS_G2_SCRIPTED_INPUT
@@ -708,8 +703,6 @@ struct NoodsTestHarness {
                         firstLine = false;
                     } else if (line.rfind("MAX_FRAMES=", 0) == 0) {
                         maxFrames = (uint32_t)strtoul(line.c_str() + 11, nullptr, 10);
-                    } else if (line.rfind("HOLD_OPEN=", 0) == 0) {
-                        holdOpenAfterTest = (strtoul(line.c_str() + 10, nullptr, 10) != 0);
                     } else if (line.rfind("CHECKPOINTS=", 0) == 0) {
                         const char* p = line.c_str() + 12;
                         while (*p) {
@@ -926,6 +919,8 @@ struct NoodsTestHarness {
                 fflush(ff);
                 fclose(ff);
             }
+            fatUnmount("sd");
+            fatInitDefault();
         }
 
         SYS_Report("[NOODS] CHECKPOINT frame=%u cyc=%u mem=%016llX fb=%016llX us=%llu\n",
@@ -934,19 +929,13 @@ struct NoodsTestHarness {
                    (unsigned long long)accumFrameUs);
 
         if (maxFrames > 0 && currentFrame >= maxFrames) {
-            SYS_Report("[NOODS] MAX_FRAMES_DONE frame=%u hold=%d\n", currentFrame, (int)holdOpenAfterTest);
+            SYS_Report("[NOODS] MAX_FRAMES_DONE frame=%u\n", currentFrame);
             runEmulatorThread = false;
-            // A finished test run ends the process; the main loop does the
-            // join/teardown.  HOLD_OPEN=1 in autoboot.txt keeps it alive so the
-            // final on-screen result can be inspected.
-            if (!holdOpenAfterTest)
-                requestCleanShutdown();
         }
     }
 };
 
 uint32_t NoodsTestHarness::maxFrames = 0;
-bool     NoodsTestHarness::holdOpenAfterTest = false;
 std::vector<uint32_t> NoodsTestHarness::checkpoints;
 uint32_t NoodsTestHarness::poolLimitWords = 0;
 #if NOODS_G2_SCRIPTED_INPUT
@@ -983,76 +972,6 @@ static void StopAndDeleteCore() {
         delete ndsCore;
         ndsCore = nullptr;
     }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Clean shutdown
-//
-// Previously the only ways out of the process were the HOME button and the
-// settings-menu "Quit to Wii Menu" item.  Everything else — a finished autoboot
-// test run, a console power-off, or the host closing the emulator — left the
-// main loop spinning forever, so the emulator had to be force-quit.
-//
-// Two-stage on purpose, because the trigger can fire on any thread:
-//   • requestCleanShutdown() only raises a flag.  Called from the emulator
-//     thread (MAX_FRAMES_DONE) or from a libogc power/reset callback, where
-//     joining our own thread (or tearing down FatFs) would deadlock.
-//   • NoodsCleanShutdown() performs the join/teardown and exits.  Only ever
-//     called from the main loop thread.
-// ─────────────────────────────────────────────────────────────────────────────
-static volatile bool g_shutdownRequested = false;
-static volatile bool g_shutdownStarted   = false;
-static bool          g_sdMounted         = false;
-static bool          g_settingsLoaded    = false;
-
-static void requestCleanShutdown() {
-    g_shutdownRequested = true;
-}
-
-static void NoodsCleanShutdown() {
-    if (g_shutdownStarted) return;
-    g_shutdownStarted = true;
-
-    runEmulatorThread = false;
-    runAudioThread    = false;
-    PPCCompilerBarrier();
-    KThreadJoin(&emulatorThread);
-    ShutdownAudio();
-    StopAndDeleteCore();
-
-    // Persist settings only if the user actually had a noods.ini, so a test run
-    // never rewrites the harness-pinned configuration.
-    if (g_settingsLoaded) Settings::save();
-
-    // A clean quit must leave the SD card consistent: the harness writes
-    // g2_state.log / mem_dump.bin / gbaout.log and the emulator writes save
-    // files, all through FatFs on top of the host's SD image.  Unmounting
-    // commits them instead of losing them with the process.
-    if (g_sdMounted) {
-        SYS_Report("[NOODS] SHUTDOWN clean sd_flushed=1\n");
-        fatUnmount("sd");
-        g_sdMounted = false;
-    } else {
-        SYS_Report("[NOODS] SHUTDOWN clean sd_flushed=0\n");
-    }
-
-    // Hand control back to the loader.  On hardware this reboots to the System
-    // Menu; under Dolphin it is the normal end-of-application path, which is
-    // what lets the emulator close instead of being killed.
-    WPAD_Shutdown();
-    SYS_ResetSystem(SYS_RETURNTOMENU, 0, 0);
-    exit(0);
-}
-
-// Power button / console reset: on hardware these mean "the user wants the
-// console off", so save and quit rather than ignore it.  These callbacks run on
-// the reset-button thread, so they only request; the main loop does the work.
-static void NoodsPowerCallback() {
-    requestCleanShutdown();
-}
-
-static void NoodsResetCallback(u32 /*irq*/, void* /*ctx*/) {
-    requestCleanShutdown();
 }
 
 static sptr EmulatorThreadMain(void* /*arg*/) {
@@ -1213,12 +1132,10 @@ static void InitializeNDS() {
     InitializeSettings();
 
     if (fatInitDefault()) {
-        g_sdMounted = true;
         FILE* iniProbe = fopen("sd:/noods.ini", "r");
         if (iniProbe) {
             fclose(iniProbe);
             Settings::load("sd:/");
-            g_settingsLoaded = true;
         }
         UpdateFileBrowser(currentDir);
 #if NOODS_FORCE_BROWSER
@@ -1492,8 +1409,14 @@ static void ReturnToFileBrowserFromGame() {
 }
 
 static void QuitToWiiMenuSafely() {
-    // Settings-menu "Quit to Wii Menu" — same teardown as HOME and power-off.
-    NoodsCleanShutdown();
+    // Safe quit to Wii Menu / Homebrew Channel — mirrors HOME button path
+    Settings::save();
+    runEmulatorThread = false;
+    PPCCompilerBarrier();
+    KThreadJoin(&emulatorThread);
+    ShutdownAudio();
+    StopAndDeleteCore();
+    exit(0);
 }
 
 static uint16_t MapInputsToNDS(const ControllerState& cs, bool gbaMode) {
@@ -1759,7 +1682,12 @@ static void ScanWiiInputs() {
 
     // HOME always quits cleanly.
     if ((pressed & WPAD_BUTTON_HOME) || (pressed & WPAD_CLASSIC_BUTTON_HOME)) {
-        NoodsCleanShutdown();
+        runEmulatorThread = false;
+        PPCCompilerBarrier();
+        KThreadJoin(&emulatorThread);
+        ShutdownAudio();
+        StopAndDeleteCore();
+        exit(0);
     }
 
     // -----------------------------------------------------------------------
@@ -2062,10 +1990,6 @@ int main(int /*argc*/, char** /*argv*/) {
     PAD_Init();
     WPAD_Init();
 
-    // Console power-off / reset now save and exit cleanly instead of wedging.
-    SYS_SetPowerCallback(NoodsPowerCallback);
-    SYS_SetResetCallback(NoodsResetCallback);
-
     InitializeNDS();
 
 #if NOODS_DISPATCH_BENCH
@@ -2074,11 +1998,6 @@ int main(int /*argc*/, char** /*argv*/) {
 #endif
 
     while (true) {
-        // Any thread may have asked to quit (finished test run, power-off,
-        // reset).  The teardown joins threads, so it happens here.
-        if (g_shutdownRequested)
-            NoodsCleanShutdown();
-
         ScanWiiInputs();
 
         const uint32_t* renderTop    = nullptr;
