@@ -13,6 +13,9 @@ BROWSER   ?= 0
 FULL_RAM_DUMP ?= 0
 G2_SCRIPTED_INPUT ?= 0
 TEST_FAST ?= 0
+THREADED ?= 1
+DISPATCH_BENCH ?= 0
+BENCH_WEIGHT ?= 1
 
 CC      := $(DEVKITPPC)/bin/powerpc-eabi-g++
 MACHDEP := -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions
@@ -33,13 +36,17 @@ CXXFLAGS += -O3 -fno-rtti -MMD -MP \
 -DENDIAN_BIG \
 -DNOODS_V172_OPT -DNOODS_V174_OPT -DNOODS_V175_OPT -DNOODS_V176_OPT -DNOODS_V177_OPT -DNOODS_V178_OPT \
 $(JIT_DEFS) \
+-DNOODS_THREADED_DISPATCH=$(THREADED) \
+-DNOODS_DISPATCH_BENCH=$(DISPATCH_BENCH) \
+-DBENCH_WEIGHT=$(BENCH_WEIGHT) \
+-DNOODS_V1980_OPT \
 $(BROWSER_DEFS) \
 $(TEST_DEFS) \
 $(INCLUDES) $(MACHDEP) \
 -finline-limit=1000 -fgcse-after-reload -fpredictive-commoning -ftree-vectorize -flto=auto -fno-stack-protector
 LDFLAGS += -flto=auto -fuse-linker-plugin -Wl,--gc-sections
 
-CONFIG_TAG := jit$(JIT)_blocks$(BLOCKS)_gba$(GBA_JIT)_stats$(JIT_STATS)_browser$(BROWSER)
+CONFIG_TAG := jit$(JIT)_blocks$(BLOCKS)_gba$(GBA_JIT)_stats$(JIT_STATS)_browser$(BROWSER)_thr$(THREADED)_bw$(BENCH_WEIGHT)
 ifeq ($(FULL_RAM_DUMP),1)
   CONFIG_TAG := $(CONFIG_TAG)_fullram
 endif
