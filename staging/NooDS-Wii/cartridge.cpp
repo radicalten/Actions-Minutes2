@@ -95,7 +95,11 @@ bool Cartridge::loadRom() {
 }
 
 void Cartridge::loadRomSection(size_t offset, size_t size) {
-    if (rom) delete[] rom;
+    // Allocation may throw: leave a null pointer after releasing the old
+    // section so constructor unwinding cannot delete it a second time.
+    delete[] rom;
+    // The store must survive optimization even if the allocation unwinds.
+    *static_cast<uint8_t * volatile *>(&rom) = nullptr;
     rom = new uint8_t[size];
     fseek(romFile, offset, SEEK_SET);
     fread(rom, sizeof(uint8_t), size, romFile);
@@ -801,9 +805,11 @@ void CartridgeGba::loadState(FILE *file) {
 static uint8_t *s_gbaArena1Base  = nullptr;
 static size_t   s_gbaArena1Bytes = 0;
 static size_t   s_gbaArena1Used  = 0;
+static size_t   s_jitArena1Bytes = 0;
 
-// Reclaim MEM1 (1T-SRAM) space left stranded after libogc's _sbrk_r jumps one-way to MEM2.
-static uint8_t *AllocGbaArena1Bank(size_t allocBytes) {
+// Reserve the available arena once, then share it between the active NDS JIT
+// and GBA ROM banks. Only reconfigure between cores, after old code is dead.
+static void InitSharedArena1() {
     if (!s_gbaArena1Base) {
         PPCIrqState st = PPCIrqLockByMsr();
         uintptr_t lo = ((uintptr_t)SYS_GetArena1Lo() + 31u) & ~(uintptr_t)31u;
@@ -817,6 +823,19 @@ static uint8_t *AllocGbaArena1Bank(size_t allocBytes) {
         }
         PPCIrqUnlockByMsr(st);
     }
+}
+
+void *Wii_ConfigureJitArena(bool standaloneGba, size_t *bytes) {
+    InitSharedArena1();
+    s_jitArena1Bytes = standaloneGba ? 0 : std::min(s_gbaArena1Bytes, size_t(6u * 1024u * 1024u));
+    if (s_jitArena1Bytes < 1024u * 1024u) s_jitArena1Bytes = 0;
+    s_gbaArena1Used = s_jitArena1Bytes;
+    *bytes = s_jitArena1Bytes;
+    return s_jitArena1Bytes ? s_gbaArena1Base : nullptr;
+}
+
+static uint8_t *AllocGbaArena1Bank(size_t allocBytes) {
+    InitSharedArena1();
     if (s_gbaArena1Base && s_gbaArena1Used + allocBytes <= s_gbaArena1Bytes) {
         uint8_t *p = s_gbaArena1Base + s_gbaArena1Used;
         s_gbaArena1Used += allocBytes;
@@ -850,7 +869,7 @@ void CartridgeGba::freeGbaBanks() {
         }
     }
 #ifdef GEKKO
-    s_gbaArena1Used = 0;
+    s_gbaArena1Used = s_jitArena1Bytes;
 #endif
 }
 
@@ -922,6 +941,12 @@ bool CartridgeGba::loadRom() {
         if (!buf)
             buf = (uint8_t*)memalign(32, allocBytes);
         if (!buf) {
+#ifdef GEKKO
+            if (FILE *diag = fopen("sd:/gba_alloc_debug.txt", "w")) {
+                fprintf(diag, "bank=%zu loaded=%zu requested=%zu arena1bytes=%zu arena1used=%zu arena1lo=%p arena1hi=%p arena2lo=%p arena2hi=%p\n", b, loadedBytes, allocBytes, s_gbaArena1Bytes, s_gbaArena1Used, SYS_GetArena1Lo(), SYS_GetArena1Hi(), SYS_GetArena2Lo(), SYS_GetArena2Hi());
+                fclose(diag);
+            }
+#endif
             fclose(romFile);
             romFile = nullptr;
             freeGbaBanks();

@@ -152,6 +152,15 @@ Core::Core(std::string ndsRom, std::string gbaRom, int id,
     tasks[GBA_SIO_TRANSFER] = SchedCallback(shim_gbaSioTransfer, &memory);
 
 #if NOODS_JIT
+#ifdef GEKKO
+    // This is the only active core: the previous core and its JIT entries must
+    // already be destroyed before sharing this arena with either code or ROM.
+    extern void *Wii_ConfigureJitArena(bool standaloneGba, size_t *bytes);
+    size_t jitBytes = 0;
+    const bool jitGbaOnly = (gbaRom != "" || gbaRomFd != -1) && ndsRom == "" && ndsRomFd == -1;
+    void *jitMemory = Wii_ConfigureJitArena(jitGbaOnly, &jitBytes);
+    ArmPpcJit::configureCodePool(jitMemory, jitBytes);
+#endif
     ArmPpcJit::reset();
 #endif
 
@@ -292,7 +301,10 @@ void Core::loadState(FILE* file) {
 // ---------------------------------------------------------------------------
 // updateRun — select the tightest interpreter loop for the current state
 // ---------------------------------------------------------------------------
+uint32_t g_evCnt[12];
+
 void Core::updateRun() {
+    g_evCnt[7]++;
     if (interpreter[0].halted && interpreter[1].halted)
         runFunc = &Interpreter::runCoreNone;
     else if (gbaMode)
@@ -305,6 +317,9 @@ void Core::updateRun() {
         runFunc = &Interpreter::runCoreSingle<true, 1>;
     else
         runFunc = &Interpreter::runCoreSingle<false, 0>;
+#if NOODS_JIT
+    ArmPpcJit::setSolo(runFunc == &Interpreter::runCoreSingle<false, 0>);
+#endif
 
     PPCIrqState st = PPCIrqLockByMsr();
     running = 0;
@@ -384,6 +399,7 @@ void Core::enterGbaMode() {
 void Core::endFrame() {
     PPCIrqState st = PPCIrqLockByMsr();
     running = 0;
+    frameEnded = true;
     PPCIrqUnlockByMsr(st);
 
     fpsCount++;

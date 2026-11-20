@@ -36,6 +36,8 @@ public:
     void drawGbaScanline(int line);
     void drawScanline(int line);
 
+    void finishGx2D();
+
     uint32_t *getFramebuffer() { return framebuffer; }
     uint32_t *getRawLine() { return layers[0]; }
 
@@ -68,6 +70,8 @@ public:
     void writeMasterBright(uint16_t mask, uint16_t value);
 
 private:
+    bool queueGxTextLine(int line);
+    bool queueGxBitmapLine(int line);
     Core *core;
     bool engine;
 
@@ -121,7 +125,32 @@ private:
     // precomputed per-scanline window mask (valid after updateWindows)
     uint8_t winMaskCache[256] = {};
     bool winMaskValid = false;
+    bool soloTextLine(int bg, int line, uint32_t backdrop, bool raw);
+    bool soloBitmapLine(int bg, int line, uint32_t backdrop, bool raw); // v1.118
+    bool l1Needed = true; // v1.114: this line needs the second (underneath) layer
     void buildWindowMask(int line);
+
+    // v1.80: one parsed active-object list per scanline. It replaces the old
+    // OAM rescan in each of the two object passes while preserving OAM order.
+    struct ObjectLine {
+        uint16_t object[3];
+        int16_t x;
+        int16_t spriteY;
+        uint8_t width;
+        uint8_t height;
+        uint8_t width2;
+        uint8_t height2;
+        int8_t priority;
+        uint8_t type;
+    } __attribute__((aligned(4)));
+    ObjectLine objectLine[128] = {};
+    int objectLineCount = 0;
+    int buildObjectLine(int line);
+    // v1.123: which OAM entries can touch each line, rebuilt when OAM is written
+    uint32_t objMask[192][4] = {};
+    uint32_t objMaskGen = 0;
+    void buildObjectMask();
+    int buildObjectLineDs(int line);
     static uint8_t s_brightIncTable[64][17];
     static uint8_t s_brightDecTable[64][17];
     static bool s_brightTablesReady;
@@ -137,8 +166,11 @@ private:
 
     template <bool gbaMode> void drawText(int bg, int line);
     template <bool gbaMode> void drawAffine(int bg, int line);
+    template <bool gbaMode> void drawAffineImpl(int bg, int line);
     void drawExtended(int bg, int line);
     void drawExtendedGba(int bg, int line);
     void drawLarge(int bg, int line);
+    bool objReference = false; // diagnostic dual-render only
     template <bool gbaMode> void drawObjects(int line, bool window);
+    template <bool gbaMode> void drawObjectsImpl(int line, bool window);
 };

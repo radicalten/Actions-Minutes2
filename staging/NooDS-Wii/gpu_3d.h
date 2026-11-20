@@ -38,6 +38,7 @@ struct Entry {
     uint8_t command;
     uint32_t param;
 
+    Entry(): command(0), param(0) {}
     Entry(uint8_t command, uint32_t param): command(command), param(param) {}
 };
 
@@ -152,12 +153,48 @@ public:
     void writeVecTest(uint32_t mask, uint32_t value);
     void writeGxStat(uint32_t mask, uint32_t value);
 
+    // v1.115: whole-word write to a geometry command port
+    void writeCommandPort(uint32_t cmd, uint32_t value) { addEntry(Entry(cmd, value)); }
+    // v1.117: is this (word-aligned) address a geometry command port, and for which command
+    static inline bool commandPort(uint32_t address, uint32_t &cmd) {
+        const uint32_t off = address - 0x4000440;
+        if (off >= 0x18C || (off & 3)) return false;
+        cmd = (off >> 2) + 0x10;
+        static const uint32_t valid[4] = { 0x1FFF0000u, 0x001F0FFFu, 0x00010003u, 0x00070001u };
+        return (valid[cmd >> 5] & (1u << (cmd & 31))) != 0;
+    }
+
 private:
     Core *core;
 
     GXState state = GX_IDLE;
 
-    std::deque<Entry> fifo;
+    // v1.111: growable ring buffer instead of std::deque (every geometry command parameter
+    // goes through here)
+    struct EntryFifo {
+        Entry *buf = nullptr;
+        uint32_t cap = 0, head = 0, count = 0;
+        ~EntryFifo() { delete[] buf; }
+        size_t size() const { return count; }
+        bool empty() const { return count == 0; }
+        Entry &front() { return buf[head]; }
+        Entry &operator[](size_t i) { return buf[(head + i) & (cap - 1)]; }
+        void clear() { head = count = 0; }
+        void pop_front() { head = (head + 1) & (cap - 1); count--; }
+        void push_back(const Entry &e) {
+            if (count == cap) grow();
+            buf[(head + count) & (cap - 1)] = e;
+            count++;
+        }
+        void grow() {
+            const uint32_t ncap = cap ? cap * 2 : 1024;
+            Entry *nb = new Entry[ncap];
+            for (uint32_t i = 0; i < count; i++) nb[i] = buf[(head + i) & (cap - 1)];
+            delete[] buf;
+            buf = nb; cap = ncap; head = 0;
+        }
+    };
+    EntryFifo fifo;
     uint32_t pipeSize = 0;
     uint32_t testQueue = 0;
     uint32_t matrixQueue = 0;
@@ -166,10 +203,14 @@ private:
 
     uint8_t matrixMode = 0;
     bool clipDirty = false;
+    uint8_t clipSmall = 2; // v1.117: 1 = upper rows of the clip matrix are small (see addVertex), 2 = not checked yet
 
     Matrix projection, projectionStack;
     Matrix coordinate, coordinateStack[32];
     Matrix direction, directionStack[32];
+#if NOODS_GX_NORMAL_MATH
+    uint8_t directionSmall = 2; // 2 = recheck 3x3 matrix on next NORMAL
+#endif
     Matrix texture, textureStack;
     Matrix clip;
 
@@ -226,17 +267,17 @@ private:
     void mtxStoreCmd(uint32_t param);
     void mtxRestoreCmd(uint32_t param);
     void mtxIdentityCmd();
-    void mtxLoad44Cmd(std::vector<uint32_t> &params);
-    void mtxLoad43Cmd(std::vector<uint32_t> &params);
-    void mtxMult44Cmd(std::vector<uint32_t> &params);
-    void mtxMult43Cmd(std::vector<uint32_t> &params);
-    void mtxMult33Cmd(std::vector<uint32_t> &params);
-    void mtxScaleCmd(std::vector<uint32_t> &params);
-    void mtxTransCmd(std::vector<uint32_t> &params);
+    void mtxLoad44Cmd(const uint32_t *params);
+    void mtxLoad43Cmd(const uint32_t *params);
+    void mtxMult44Cmd(const uint32_t *params);
+    void mtxMult43Cmd(const uint32_t *params);
+    void mtxMult33Cmd(const uint32_t *params);
+    void mtxScaleCmd(const uint32_t *params);
+    void mtxTransCmd(const uint32_t *params);
     void colorCmd(uint32_t param);
     void normalCmd(uint32_t param);
     void texCoordCmd(uint32_t param);
-    void vtx16Cmd(std::vector<uint32_t> &params);
+    void vtx16Cmd(const uint32_t *params);
     void vtx10Cmd(uint32_t param);
     void vtxXYCmd(uint32_t param);
     void vtxXZCmd(uint32_t param);
@@ -249,12 +290,12 @@ private:
     void speEmiCmd(uint32_t param);
     void lightVectorCmd(uint32_t param);
     void lightColorCmd(uint32_t param);
-    void shininessCmd(std::vector<uint32_t> &params);
+    void shininessCmd(const uint32_t *params);
     void beginVtxsCmd(uint32_t param);
     void swapBuffersCmd(uint32_t param);
     void viewportCmd(uint32_t param);
-    void boxTestCmd(std::vector<uint32_t> &params);
-    void posTestCmd(std::vector<uint32_t> &params);
+    void boxTestCmd(const uint32_t *params);
+    void posTestCmd(const uint32_t *params);
     void vecTestCmd(uint32_t param);
 
     void addEntry(Entry entry);

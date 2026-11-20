@@ -1,3 +1,7 @@
+#include "gba_arm_alu.h"
+#if NOODS_GBA_DEDICATED || NOODS_GBA_ROM_ISLAND
+#include "arm_alu_specialized.h"
+#endif
 /*
     Copyright (C) 2019-2025 Hydr8gon
     Copyright (C) 2026 radicalten
@@ -20,7 +24,24 @@
 
 #include "core.h"
 #include "arm_jit.h"
+#include "arm_jit_fast.h"
+#include "mpu_pure.h"
 #include <tuxedo/thread.h>
+
+#ifndef NOODS_STRICT_SINGLE_PRECHECK
+#define NOODS_STRICT_SINGLE_PRECHECK 1
+#endif
+#ifndef NOODS_STRICT_BRANCH_PRECHECK
+#define NOODS_STRICT_BRANCH_PRECHECK 1
+#endif
+
+#if NOODS_NDS_TASK_PROFILE
+// Profile every scheduler mode, not just the dual-CPU NDS loop. The old
+// NDS_CPU counter deliberately remains dual-only for historical comparisons.
+static uint64_t singleCpuTicks[3]; // NDS ARM9 only, NDS ARM7 only, GBA
+static uint64_t singleTaskTicks[3][MAX_TASKS];
+static uint32_t singleTaskCalls[3][MAX_TASKS];
+#endif
 
 Interpreter::Interpreter(Core *core, bool arm7): core(core), arm7(arm7) {
     // Initialize the registers for user mode
@@ -124,12 +145,14 @@ void Interpreter::resetCycles() {
 void Interpreter::runCoreNone(Core &core) {
     // Run the core with no active CPUs
     while (true) {
-        PPCIrqState st = PPCIrqLockByMsr();
-        bool is_running = core.running;
-        core.running = true;
-        PPCIrqUnlockByMsr(st);
-
-        if (!is_running) break;
+        // v1.116: the flag is only read here in the common case; interrupts are masked only
+        // when a stop request is actually taken (this runs once per scheduler event).
+        if (__builtin_expect(!core.running, 0)) {
+            PPCIrqState st = PPCIrqLockByMsr();
+            core.running = true;
+            PPCIrqUnlockByMsr(st);
+            break;
+        }
 
         // Jump to the next task and run all that are scheduled at this timestamp
         uint32_t target = core.events[0].cycles;
@@ -147,6 +170,179 @@ void Interpreter::runCoreNone(Core &core) {
     }
 }
 
+#if NOODS_GBA_ARM_BURST
+#if NOODS_NDS_TASK_PROFILE
+static uint32_t gbaBurstCounts[4]; // successful runs, instructions, ALU, mapped transfers
+#endif
+#if NOODS_GBA_ARM_BURST >= 3
+__attribute__((always_inline)) inline
+#endif
+bool Interpreter::runGbaArmBurst() {
+    Core &c=*core;GbaBus &bus=c.gbaBus;
+    uint32_t r15=*registers[15];
+    if ((cpsr&0x20u) || (r15>>24)!=3 || (r15&3) || !pcData || bus.active ||
+        c.globalCycles!=cycles || c.events.frontCycles<=cycles+1) return false;
+    unsigned slots=(0xFFCu-(r15&0xFFFu))/4;
+    if (!slots) return false;
+    uint32_t clock=cycles,op=pipeline[0],next=pipeline[1];
+    uint8_t *pc=pcData;unsigned done=0,last=0;
+    do {
+        const unsigned cond=condition[((op>>24)&0xF0u)|(cpsr>>28)];
+        if (cond==2) break;
+        const bool alu=GbaArmAlu::eligible(op);
+        uint32_t address=0,dataCost=0;bool load=false,byte=false;
+        if (cond && !alu) {
+#if NOODS_GBA_ARM_BURST >= 2
+            // Pre-indexed, no-writeback, ordinary word/byte transfers only.
+            // All I/O, BIOS/open-bus, GamePak and special encodings fall back.
+            if ((op&0x0D200000u)!=0x05000000u || ((op>>12)&15)==15 ||
+                ((op&0x02000000u) && (op&0x10u))) break;
+            auto reg=[&](unsigned n){return n==15?r15+4:*registers[n];};
+            uint32_t offset=op&0xFFFu;
+            if(op&0x02000000u) {
+                const uint32_t v=reg(op&15);const unsigned n=(op>>7)&31;
+                switch((op>>5)&3) {
+                case 0:offset=v<<n;break;case 1:offset=n?v>>n:0;break;
+                case 2:offset=uint32_t(int32_t(v)>>(n?n:31));break;
+                default:offset=n?GbaArmAlu::ror(v,n):((cpsr&0x20000000u)<<2)|(v>>1);break;
+                }
+            }
+            address=reg((op>>16)&15);address=(op&0x00800000u)?address+offset:address-offset;
+            load=op&0x00100000u;byte=op&0x00400000u;
+            const unsigned region=address>>24;
+            if(region!=2 && region!=3 && region!=6) break;
+            if(!(load?c.memory.readMap7:c.memory.writeMap7)[address>>12]) break;
+            dataCost=region==2?(byte?3:6):region==6?(byte?1:2):1;
+#else
+            break;
+#endif
+        }
+        const unsigned cost=1+dataCost+(load?1:0);
+        if(c.events.frontCycles-clock<=cost)break;
+        const uint32_t executing=op;
+        r15+=4;*registers[15]=r15;op=next;pc+=4;next=U8TO32(pc,0);
+        last=0;
+        if(cond) {
+            if(alu) {
+                GbaArmAlu::execute(registers,cpsr,executing);
+#if NOODS_NDS_TASK_PROFILE
+                ++gbaBurstCounts[2];
+#endif
+            } else {
+                last=load?2:1;
+                if(load) {
+                    const uint8_t *data=c.memory.readMap7[address>>12];
+                    uint32_t value=byte?data[address&0xFFFu]:U8TO32(data,address&0xFFCu);
+                    if(!byte && (address&3))value=GbaArmAlu::ror(value,(address&3)*8);
+                    *registers[(executing>>12)&15]=value;
+                } else {
+                    // Preserve ordinary write-side SMC invalidation and GBA byte-VRAM rules.
+                    cycles=clock+1+dataCost;c.globalCycles=cycles;
+                    bus.beginInstruction();bus.nextSeq=false;bus.inSeqAccess=bus.hadDataAccess=true;
+                    bus.lastFetchUsedDuty=false;
+                    const uint32_t value=*registers[(executing>>12)&15];
+                    if(byte)c.memory.write<uint8_t>(true,address,value);
+                    else c.memory.write<uint32_t>(true,address,value);
+                }
+#if NOODS_NDS_TASK_PROFILE
+                ++gbaBurstCounts[3];
+#endif
+            }
+        }
+        clock+=cost;++done;
+    } while(done<slots);
+    if (!done) return false;
+    pipeline[0]=op;pipeline[1]=next;pcData=pc;cycles=clock;c.globalCycles=clock;
+    bus.lastFetchUsedDuty=false;bus.beginInstruction();bus.nextSeq=last==0;
+    if(last){bus.inSeqAccess=bus.hadDataAccess=true;bus.hadLoad=last==2;}
+    c.memory.clearGbaDmaOpenBus();
+#if NOODS_NDS_TASK_PROFILE
+    ++gbaBurstCounts[0];gbaBurstCounts[1]+=done;
+#endif
+    return true;
+}
+#endif
+#if NOODS_GBA_DEDICATED
+#include "gba_dedicated.inc"
+#endif
+#if NOODS_GBA_ROM_ISLAND
+#include "arm7tdmi_mul.h"
+#include "gba_rom_island.inc"
+#endif
+#if NOODS_GBA_THUMB_ISLAND
+#if !NOODS_GBA_ROM_ISLAND
+#include "arm7tdmi_mul.h"
+#endif
+#if NOODS_GBA_ISLAND_STATS
+uint32_t g_tisEntries=0,g_tisFalseEntry=0,g_tisInstrs=0;
+uint32_t g_tisBrk[8]={0};  // 0 region,1 margin,2 spare,3 spare,4 unhandled,5 region/mapped,6 page,7 spare
+uint32_t g_tisCat[7]={0};  // kind 0..6
+#endif
+#include "gba_thumb_island.inc"
+#if NOODS_GBA_ISLAND_STATS
+void dumpGbaThumbIslandStats(FILE *f) {
+    if (!f) return;
+    fprintf(f, "GBA_TISLAND entries=%u false_entries=%u instrs=%u cats alu=%u x2=%u mul=%u xfer=%u block=%u branch=%u blsetup=%u\n",
+        g_tisEntries,g_tisFalseEntry,g_tisInstrs,g_tisCat[0],g_tisCat[1],g_tisCat[2],g_tisCat[3],g_tisCat[4],g_tisCat[5],g_tisCat[6]);
+    fprintf(f, "GBA_TISLAND_BREAKS region=%u margin=%u b2=%u b3=%u unhandled=%u regionmap=%u page=%u\n",
+        g_tisBrk[0],g_tisBrk[1],g_tisBrk[2],g_tisBrk[3],g_tisBrk[4],g_tisBrk[5],g_tisBrk[6]);
+#if NOODS_GBA_ISLAND_VERIFY
+    { extern int g_tisVerifyFails; extern uint32_t g_tisFirstPc, g_tisFirstOp, g_tisFirstDepth, g_tisLastPc, g_tisLastOp;
+      extern char g_tisFirstWhy[16], g_tisLastWhy[16];
+      extern uint32_t g_tisFirstI0, g_tisFirstI1, g_tisFirstP0, g_tisFirstP1, g_tisFirstR15, g_tisFirstIPc;
+      fprintf(f, "GBA_TISLAND_VERIFY fails=%d first=%s pc=%08X op=%04X depth=%u last=%s pc=%08X op=%04X\n",
+        g_tisVerifyFails, g_tisFirstWhy, g_tisFirstPc, g_tisFirstOp, g_tisFirstDepth,
+        g_tisLastWhy, g_tisLastPc, g_tisLastOp);
+      extern uint32_t g_tisRegIdx, g_tisRegIsl, g_tisRegRef, g_tisCpsrIsl, g_tisCpsrRef;
+      fprintf(f, "GBA_TISLAND_PIPE isl=[%04X,%04X] ref=[%04X,%04X] r15=%08X pcOff=%u\n",
+        g_tisFirstI0, g_tisFirstI1, g_tisFirstP0, g_tisFirstP1, g_tisFirstR15, g_tisFirstIPc);
+      fprintf(f, "GBA_TISLAND_REG idx=%u isl=%08X ref=%08X cpsr isl=%08X ref=%08X\n",
+        g_tisRegIdx, g_tisRegIsl, g_tisRegRef, g_tisCpsrIsl, g_tisCpsrRef); }
+#endif
+}
+#endif
+#endif
+#if NOODS_GBA_ROM_ISLAND
+#if NOODS_GBA_ISLAND_STATS
+uint32_t g_loopIters=0, g_loopThumb=0, g_loopOpcode=0;
+void dumpGbaIslandStats(FILE *f) {
+    if (f) fprintf(f, "GBA_LOOP iters=%u thumb=%u runGbaOpcode=%u\n", g_loopIters, g_loopThumb, g_loopOpcode);
+    if (!f) return;
+    fprintf(f, "GBA_ISLAND entries=%u false_entries=%u instrs=%u cats alu=%u false=%u mul=%u branch=%u xfer=%u block=%u\n",
+        g_islEntries,g_islFalseEntry,g_islInstrs,g_islCat[0],g_islCat[1],g_islCat[2],g_islCat[3],g_islCat[4],g_islCat[5]);
+    fprintf(f, "GBA_ISLAND_BREAKS cond2=%u page=%u region=%u margin=%u unhandled=%u noprog=%u gpio=%u\n",
+        g_islBrk[0],g_islBrk[1],g_islBrk[2],g_islBrk[3],g_islBrk[4],g_islBrk[5],g_islBrk[6]);
+    fprintf(f, "GBA_ISLAND_WHY thumb=%u notrom=%u unaligned=%u nopc=%u desync=%u margin=%u\n",
+        g_islWhy[0],g_islWhy[1],g_islWhy[2],g_islWhy[3],g_islWhy[4],g_islWhy[5]);
+}
+#endif
+#endif
+#if NOODS_JIT && NOODS_JIT_BLOCKS
+// v1p171: relaxed GBA timing, opt-in via Settings::gbaFastTiming (off by default).
+// Kept out of line on purpose: inlining this loop into runCoreSingle cost the exact
+// path ~3% (LTO re-decides inlining for the whole hot function), so it lives here and
+// the exact path keeps v1p170's code shape.
+void __attribute__((noinline)) Interpreter::runGbaFastTiming(Interpreter &arm, Core &core) {
+    const bool jitOn = Settings::armJit != 0;
+    ArmPpcJit::linkMode = 4u; // v1.120
+    while (core.events.frontCycles > arm.cycles) {
+        const uint32_t pcNow = arm.registersUsr[15];
+        const uint32_t thumbNow = arm.cpsr & 0x20u;
+        int c = 0;
+        if (__builtin_expect(jitOn, 1))
+            c = ArmPpcJit::fastDispatch(&arm, &core, true, 0u, [&](bool) {
+                return core.events.frontCycles - arm.cycles; });
+        if (__builtin_expect(c == 0, 0)) {
+            uint32_t rem = core.events[0].cycles - arm.cycles;
+            c = arm.runOpcode(rem, rem);
+        }
+        const uint32_t region = pcNow >> 24;
+        if (region >= 8u) c += thumbNow ? c : (c << 1);          // cartridge ROM
+        else if (region == 2u) c *= thumbNow ? 3 : 6;            // external work RAM
+        arm.cycles = (core.globalCycles += c);
+    }
+}
+#endif
 template void Interpreter::runCoreSingle<false, 0>(Core &core);
 template void Interpreter::runCoreSingle<true, 0>(Core &core);
 template void Interpreter::runCoreSingle<true, 1>(Core &core);
@@ -154,38 +350,112 @@ template <bool _arm7, int shift> void Interpreter::runCoreSingle(Core &core) {
     // Run the core with one active CPU
     Interpreter &arm = core.interpreter[_arm7];
     while (true) {
-        PPCIrqState st = PPCIrqLockByMsr();
-        bool is_running = core.running;
-        core.running = true;
-        PPCIrqUnlockByMsr(st);
+        // v1.116: the flag is only read here in the common case; interrupts are masked only
+        // when a stop request is actually taken (this runs once per scheduler event).
+        if (__builtin_expect(!core.running, 0)) {
+            PPCIrqState st = PPCIrqLockByMsr();
+            core.running = true;
+            PPCIrqUnlockByMsr(st);
+            break;
+        }
 
-        if (!is_running) break;
-
+#if NOODS_NDS_TASK_PROFILE
+        const unsigned profileMode = core.gbaMode ? 2u : (_arm7 ? 1u : 0u);
+        const uint64_t singleCpuStart = PPCGetTickCount();
+#endif
         // Run a CPU until the next scheduled task
         core.globalCycles = std::max(core.globalCycles, arm.cycles);
+#if NOODS_JIT && NOODS_JIT_BLOCKS
+        ArmPpcJit::linkMode = 0u; // v1.120: set again by the loop that supports block links
+#endif
+#if NOODS_JIT && NOODS_JIT_BLOCKS
+        if (__builtin_expect(Settings::gbaFastTiming && _arm7 && core.gbaMode && shift == 0, 0))
+            runGbaFastTiming(arm, core);
+        else
+#endif
         if (_arm7 && core.gbaMode) {
-            while (core.events[0].cycles > arm.cycles) {
+            while (core.events.frontCycles > arm.cycles) {
+#if NOODS_GBA_ISLAND_STATS
+                ++g_loopIters;
+                if (arm.isThumb()) ++g_loopThumb;
+#endif
+                // Cheap inline mode gate: the islands are mode-specific, and
+                // nearly all GBA titles run THUMB code, so an unguarded ARM-only
+                // island would cost a function call per THUMB instruction.
+#if NOODS_GBA_THUMB_ISLAND
+                if(arm.isThumb()) { if(arm.runGbaThumbIsland()) continue; }
+                else
+#endif
+#if NOODS_GBA_ROM_ISLAND
+                if(!arm.isThumb() && arm.runGbaRomIsland()) continue;
+#if NOODS_GBA_THUMB_ISLAND
+                else
+#endif
+#endif
+#if NOODS_GBA_THUMB_ISLAND && !NOODS_GBA_ROM_ISLAND
+                else
+#endif
+                { }
+#if NOODS_GBA_DEDICATED
+                if(arm.runGbaDedicated()) continue;
+#endif
+#if NOODS_GBA_ARM_BURST
+                if(arm.runGbaArmBurst()) continue;
+#endif
 #if NOODS_JIT && NOODS_JIT_BLOCKS && NOODS_GBA_JIT
                 if (Settings::armJit && arm.pcData && core.gbaBus.nextSeq &&
                     ArmPpcJit::tryExecuteGbaFast(&arm, core.memory.getWaitCnt(), core.events[0].cycles))
                     continue;
 #endif
+#if NOODS_GBA_ISLAND_STATS
+                ++g_loopOpcode;
+#endif
                 arm.runGbaOpcode();
             }
         }
         else {
+#if NOODS_JIT && NOODS_JIT_BLOCKS
+            // <true, 0> is the GBA instantiation; its NDS branch is never taken, and is kept
+            // as it was so the GBA loop's code generation does not change.
+            if (_arm7 && shift == 0) {
+                while (core.events[0].cycles > arm.cycles) {
+                    uint32_t rem = (core.events[0].cycles - arm.cycles + shift) >> shift;
+                    arm.cycles = (core.globalCycles += arm.runOpcode(rem, rem) << shift);
+                }
+            }
+            else {
+            // v1.101: try the inline block-hit path first; fall back to the unchanged slow path.
+            const bool jitOn = Settings::armJit != 0;
+            ArmPpcJit::linkMode = _arm7 ? 3u : 1u; // v1.120
+            while (core.events.frontCycles > arm.cycles) {
+                int c = 0;
+                if (__builtin_expect(jitOn, 1))
+                    c = ArmPpcJit::fastDispatch(&arm, &core, _arm7, (uint32_t)shift, [&](bool) {
+                        return (core.events.frontCycles - arm.cycles + shift) >> shift; });
+                if (__builtin_expect(c == 0, 0)) {
+                    uint32_t rem = (core.events[0].cycles - arm.cycles + shift) >> shift;
+                    c = arm.runOpcode(rem, rem);
+                }
+                arm.cycles = (core.globalCycles += c << shift);
+            }
+            }
+#else
             while (core.events[0].cycles > arm.cycles) {
                 uint32_t rem = (core.events[0].cycles - arm.cycles + shift) >> shift;
                 arm.cycles = (core.globalCycles += arm.runOpcode(rem, rem) << shift);
             }
+#endif
         }
 
+#if NOODS_NDS_TASK_PROFILE
+        singleCpuTicks[profileMode] += PPCGetTickCount() - singleCpuStart;
+#endif
         // Run all tasks scheduled up to the current timestamp, keeping mid-instruction GBA DMAs for runGbaOpcode Step 2!
         uint32_t initialTarget = core.events[0].cycles;
         uint32_t limit = std::max(initialTarget, arm.halted ? initialTarget : arm.cycles);
         while (core.events[0].cycles <= limit) {
             SchedEvent ev = core.events[0];
-            if (core.gbaMode && ev.cycles > initialTarget &&
+            if (core.gbaMode && !Settings::gbaFastTiming && ev.cycles > initialTarget &&
                 ev.task >= DMA7_TRANSFER0 && ev.task <= DMA7_TRANSFER3) {
                 break;
             }
@@ -194,7 +464,14 @@ template <bool _arm7, int shift> void Interpreter::runCoreSingle(Core &core) {
 #if NOODS_JIT && NOODS_JIT_POLL_SKIP
             ArmPpcJit::pollEpoch++;
 #endif
+#if NOODS_NDS_TASK_PROFILE
+            const uint64_t singleTaskStart = PPCGetTickCount();
             core.tasks[ev.task]();
+            singleTaskTicks[profileMode][ev.task] += PPCGetTickCount() - singleTaskStart;
+            ++singleTaskCalls[profileMode][ev.task];
+#else
+            core.tasks[ev.task]();
+#endif
             if (ev.task == RESET_CYCLES) {
                 initialTarget = 0;
                 limit = arm.halted ? 0u : arm.cycles;
@@ -214,6 +491,18 @@ static uint64_t ndsTaskTicks[MAX_TASKS];
 static uint32_t ndsTaskCalls[MAX_TASKS];
 
 void Interpreter::dumpNdsTaskProfile(FILE *f) {
+#if NOODS_GBA_ARM_BURST
+    fprintf(f,"GBA_BURST runs=%u instructions=%u alu=%u memory=%u\n",gbaBurstCounts[0],gbaBurstCounts[1],gbaBurstCounts[2],gbaBurstCounts[3]);
+#endif
+
+
+    for (unsigned mode = 0; mode < 3; ++mode) {
+        fprintf(f, "SINGLE_CPU mode=%u us=%llu\n", mode, (unsigned long long)PPCTicksToUs(singleCpuTicks[mode]));
+        for (unsigned task = 0; task < MAX_TASKS; ++task) {
+            if (singleTaskCalls[mode][task])
+                fprintf(f, "SINGLE_TASK mode=%u id=%u count=%u us=%llu\n", mode, task, singleTaskCalls[mode][task], (unsigned long long)PPCTicksToUs(singleTaskTicks[mode][task]));
+        }
+    }
     fprintf(f, "NDS_CPU us=%llu\n", (unsigned long long)PPCTicksToUs(ndsCpuTicks));
     for (unsigned i = 0; i < MAX_TASKS; ++i) {
         if (ndsTaskCalls[i])
@@ -228,30 +517,73 @@ void Interpreter::runCoreNds(Core &core) {
     Interpreter &arm9 = core.interpreter[0];
     Interpreter &arm7 = core.interpreter[1];
     while (true) {
-        PPCIrqState st = PPCIrqLockByMsr();
-        bool is_running = core.running;
-        core.running = true;
-        PPCIrqUnlockByMsr(st);
-
-        if (!is_running) break;
+        // v1.116: the flag is only read here in the common case; interrupts are masked only
+        // when a stop request is actually taken (this runs once per scheduler event).
+        if (__builtin_expect(!core.running, 0)) {
+            PPCIrqState st = PPCIrqLockByMsr();
+            core.running = true;
+            PPCIrqUnlockByMsr(st);
+            break;
+        }
 
         // Run the ARM9 and half-speed ARM7 until the next scheduled task
 #if NOODS_NDS_TASK_PROFILE
         uint64_t cpuStart = PPCGetTickCount();
 #endif
-        while (core.events[0].cycles > core.globalCycles) {
-            const uint32_t evTarget = core.events[0].cycles;
+#if NOODS_JIT && NOODS_JIT_BLOCKS
+        const bool jitOn = Settings::armJit != 0;
+#endif
+#if NOODS_JIT && NOODS_JIT_BLOCKS
+        ArmPpcJit::linkMode = 2u; // v1.120
+#endif
+        while (core.events.frontCycles > core.globalCycles) {
+            const uint32_t evTarget = core.events.frontCycles;
+#if NOODS_JIT && NOODS_JIT_BLOCKS
+            ArmPpcJit::linkEvTarget = evTarget;
+#endif
             if (core.globalCycles >= arm9.cycles) {
+#if NOODS_JIT && NOODS_JIT_BLOCKS
+                // v1.101: the remaining-cycle bounds are only needed by loop blocks and by the
+                // slow path, so they are computed lazily.
+                auto remIndep9 = [&]() -> uint32_t { return evTarget - core.globalCycles; };
+                auto remShared9 = [&]() -> uint32_t {
+                    uint32_t safeEnd9 = arm7.halted ? evTarget : std::min<uint32_t>(evTarget, std::max<uint32_t>(core.globalCycles + 1u, arm7.cycles));
+                    return safeEnd9 - core.globalCycles;
+                };
+                int c9 = 0;
+                if (__builtin_expect(jitOn, 1))
+                    c9 = ArmPpcJit::fastDispatch(&arm9, &core, false, 0u, [&](bool indep) {
+                        return indep ? remIndep9() : remShared9(); });
+                if (__builtin_expect(c9 == 0, 0))
+                    c9 = arm9.runOpcode(remIndep9(), remShared9());
+                arm9.cycles = core.globalCycles + c9;
+#else
                 uint32_t remIndep9 = evTarget - core.globalCycles;
                 uint32_t safeEnd9 = arm7.halted ? evTarget : std::min<uint32_t>(evTarget, std::max<uint32_t>(core.globalCycles + 1u, arm7.cycles));
                 uint32_t remShared9 = safeEnd9 - core.globalCycles;
                 arm9.cycles = core.globalCycles + arm9.runOpcode(remIndep9, remShared9);
+#endif
             }
             if (core.globalCycles >= arm7.cycles) {
+#if NOODS_JIT && NOODS_JIT_BLOCKS
+                auto remIndep7 = [&]() -> uint32_t { return (evTarget - core.globalCycles + 1u) >> 1; };
+                auto remShared7 = [&]() -> uint32_t {
+                    uint32_t safeEnd7 = arm9.halted ? evTarget : std::min<uint32_t>(evTarget, std::max<uint32_t>(core.globalCycles + 2u, arm9.cycles));
+                    return (safeEnd7 - core.globalCycles + 1u) >> 1;
+                };
+                int c7 = 0;
+                if (__builtin_expect(jitOn, 1))
+                    c7 = ArmPpcJit::fastDispatch(&arm7, &core, true, 1u, [&](bool indep) {
+                        return indep ? remIndep7() : remShared7(); });
+                if (__builtin_expect(c7 == 0, 0))
+                    c7 = arm7.runOpcode(remIndep7(), remShared7());
+                arm7.cycles = core.globalCycles + (c7 << 1);
+#else
                 uint32_t remIndep7 = (evTarget - core.globalCycles + 1u) >> 1;
                 uint32_t safeEnd7 = arm9.halted ? evTarget : std::min<uint32_t>(evTarget, std::max<uint32_t>(core.globalCycles + 2u, arm9.cycles));
                 uint32_t remShared7 = (safeEnd7 - core.globalCycles + 1u) >> 1;
                 arm7.cycles = core.globalCycles + (arm7.runOpcode(remIndep7, remShared7) << 1);
+#endif
             }
             core.globalCycles = std::min<uint32_t>(arm9.cycles, arm7.cycles);
         }
@@ -287,14 +619,19 @@ void Interpreter::runCoreDsi(Core &core) {
     Interpreter &arm9 = core.interpreter[0];
     Interpreter &arm7 = core.interpreter[1];
     while (true) {
-        PPCIrqState st = PPCIrqLockByMsr();
-        bool is_running = core.running;
-        core.running = true;
-        PPCIrqUnlockByMsr(st);
-
-        if (!is_running) break;
+        // v1.116: the flag is only read here in the common case; interrupts are masked only
+        // when a stop request is actually taken (this runs once per scheduler event).
+        if (__builtin_expect(!core.running, 0)) {
+            PPCIrqState st = PPCIrqLockByMsr();
+            core.running = true;
+            PPCIrqUnlockByMsr(st);
+            break;
+        }
 
         // Run both CPUs until the next scheduled task
+#if NOODS_JIT && NOODS_JIT_BLOCKS
+        ArmPpcJit::linkMode = 0u; // v1.120: no block links in DSi mode
+#endif
         while (core.events[0].cycles > core.globalCycles) {
             // Run the ARM9 twice as fast as usual
             if (core.globalCycles >= arm9.cycles) {
@@ -325,6 +662,14 @@ void Interpreter::runCoreDsi(Core &core) {
     }
 }
 
+#ifndef NOODS_MPU_PURE_FAST
+#define NOODS_MPU_PURE_FAST 0
+#endif
+uint32_t g_mpuPureFastStats[3]; // arm pure, thumb pure, condition false
+
+// Conservative instruction classes that cannot access DS data memory and do
+// not change PC, modes or status-register banking. Unrecognized forms retain
+// the original checked path. Instruction permission is checked separately.
 FORCE_INLINE int Interpreter::runOpcode(uint32_t remIndep, uint32_t remShared) {
     if (!arm7 && __builtin_expect(core->cp15.mpuRestricted, 0)) {
         const uint32_t faultPc = *registers[15] - ((cpsr & BIT(5)) ? 2u : 4u);
@@ -334,9 +679,129 @@ FORCE_INLINE int Interpreter::runOpcode(uint32_t remIndep, uint32_t remShared) {
         // custom data restrictions, or non-executable PC page.
         if (!priv || !core->cp15.mpuFastPriv ||
             !(core->cp15.getPagePerm(faultPc >> 12) & 0x04)) {
-            if (!core->cp15.checkAccess(faultPc, false, false, priv))
+            if (!core->cp15.checkAccessPage(faultPc, false, false, priv))
                 return takeAbort(0x0C, faultPc + 4);
 
+#if NOODS_MPU_PURE_FAST
+            // The same checked interpreter dispatch with no rollback snapshot
+            // is safe only if the instruction provably cannot touch data.
+            // Condition-false ARM instructions do not execute at all.
+            const uint32_t pureOp = pipeline[0];
+            const bool thumbPure = (cpsr & BIT(5)) && mpuPureThumb((uint16_t)pureOp);
+            const int armCond = !(cpsr & BIT(5)) ? condition[((pureOp >> 24) & 0xF0) | (cpsr >> 28)] : 2;
+            const bool falseArm = !(cpsr & BIT(5)) && armCond == 0;
+            const bool armPure = !(cpsr & BIT(5)) && armCond == 1 && mpuPureArm(pureOp);
+            if (thumbPure || armPure || falseArm) {
+                pipeline[0] = pipeline[1];
+                if (cpsr & BIT(5)) {
+                    pipeline[1] = (((*registers[15] += 2) & 0xFFE) && pcData) ? U8TO16(pcData += 2, 0) : getOpcode16();
+                    ++g_mpuPureFastStats[1];
+#if NOODS_MPU_PURE_JIT && NOODS_JIT && NOODS_JIT_BLOCKS
+                    if (Settings::armJit) return ArmPpcJit::executeThumb(this, pureOp, remIndep, remShared);
+#endif
+                    return (this->*thumbInstrs[(pureOp >> 6) & 0x3FF])(pureOp);
+                }
+                pipeline[1] = (((*registers[15] += 4) & 0xFFC) && pcData) ? U8TO32(pcData += 4, 0) : getOpcode32();
+                if (falseArm) { ++g_mpuPureFastStats[2]; return 1; }
+                ++g_mpuPureFastStats[0];
+#if NOODS_MPU_PURE_JIT && NOODS_JIT && NOODS_JIT_BLOCKS
+                if (Settings::armJit) return ArmPpcJit::executeArm(this, pureOp, remIndep, remShared);
+#endif
+                return (this->*armInstrs[((pureOp >> 16) & 0xFF0) | ((pureOp >> 4) & 0xF)])(pureOp);
+            }
+#endif
+#if NOODS_STRICT_SINGLE_PRECHECK
+            // Preflight a single immediate-offset ARM load/store. The handler
+            // performs exactly one data access at this address, so if that
+            // access is permitted there is no possible data abort to roll
+            // back. Keep PC operands, writeback, register offsets and all
+            // other instruction classes on the original snapshot path.
+            // The address passed to checkAccessPage matches Memory::read/write
+            // before their alignment behavior, including unsigned wraparound.
+            const uint32_t strictOp = pipeline[0];
+            if (!(cpsr & BIT(5)) && condition[((strictOp >> 24) & 0xF0) | (cpsr >> 28)] == 1 &&
+                (strictOp & 0x0F200000u) == 0x05000000u &&
+                ((strictOp >> 16) & 15u) != 15u && ((strictOp >> 12) & 15u) != 15u) {
+                const uint32_t base = *registers[(strictOp >> 16) & 15u];
+                const uint32_t imm = strictOp & 0xFFFu;
+                const uint32_t address = (strictOp & BIT(23)) ? base + imm : base - imm;
+                // Unmapped accesses can invoke MMIO and nested DMA operations;
+                // keep those on the original checked path as well.
+                const bool isWrite = !(strictOp & BIT(20));
+                const uint32_t page = address >> 12;
+                uint8_t *const dataPage = isWrite ? core->memory.writeMap9A[page] : core->memory.readMap9A[page];
+                if (dataPage && core->cp15.checkAccessPage(address, isWrite, true, priv)) {
+                    // A mapped, word-sized read has no MMIO effects. When the
+                    // next opcode is also a direct pointer fetch, no mapping
+                    // can change between the permission check and this load.
+                    // Preserve Memory::read's aligned-word and ARM rotation rules.
+                    const uint8_t *const data = dataPage + (address & 0xFFCu);
+                    if (!isWrite && !(strictOp & BIT(22)) && !core->memory.mpuDataCheckActive &&
+                        pcData && ((*registers[15] + 4u) & 0xFFCu) && !((uintptr_t)data & 3u)) {
+                        pipeline[0] = pipeline[1];
+                        *registers[15] += 4;
+                        pipeline[1] = U8TO32(pcData += 4, 0);
+                        uint32_t value;
+                        __builtin_memcpy(&value, data, 4);
+#ifdef ENDIAN_BIG
+                        value = __builtin_bswap32(value);
+#endif
+                        const unsigned shift = (address & 3u) * 8u;
+                        if (shift) value = (value >> shift) | (value << (32u - shift));
+                        *registers[(strictOp >> 12) & 15u] = value;
+                        return 1;
+                    }
+                    pipeline[0] = pipeline[1];
+                    pipeline[1] = (((*registers[15] += 4) & 0xFFC) && pcData) ? U8TO32(pcData += 4, 0) : getOpcode32();
+                    return (this->*armInstrs[((strictOp >> 16) & 0xFF0) | ((strictOp >> 4) & 0xF)])(strictOp);
+                }
+            }
+#endif
+#if NOODS_STRICT_BRANCH_PRECHECK
+            // The checked interpreter's branch refill performs a data-checked
+            // read at its target. Only bypass rollback if the target is mapped,
+            // both opcodes fit in the page, and that same data read is allowed.
+            // For all other cases preserve the checked refill and abort path.
+            const uint32_t brOp = pipeline[0];
+            if (!(cpsr & BIT(5)) && condition[((brOp >> 24) & 0xF0) | (cpsr >> 28)] == 1) {
+                const bool immBranch = (brOp & 0x0E000000u) == 0x0A000000u;
+                const bool regBranch = (brOp & 0x0FFFFFF0u) == 0x012FFF10u && (brOp & 15u) != 15u;
+                if (immBranch || regBranch) {
+                    const uint32_t target = immBranch ? (*registers[15] + 4u + uint32_t(int32_t(brOp << 8) >> 6)) : *registers[brOp & 15u];
+                    const bool thumbTarget = regBranch && (target & 1u);
+                    const uint32_t alignedTarget = target & (thumbTarget ? ~1u : ~3u);
+                    const uint32_t offset = alignedTarget & 0xFFFu;
+                    uint8_t *const targetPage = core->memory.readMap9A[alignedTarget >> 12];
+                    if (offset <= (thumbTarget ? 0xFFCu : 0xFF8u) && targetPage &&
+                        core->cp15.checkAccessPage(alignedTarget, false, true, priv)) {
+                        // With direct source and target fetches, the sequential
+                        // pipeline read that the branch discards has no side
+                        // effects. Refill exactly as flushPipeline would.
+                        if (!core->gbaMode && !core->memory.mpuDataCheckActive && pcData &&
+                            ((*registers[15] + 4u) & 0xFFCu)) {
+                            if (immBranch && (brOp & BIT(24))) *registers[14] = *registers[15];
+                            if (thumbTarget) cpsr |= BIT(5);
+                            uint8_t *const targetData = targetPage + offset;
+                            if (thumbTarget) {
+                                *registers[15] = alignedTarget + 2;
+                                pipeline[0] = U8TO16(targetData, 0);
+                                pipeline[1] = U8TO16(targetData, 2);
+                                pcData = targetData + 2;
+                            } else {
+                                *registers[15] = alignedTarget + 4;
+                                pipeline[0] = U8TO32(targetData, 0);
+                                pipeline[1] = U8TO32(targetData, 4);
+                                pcData = targetData + 4;
+                            }
+                            return 3;
+                        }
+                        pipeline[0] = pipeline[1];
+                        pipeline[1] = (((*registers[15] += 4) & 0xFFC) && pcData) ? U8TO32(pcData += 4, 0) : getOpcode32();
+                        return (this->*armInstrs[((brOp >> 16) & 0xFF0) | ((brOp >> 4) & 0xF)])(brOp);
+                    }
+                }
+            }
+#endif
             uint32_t savedRegs[15];
             for (int i = 0; i < 15; i++)
                 savedRegs[i] = *registers[i];
@@ -426,6 +891,9 @@ void Interpreter::stallGbaDmaCycles(uint32_t c) {
     }
 }
 
+#if NOODS_GBA_ARM_BURST >= 3 || NOODS_GBA_DEDICATED
+__attribute__((noinline))
+#endif
 void Interpreter::runGbaOpcode() {
     uint32_t opcode = pipeline[0];
     pipeline[0] = pipeline[1];
@@ -435,7 +903,12 @@ void Interpreter::runGbaOpcode() {
     // 1. Instruction fetch phase (pipeline[1])
     if (thumb) {
         pipeline[1] = (((*registers[15] += 2) & 0xFFE) && pcData) ? U8TO16(pcData += 2, 0) : getOpcode16();
+#if NOODS_GBA_FETCH_FAST
+        int fFast = core->gbaBus.fetchThumbRomSeq(*registers[15], waitCnt);
+        int fCyc = (fFast >= 0) ? fFast : core->gbaBus.fetchOpcode(*registers[15], false, waitCnt);
+#else
         int fCyc = core->gbaBus.fetchOpcode(*registers[15], false, waitCnt);
+#endif
         cycles = (core->globalCycles += fCyc);
     }
     else {
@@ -448,7 +921,7 @@ void Interpreter::runGbaOpcode() {
 
     // 2. Allow any pending GBA DMA transfer ready by end of fetch to preempt bus before data phase,
     //    even if a scanline/audio task sits earlier in core->events!
-    if (!halted && core->events[0].cycles <= cycles) {
+    if (!halted && core->events.frontCycles <= cycles) {
         for (size_t idx = 0; idx < core->events.size() && core->events[idx].cycles <= cycles; ) {
             SchedTask t = core->events[idx].task;
             if (t >= DMA7_TRANSFER0 && t <= DMA7_TRANSFER3) {
@@ -618,6 +1091,35 @@ int Interpreter::undefinedException(bool thumb) {
 }
 
 void Interpreter::flushPipeline() {
+    // v1.118: the usual case - a DS CPU jumping to code in a mapped page, with both pipeline
+    // words in that page - is served from one page-table lookup. It leaves exactly the state
+    // the general code below does (R15, pipeline, pcData).
+    if (__builtin_expect(!core->gbaMode && !core->memory.mpuDataCheckActive, 1)) {
+        uint8_t *const page = (arm7 ? core->memory.readMap7 : core->memory.readMap9A)[*registers[15] >> 12];
+        if (__builtin_expect(page != nullptr, 1)) {
+            if (cpsr & BIT(5)) {
+                const uint32_t targetPc = *registers[15] & ~0x1u;
+                if (__builtin_expect((targetPc & 0xFFE) != 0xFFE, 1)) {
+                    const uint8_t *p = page + (targetPc & 0xFFE);
+                    *registers[15] = targetPc + 2;
+                    pipeline[0] = U8TO16(p, 0);
+                    pipeline[1] = U8TO16(p, 2);
+                    pcData = const_cast<uint8_t*>(p) + 2;
+                    return;
+                }
+            } else {
+                const uint32_t targetPc = *registers[15] & ~0x3u;
+                if (__builtin_expect((targetPc & 0xFFC) != 0xFFC, 1)) {
+                    const uint8_t *p = page + (targetPc & 0xFFC);
+                    *registers[15] = targetPc + 4;
+                    pipeline[0] = U8TO32(p, 0);
+                    pipeline[1] = U8TO32(p, 4);
+                    pcData = const_cast<uint8_t*>(p) + 4;
+                    return;
+                }
+            }
+        }
+    }
     bool prevExec = core->memory.gbaCpuExecActive;
     core->memory.gbaCpuExecActive = false;
     uint32_t targetPc;

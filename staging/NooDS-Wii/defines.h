@@ -25,6 +25,11 @@
 // Control how many cycles of 3D GPU commands are batched
 #define GPU3D_BATCH 32
 
+// Cycles between a command reaching an idle geometry engine and the engine starting on it
+#ifndef GPU3D_IDLE_DELAY
+#define GPU3D_IDLE_DELAY 2
+#endif
+
 // Print critical logs in red if enabled
 #if LOG_LEVEL > 0
 #define LOG_CRIT(...) printf("\x1b[31m" __VA_ARGS__)
