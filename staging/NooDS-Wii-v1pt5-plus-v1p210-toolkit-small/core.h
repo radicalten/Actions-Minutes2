@@ -170,6 +170,16 @@ public:
     }
 
     inline void insertUpperBound(const SchedEvent& e) {
+        // v1.117: an event earlier than every queued one goes in front in one step (the
+        // geometry engine schedules itself a few cycles ahead for every command); the
+        // general path below would move the whole queue up by one for it.
+        if (sz != 0 && e.cycles < buf[head].cycles) {
+            head = (head - 1u) & MASK;
+            buf[head] = e;
+            sz++;
+            frontCycles = e.cycles;
+            return;
+        }
         uint32_t pos = sz;
         while (pos > 0 && (*this)[pos - 1].cycles > e.cycles) {
             (*this)[pos] = (*this)[pos - 1];
@@ -180,6 +190,12 @@ public:
         syncFront();
     }
 };
+
+// test-harness counters of rare, expensive events (printed in the checkpoint log):
+// 0 cp15 control, 1 TCM base/size, 2 WRAMCNT, 3 VRAM remap, 4 block tables cleared,
+// 5 blocks compiled, 6 code pool wraps, 7 run loop changes
+// 8 live block evicted from its table slot, 9 block dropped after a write to its page
+extern uint32_t g_evCnt[12];
 
 class Core {
 public:
@@ -239,7 +255,23 @@ public:
     void loadState(FILE* file);
 
     // Hot path: single load + indirect branch, no virtual dispatch.
-    inline void runCore() { (*runFunc)(*this); }
+#ifndef NOODS_RUN_TO_FRAME
+#define NOODS_RUN_TO_FRAME 1
+#endif
+    // v1.121: a run loop also returns when the set of running CPUs changes (a CPU halts or
+    // wakes, see updateRun), which many games do hundreds of times per frame. That used to
+    // go all the way back to the caller, which treated it as a finished frame (input poll,
+    // frame check, ...). Now only endFrame() ends the call; a change of loop just continues
+    // in the new loop.
+    volatile bool frameEnded = false;
+    inline void runCore() {
+#if NOODS_RUN_TO_FRAME
+        frameEnded = false;
+        do { (*runFunc)(*this); } while (!frameEnded);
+#else
+        (*runFunc)(*this);
+#endif
+    }
 
     void schedule(SchedTask task, uint32_t cycles);
     void enterGbaMode();

@@ -8,7 +8,13 @@
 #ifdef NOODS_V180_PROFILE
 #include <tuxedo/ppc/clock.h>
 
-extern volatile uint64_t g_v180Profile[16];
+extern volatile uint64_t g_v180Profile[24];
+
+struct V180ProfScopeConditional {
+    int index; bool active; uint64_t start;
+    V180ProfScopeConditional(int idx, bool enabled) : index(idx), active(enabled), start(enabled ? PPCGetTickCount() : 0) {}
+    ~V180ProfScopeConditional() { if (active) g_v180Profile[index] += PPCGetTickCount() - start; }
+};
 
 struct V180ProfScope {
     int index;
@@ -17,11 +23,13 @@ struct V180ProfScope {
     ~V180ProfScope() { g_v180Profile[index] += PPCGetTickCount() - start; }
 };
 
+#define V180_PROFILE_SCOPE_IF(idx, enabled) V180ProfScopeConditional _v180ProfScopeConditional(idx, enabled)
 #define V180_PROFILE_SCOPE(idx) V180ProfScope _v180ProfScope(idx)
 #define V180_PROFILE_TICK() PPCGetTickCount()
 #define V180_PROFILE_ADD(idx, value) (g_v180Profile[idx] += (value))
 #define V180_PROFILE_INC(idx) (g_v180Profile[idx]++)
 #else
+#define V180_PROFILE_SCOPE_IF(idx, enabled) do {} while (0)
 #define V180_PROFILE_SCOPE(idx) do {} while (0)
 #define V180_PROFILE_TICK() UINT64_C(0)
 #define V180_PROFILE_ADD(idx, value) do {} while (0)

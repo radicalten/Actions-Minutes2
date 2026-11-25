@@ -38,7 +38,9 @@
 #include "wii_video.h"
 #include "wii_audio.h"
 #include "core.h"
+
 #include "settings.h"
+
 #include "console_ui.h"
 
 // Browser build: ignore test-harness autoboot files and ROM fallbacks on SD.
@@ -107,9 +109,11 @@ static void NoodsPanicHandler(unsigned exid, PPCContext* ctx) {
 
 static uint32_t* frontBuffer = nullptr;
 static uint32_t* backBuffer  = nullptr;
+static volatile bool frontIs565 = false, backIs565 = false; // v1.112: buffer holds GX RGB565 textures
+static uint32_t* emuBuffer   = nullptr; // v1.110: the emulator thread draws here, then swaps with backBuffer
 
 // Optional cumulative renderer profiler counters (ticks), populated only by PROFILE=1 builds.
-volatile uint64_t g_v180Profile[16] = {};
+volatile uint64_t g_v180Profile[24] = {};
 
 static volatile bool newFrameReady     = false;
 static volatile bool runEmulatorThread = true;
@@ -207,6 +211,9 @@ static const SettingsEntry s_settingsTable[] = {
     { "Quit to Wii Menu",&s_quitToHomeSentinel,   1,  nullptr,       0 },
     { "Hide Top Menu",   &s_hideTopMenu,          2,  s_toggleNames, 2 },
     { "ARM JIT",         &Settings::armJit,       2,  s_toggleNames, 2 },
+    // v1p171: relaxed GBA timing. Off by default; on trades cycle-exactness
+    // (and mGBA suite accuracy) for roughly 2x speed in GBA games.
+    { "Fast GBA Timing", &Settings::gbaFastTiming, 2, s_toggleNames, 2 },
     { "Audio Emulation", &Settings::emulateAudio, 2,  s_toggleNames, 2 },
     { "Skip Frames",     &Settings::frameskip,    Settings::FRAMESKIP_COUNT, s_frameskipNames, Settings::FRAMESKIP_COUNT },
     { "Screen Layout",   &Settings::screenLayout, 6,  s_layoutNames, 6 },
@@ -554,6 +561,7 @@ static void InitializeSettings() {
     Settings::screenSwap   = 0;
     Settings::wiiScreenGap = 1;
     Settings::armJit       = 1;
+    Settings::gbaFastTiming = 0; // v1p171: cycle-exact unless the user opts in
     Settings::arm7Hle      = 0;
     Settings::dsiMode      = 0;
 }
@@ -627,7 +635,14 @@ static void UpdateFileBrowser(const std::string& path) {
     displayOffset     = 0;
 }
 
+#if NOODS_TEST_MOVE_TEMP
+// Test only: allocate after the shared JIT arena has been reserved.
+static uint32_t *tempBuffer = nullptr;
+#else
 alignas(32) static uint32_t tempBuffer[NDS_SCREEN_WIDTH * NDS_SCREEN_HEIGHT * 8];
+#endif
+static uint32_t *g_lastFrame = tempBuffer;
+static bool g_lastFrameIsTex = false;      // v1.112: last frame went out as textures; harness re-derives it // most recent finished frame (test harness reads it)
 
 #if NOODS_JIT
 #include "arm_jit.h"
@@ -702,6 +717,7 @@ struct NoodsTestHarness {
         currentFrame = 0;
         accumFrameUs = 0;
 
+        int testFpsLimiter = 1; // validation uses normal pacing unless explicitly benchmarking
         std::string chosen;
         const char* abFiles[] = { "sd:/autoboot.txt", "sd:/noods/autoboot.txt" };
         for (const char* ab : abFiles) {
@@ -714,6 +730,8 @@ struct NoodsTestHarness {
                     if (firstLine && line.find('=') == std::string::npos) {
                         chosen = line;
                         firstLine = false;
+                    } else if (line.rfind("FPS_LIMITER=", 0) == 0) {
+                        testFpsLimiter = strtoul(line.c_str() + 12, nullptr, 10) ? 1 : 0;
                     } else if (line.rfind("MAX_FRAMES=", 0) == 0) {
                         maxFrames = (uint32_t)strtoul(line.c_str() + 11, nullptr, 10);
                     } else if (line.rfind("CHECKPOINTS=", 0) == 0) {
@@ -826,7 +844,7 @@ struct NoodsTestHarness {
 
         if (!chosen.empty()) {
             if (!checkpoints.empty() || maxFrames > 0) {
-                Settings::fpsLimiter = 0;
+                Settings::fpsLimiter = testFpsLimiter;
                 Settings::frameskip  = 0;
                 if (FILE* f = fopen("sd:/g2_state.log", "wb")) fclose(f);
             }
@@ -852,7 +870,7 @@ struct NoodsTestHarness {
         char name[64];
         snprintf(name, sizeof(name), "sd:/fb_cp%u.bin", frame);
         if (FILE* ff = fopen(name, "wb")) {
-            fwrite(tempBuffer, sizeof(uint32_t), NDS_SCREEN_WIDTH * NDS_SCREEN_HEIGHT * 2, ff);
+            fwrite(g_lastFrame, sizeof(uint32_t), NDS_SCREEN_WIDTH * NDS_SCREEN_HEIGHT * 2, ff);
             fclose(ff);
         }
     }
@@ -930,14 +948,24 @@ struct NoodsTestHarness {
                              (hWram7 << 4) ^ (hPal << 5) ^ (hOam << 6) ^ (hVram << 7);
 
         size_t scrPixels = NDS_SCREEN_WIDTH * NDS_SCREEN_HEIGHT;
-        uint64_t hFbTop  = fnv1a64(tempBuffer, scrPixels * sizeof(uint32_t));
-        uint64_t hFbBot  = fnv1a64(tempBuffer + scrPixels, scrPixels * sizeof(uint32_t));
-        uint64_t hFbAll  = fnv1a64(tempBuffer, scrPixels * 2 * sizeof(uint32_t));
+        if (g_lastFrameIsTex) { core->gpu.peekFrame(tempBuffer); g_lastFrame = tempBuffer; g_lastFrameIsTex = false; }
+        uint64_t hFbTop  = fnv1a64(g_lastFrame, scrPixels * sizeof(uint32_t));
+        uint64_t hFbBot  = fnv1a64(g_lastFrame + scrPixels, scrPixels * sizeof(uint32_t));
+        uint64_t hFbAll  = fnv1a64(g_lastFrame, scrPixels * 2 * sizeof(uint32_t));
 
         if (FILE* f = fopen("sd:/g2_state.log", "ab")) {
             fprintf(f, "=== CHECKPOINT FRAME %u ===\n", currentFrame);
             fprintf(f, "CYCLES global=%u arm9=%u arm7=%u gbaMode=%d\n",
                     core->globalCycles, core->interpreter[0].cycles, core->interpreter[1].cycles, (int)core->gbaMode);
+            core->cp15.dumpMpu(f);
+            for (int e = 0; e < 2; e++) {
+                Gpu2D &g = core->gpu2D[e];
+                fprintf(f, "GPU2D%c dispcnt=%08X bg=%04X,%04X,%04X,%04X bld=%04X alpha=%04X win=%04X,%04X bright=%04X\n", 'A' + e,
+                        (unsigned)g.readDispCnt(), g.readBgCnt(0), g.readBgCnt(1), g.readBgCnt(2), g.readBgCnt(3),
+                        g.readBldCnt(), g.readBldAlpha(), g.readWinIn(), g.readWinOut(), g.readMasterBright());
+            }
+            fprintf(f, "EVENTS cp15ctrl=%u tcm=%u wramcnt=%u vram=%u tblClear=%u compiled=%u poolWrap=%u runSwitch=%u evict=%u smcDrop=%u samePc=%u why=%08X\n",
+                    g_evCnt[0], g_evCnt[1], g_evCnt[2], g_evCnt[3], g_evCnt[4], g_evCnt[5], g_evCnt[6], g_evCnt[7], g_evCnt[8], g_evCnt[9], g_evCnt[11], g_evCnt[10]);
             dumpCpuLine(f, "ARM9", core->interpreter[0]);
             dumpCpuLine(f, "ARM7", core->interpreter[1]);
 #if NOODS_G2_SCRIPTED_INPUT
@@ -957,6 +985,61 @@ struct NoodsTestHarness {
                     (unsigned long long)hTotalMem);
             fprintf(f, "FB_HASH top=%016llX bottom=%016llX combined=%016llX\n",
                     (unsigned long long)hFbTop, (unsigned long long)hFbBot, (unsigned long long)hFbAll);
+            fprintf(f, "TEST_SETTINGS fps_limiter=%d frameskip=%d\n", Settings::fpsLimiter, Settings::frameskip);
+            { extern uint32_t g_gbaAffineStats[3]; fprintf(f, "GBA_AFFINE_VERIFY lines=%u mismatches=%u bypassed_lines=%u\n", g_gbaAffineStats[0], g_gbaAffineStats[1], g_gbaAffineStats[2]); }
+            { extern uint32_t g_dsObjStats[8]; fprintf(f, "DS_OBJ four=%u eight=%u affine=%u window=%u passes=%u wrong=%u ext=%u reserved=%u\n", g_dsObjStats[0],g_dsObjStats[1],g_dsObjStats[2],g_dsObjStats[3],g_dsObjStats[4],g_dsObjStats[5],g_dsObjStats[6],g_dsObjStats[7]); }
+            { extern uint32_t g_soloTextStats[6]; fprintf(f, "SOLO_TEXT calls=%u four=%u eight=%u raw=%u wrong_pixels=%u wrong_raw=%u\n",
+                g_soloTextStats[0], g_soloTextStats[1], g_soloTextStats[2], g_soloTextStats[3], g_soloTextStats[4], g_soloTextStats[5]); }
+#if NOODS_GX_NORMAL_VERIFY
+            { extern uint32_t g_gxNormalMathStats[4]; fprintf(f, "GX_NORMAL_MATH eligible=%u fallback=%u checked=%u mismatch=%u\n", g_gxNormalMathStats[0], g_gxNormalMathStats[1], g_gxNormalMathStats[2], g_gxNormalMathStats[3]); }
+#endif
+#if NOODS_DMA_GXFIFO_STATS
+            { extern uint32_t g_dmaGxStats[12]; fprintf(f, "DMA_GX mode7=%u units=%u eligible=%u fast=%u notfixed=%u notport=%u notword=%u checked=%u mapped_calls=%u mapped_words=%u compared=%u mismatches=%u\n", g_dmaGxStats[0], g_dmaGxStats[1], g_dmaGxStats[2], g_dmaGxStats[3], g_dmaGxStats[4], g_dmaGxStats[5], g_dmaGxStats[6], g_dmaGxStats[7], g_dmaGxStats[8], g_dmaGxStats[9], g_dmaGxStats[10], g_dmaGxStats[11]); }
+#endif
+#if NOODS_MPU_PURE_JIT && NOODS_MPU_PATH_STATS
+            { extern uint32_t g_mpuPureJitStats[4]; fprintf(f, "MPU_PURE_JIT marked=%u fast=%u slow=%u blocked=%u\n", g_mpuPureJitStats[0], g_mpuPureJitStats[1], g_mpuPureJitStats[2], g_mpuPureJitStats[3]); }
+#endif
+#if NOODS_MPU_CACHE_VERIFY
+            { extern uint32_t g_mpuPageCacheStats[3]; fprintf(f, "MPU_CACHE accesses=%u samples=%u mismatches=%u\n", g_mpuPageCacheStats[0], g_mpuPageCacheStats[1], g_mpuPageCacheStats[2]); }
+#endif
+#if NOODS_MPU_PATH_STATS
+            { extern uint32_t g_mpuPureFastStats[3]; fprintf(f, "MPU_PURE arm=%u thumb=%u false=%u\n", g_mpuPureFastStats[0], g_mpuPureFastStats[1], g_mpuPureFastStats[2]); }
+#else
+            fprintf(f, "MPU_PATH_STATS enabled=0 counters=disabled\n");
+#endif
+            { extern uint32_t g_gxSpanStats[4]; fprintf(f, "GX_SPANS polygons=%u rows=%u emitted=%u ineligible=%u\n", g_gxSpanStats[0], g_gxSpanStats[1], g_gxSpanStats[2], g_gxSpanStats[3]); }
+            { extern uint32_t g_gxAccuracyRoutes[5]; fprintf(f, "GX_ACCURACY gx_frames=%u sw_fallback_frames=%u effect=%u wire_shadow=%u horizontal=%u\n", g_gxAccuracyRoutes[0], g_gxAccuracyRoutes[1], g_gxAccuracyRoutes[2], g_gxAccuracyRoutes[3], g_gxAccuracyRoutes[4]); }
+            { extern uint32_t g_gxDeltaStats[12]; fprintf(f, "GX_DELTA frames=%u corrected_px=%u critical_polys=%u skipped=%u rows=%u full=%u cached=%u misses=%u budget=%u max_polys=%u max_critical=%u max_rows=%u\n", g_gxDeltaStats[0], g_gxDeltaStats[1], g_gxDeltaStats[2], g_gxDeltaStats[3], g_gxDeltaStats[4], g_gxDeltaStats[5], g_gxDeltaStats[6], g_gxDeltaStats[7], g_gxDeltaStats[8], g_gxDeltaStats[9], g_gxDeltaStats[10], g_gxDeltaStats[11]); }
+#if NOODS_V161_GX_OVERLAY
+            { extern uint32_t g_gxOverlayActive, g_gxOverlayBudgetSkip, g_gxOverlayRunCount, g_gxOverlayStats[8]; fprintf(f, "GX_OVERLAY active=%u budget_skip=%u frames=%u runs=%u pixels=%u cached=%u rebuilt=%u budget=%u max_runs=%u skipped=%u queued_runs=%u\n", g_gxOverlayActive, g_gxOverlayBudgetSkip, g_gxOverlayStats[0], g_gxOverlayStats[1], g_gxOverlayStats[2], g_gxOverlayStats[3], g_gxOverlayStats[4], g_gxOverlayStats[5], g_gxOverlayStats[6], g_gxOverlayStats[7], g_gxOverlayRunCount); }
+#endif
+            { extern uint32_t g_gx3dDbg[8]; fprintf(f, "GX3D shadowPolys=%u shadowPx=%u z0=%06X id0=%02X zraw=%08X emptyFast=%u frames=%u\n", g_gx3dDbg[0], g_gx3dDbg[1], g_gx3dDbg[2], g_gx3dDbg[3], g_gx3dDbg[4], g_gx3dDbg[5], g_gx3dDbg[6]); }
+            { extern uint32_t g_gxIndexedStats[8]; fprintf(f, "GX_INDEXED fmt2=%u fmt3=%u fmt4=%u binds=%u verified=%u wrong=%u fallback=%u texels=%u\n", g_gxIndexedStats[0],g_gxIndexedStats[1],g_gxIndexedStats[2],g_gxIndexedStats[3],g_gxIndexedStats[4],g_gxIndexedStats[5],g_gxIndexedStats[6],g_gxIndexedStats[7]); }
+            { extern uint32_t g_gx2dSelfTest[2]; fprintf(f, "GX_2D_SELFTEST compared=%u wrong=%u\n",g_gx2dSelfTest[0],g_gx2dSelfTest[1]); }
+#if NOODS_GX_2D_BATCH
+            { extern uint32_t g_gx2dBatchStats[2]; fprintf(f,"GX_2D_BATCH runs=%u quads=%u\n",g_gx2dBatchStats[0],g_gx2dBatchStats[1]); }
+#endif
+#ifdef NOODS_V180_PROFILE
+            { extern uint32_t g_gx2dCommands[4]; fprintf(f,"GX_2D_COMMAND tlut_uploads=%u texture_loads=%u backdrop_quads=%u tev_orders=%u\n",g_gx2dCommands[0],g_gx2dCommands[1],g_gx2dCommands[2],g_gx2dCommands[3]); }
+            { extern uint64_t g_gx2dTicks[8]; fprintf(f,"GX_2D_US queue=%llu row_flush=%llu atlas_pack=%llu atlas_flush=%llu submit=%llu wait=%llu unpack=%llu lock=%llu\n",
+                (unsigned long long)PPCTicksToUs(g_gx2dTicks[0]),(unsigned long long)PPCTicksToUs(g_gx2dTicks[1]),
+                (unsigned long long)PPCTicksToUs(g_gx2dTicks[2]),(unsigned long long)PPCTicksToUs(g_gx2dTicks[3]),
+                (unsigned long long)PPCTicksToUs(g_gx2dTicks[4]),(unsigned long long)PPCTicksToUs(g_gx2dTicks[5]),
+                (unsigned long long)PPCTicksToUs(g_gx2dTicks[6]),(unsigned long long)PPCTicksToUs(g_gx2dTicks[7])); }
+#endif
+#if NOODS_GX_2D_BITMAP
+            fprintf(f,"GX_BITMAP lines=%u compared=%u wrong=%u passes=%u\n",g_gxBitmapStats[0],g_gxBitmapStats[1],g_gxBitmapStats[2],g_gxBitmapStats[3]);
+#endif
+            fprintf(f, "GX_2D lines=%u backgrounds=%u passes=%u compared=%u wrong=%u four=%u eight=%u allocfail=%u\n",g_gx2dStats[0],g_gx2dStats[1],g_gx2dStats[2],g_gx2dStats[3],g_gx2dStats[4],g_gx2dStats[5],g_gx2dStats[6],g_gx2dStats[7]);
+#if NOODS_FOG_BLEND_VERIFY
+            { extern uint64_t g_fogBlendVerify[4]; fprintf(f, "FOG_BLEND_VERIFY compared=%llu zero=%llu alpha_only=%llu mismatches=%llu\n", (unsigned long long)g_fogBlendVerify[0], (unsigned long long)g_fogBlendVerify[1], (unsigned long long)g_fogBlendVerify[2], (unsigned long long)g_fogBlendVerify[3]); }
+#endif
+#if NOODS_FOG_VERIFY
+            { extern uint64_t g_fogVerify[2]; fprintf(f, "FOG_VERIFY compared=%llu mismatches=%llu\n", (unsigned long long)g_fogVerify[0], (unsigned long long)g_fogVerify[1]); }
+#endif
+#if NOODS_TEX5_VERIFY
+            { extern uint64_t g_tex5Verify[2]; fprintf(f, "TEX5_VERIFY compared=%llu mismatches=%llu\n", (unsigned long long)g_tex5Verify[0], (unsigned long long)g_tex5Verify[1]); }
+#endif
             fprintf(f, "PERF frame=%u accum_us=%llu avg_frame_us=%llu\n",
                     currentFrame, (unsigned long long)accumFrameUs,
                     (unsigned long long)(accumFrameUs / currentFrame));
@@ -973,13 +1056,20 @@ struct NoodsTestHarness {
                     (unsigned long long)PPCTicksToUs(videoRenderTicks),
                     (unsigned long long)PPCTicksToUs(videoFlushTicks),
                     (unsigned long long)PPCTicksToUs(videoVsyncTicks));
+            Wii_VideoDumpTiming(f);
 #if NOODS_JIT
             ArmPpcJit::dumpStats(f);
+#if NOODS_GBA_ISLAND_STATS
+            { extern void dumpGbaIslandStats(FILE*); dumpGbaIslandStats(f); }
+#if NOODS_GBA_THUMB_ISLAND
+            { extern void dumpGbaThumbIslandStats(FILE*); dumpGbaThumbIslandStats(f); }
+#endif
+#endif
 #else
             fprintf(f, "JIT_STATS enabled=0\n");
 #endif
 #if NOODS_NDS_TASK_PROFILE
-            if (!core->gbaMode) Interpreter::dumpNdsTaskProfile(f);
+            Interpreter::dumpNdsTaskProfile(f);
 #endif
 #ifdef NOODS_V180_PROFILE
             fprintf(f, "PROFILE us 2d=%llu gba2d=%llu 3d=%llu scan1=%llu finish=%llu polygon=%llu edge=%llu clear=%llu calls poly=%llu linear=%llu dda=%llu fallback=%llu 2d=%llu gba=%llu 3d=%llu\n",
@@ -998,6 +1088,11 @@ struct NoodsTestHarness {
                 (unsigned long long)g_v180Profile[12],
                 (unsigned long long)g_v180Profile[13],
                 (unsigned long long)g_v180Profile[14]);
+            fprintf(f, "GBA2D_PROFILE us affine=%llu objects=%llu text=%llu window=%llu objectList=%llu bitmap=%llu blend=%llu\n",
+                (unsigned long long)PPCTicksToUs(g_v180Profile[16]), (unsigned long long)PPCTicksToUs(g_v180Profile[17]),
+                (unsigned long long)PPCTicksToUs(g_v180Profile[18]), (unsigned long long)PPCTicksToUs(g_v180Profile[19]),
+                (unsigned long long)PPCTicksToUs(g_v180Profile[20]), (unsigned long long)PPCTicksToUs(g_v180Profile[21]),
+                (unsigned long long)PPCTicksToUs(g_v180Profile[22]));
 #endif
             fflush(f);
             fclose(f);
@@ -1017,7 +1112,7 @@ struct NoodsTestHarness {
                 fclose(mf);
             }
             if (FILE* ff = fopen("sd:/fb_dump.bin", "wb")) {
-                fwrite(tempBuffer, sizeof(uint32_t), scrPixels * 2, ff);
+                fwrite(g_lastFrame, sizeof(uint32_t), scrPixels * 2, ff);
                 fflush(ff);
                 fclose(ff);
             }
@@ -1085,6 +1180,11 @@ static void StopAndDeleteCore() {
         ndsCore->cartridgeGba.writeSave();
         delete ndsCore;
         ndsCore = nullptr;
+        // These process-global caches otherwise retain megabytes between ROMs.
+        // All renderer work has joined and GX finish operations have fenced.
+        gx2dReleaseCaches();
+        extern void gx3dReleaseCaches();
+        gx3dReleaseCaches();
     }
 }
 
@@ -1128,22 +1228,44 @@ static sptr EmulatorThreadMain(void* /*arg*/) {
             const char* errMsg = nullptr;
             try {
                 ndsCore = new Core(ndsRom, gbaRom);
+#if NOODS_TEST_MOVE_TEMP
+                if (!tempBuffer) {
+                    const size_t n = NDS_SCREEN_WIDTH * NDS_SCREEN_HEIGHT * 8u * sizeof(uint32_t);
+                    tempBuffer = (uint32_t*)Noods_MEM2_Alloc(n);
+                    SYS_Report("[NOODS] TEST_TEMP_ALLOC ptr=%p bytes=%u\n", tempBuffer, (unsigned)n);
+                    if (!tempBuffer) { delete ndsCore; ndsCore = nullptr; throw std::bad_alloc(); }
+                    memset(tempBuffer, 0, n);
+                    g_lastFrame = tempBuffer;
+                }
+#endif
+#if NOODS_TEST_MEM_DIAG
+                SYS_Report("[NOODS] TEST_CORE_READY\n");
+#endif
                 PPCIrqState st = PPCIrqLockByMsr();
                 romLoaded  = true;
                 romLoading = false;
                 PPCIrqUnlockByMsr(st);
             }
             catch (CoreError ce) {
+#if NOODS_TEST_MEM_DIAG
+                SYS_Report("[NOODS] TEST_CORE_ERROR code=%d\n", (int)ce);
+#endif
                 ndsCore = nullptr;
                 errMsg = (ce == ERROR_BIOS) ? "Missing BIOS file"
                        : (ce == ERROR_FIRM) ? "Missing firmware"
                                             : "Failed reading ROM";
             }
             catch (std::bad_alloc&) {
+#if NOODS_TEST_MEM_DIAG
+                SYS_Report("[NOODS] TEST_CORE_BAD_ALLOC\n");
+#endif
                 ndsCore = nullptr;
                 errMsg = "Out of memory loading ROM";
             }
             catch (...) {
+#if NOODS_TEST_MEM_DIAG
+                SYS_Report("[NOODS] TEST_CORE_UNKNOWN_EXCEPTION\n");
+#endif
                 ndsCore = nullptr;
                 errMsg = "Failed launching ROM";
             }
@@ -1227,14 +1349,48 @@ static sptr EmulatorThreadMain(void* /*arg*/) {
             ndsCore->runCore();
             uint64_t t1 = PPCGetTickCount();
 
-            if (ndsCore->gpu.getFrame(tempBuffer, ndsCore->gbaMode)) {
+            // v1.110: a plain DS frame is produced straight into a spare buffer that is then
+            // swapped with the back buffer, instead of being copied with interrupts off.
+            const bool directFrame = emuBuffer && !ndsCore->gbaMode && !Settings::highRes3D && Settings::screenFilter != 1;
+            // v1.112: in the plain case the frame is written straight into the two textures
+            // the display draws (RGB565, GX tile order): top screen at the start of the
+            // buffer, bottom screen at the usual offset.
+            const bool texFrame = directFrame && !Settings::screenGhost && (((uintptr_t)emuBuffer) & 31) == 0;
+            uint32_t *const frameTarget = directFrame ? emuBuffer : tempBuffer;
+            bool gotFrame;
+            if (texFrame) {
+                uint8_t *const tTop = (uint8_t*)emuBuffer;
+                uint8_t *const tBot = (uint8_t*)(emuBuffer + NDS_SCREEN_WIDTH * NDS_SCREEN_HEIGHT);
+                gotFrame = ndsCore->gpu.getFrameTex565(tTop, tBot);
+                if (gotFrame) {
+                    // one bit that changes every frame, so a texture cache keyed on content
+                    // (Dolphin) never mistakes a new frame for the old one
+                    static uint8_t gen = 0;
+                    gen++;
+                    tTop[1] = (tTop[1] & ~1) | (gen & 1);
+                    tBot[1] = (tBot[1] & ~1) | (gen & 1);
+                    DCFlushRange(tTop, NDS_SCREEN_WIDTH * NDS_SCREEN_HEIGHT * 2);
+                    DCFlushRange(tBot, NDS_SCREEN_WIDTH * NDS_SCREEN_HEIGHT * 2);
+                }
+            } else {
+                gotFrame = ndsCore->gpu.getFrame(frameTarget, ndsCore->gbaMode);
+            }
+            if (gotFrame) {
+                g_lastFrame = frameTarget;
+                g_lastFrameIsTex = texFrame;
                 PPCIrqState st = PPCIrqLockByMsr();
                 framesProduced++;
                 if (newFrameReady) framesOverwritten++;
+                backIs565 = texFrame;
+                if (directFrame) {
+                    emuBuffer  = backBuffer;
+                    backBuffer = frameTarget;
+                } else {
                 // GBA output is 240x160, not two 256x192 DS screens. Keep the
                 // interrupt-disabled copy limited to the pixels actually displayed.
                 size_t copyPixels = ndsCore->gbaMode ? (size_t)GBA_SCREEN_WIDTH * GBA_SCREEN_HEIGHT : pixelCount;
                 memcpy(backBuffer, tempBuffer, copyPixels * sizeof(uint32_t));
+                }
                 newFrameReady = true;
                 PPCIrqUnlockByMsr(st);
             }
@@ -1259,6 +1415,9 @@ static void InitializeNDS() {
 
     backBuffer  = (uint32_t*)Noods_MEM2_Alloc(bufSize);
     if (!backBuffer) backBuffer = (uint32_t*)malloc(bufSize);
+    emuBuffer   = (uint32_t*)Noods_MEM2_Alloc(bufSize);
+    if (!emuBuffer) emuBuffer = (uint32_t*)malloc(bufSize);
+    if (emuBuffer) memset(emuBuffer, 0, bufSize);
 
     if (!frontBuffer || !backBuffer) {
         while (true) KThreadSleepMs(16);
@@ -2145,6 +2304,7 @@ int main(int /*argc*/, char** /*argv*/) {
                     uint32_t* tmp = frontBuffer;
                     frontBuffer   = backBuffer;
                     backBuffer    = tmp;
+                    const bool tf = frontIs565; frontIs565 = backIs565; backIs565 = tf;
                     newFrameReady = false;
                     perf.renderFrameCount++;
                 }
@@ -2241,9 +2401,12 @@ int main(int /*argc*/, char** /*argv*/) {
         firstFrame = false;
 
         uint64_t videoT0 = PPCGetTickCount();
+        Wii_GxLock(); // v1.108: the emulator thread also draws with GX (hardware 3D)
+        Wii_VideoSetPreTiled(renderTop == frontBuffer && frontIs565 && !isGba);
         Wii_VideoRender(renderTop, renderBottom, isGba, haveFrame || modeChanged || !activeRom);
         uint64_t videoT1 = PPCGetTickCount();
         Wii_VideoFlushAsync();
+        Wii_GxUnlock();
         uint64_t videoT2 = PPCGetTickCount();
         VIDEO_WaitVSync();
         uint64_t videoT3 = PPCGetTickCount();
