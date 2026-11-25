@@ -1,7 +1,27 @@
+/*
+    Copyright (C) 2019-2025 Hydr8gon
+    Copyright (C) 2026 radicalten
+
+    This file is part of NooDS-Wii.
+
+    NooDS-Wii is free software: you can redistribute it and/or modify it
+    under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+
+    NooDS-Wii is distributed in the hope that it will be useful, but
+    WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+    General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with NooDS-Wii. If not, see <https://www.gnu.org/licenses/>.
+
+    Optional conservative NDS text-layer compositor. 
+*/
+
 #include <cstdint>
 #include "gpu_2d.h"
-// Optional conservative NDS text-layer compositor. GPL-3.0-or-later.
-
 
 #ifdef NOODS_V180_PROFILE
 uint64_t g_gx2dTicks[8];
