@@ -1,12 +1,3 @@
-#ifndef NOODS_GBA_AFFINE_WINDOW
-#define NOODS_GBA_AFFINE_WINDOW 0
-#endif
-#ifndef NOODS_GBA_AFFINE_VERIFY
-#define NOODS_GBA_AFFINE_VERIFY 0
-#endif
-#ifndef NOODS_GBA_OBJ_MASK
-#define NOODS_GBA_OBJ_MASK 0
-#endif
 /*
     Copyright (C) 2019-2025 Hydr8gon
     Copyright (C) 2026 radicalten
@@ -26,6 +17,16 @@
     You should have received a copy of the GNU General Public License
     along with NooDS-Wii. If not, see <https://www.gnu.org/licenses/>.
 */
+
+#ifndef NOODS_GBA_AFFINE_WINDOW
+#define NOODS_GBA_AFFINE_WINDOW 0
+#endif
+#ifndef NOODS_GBA_AFFINE_VERIFY
+#define NOODS_GBA_AFFINE_VERIFY 0
+#endif
+#ifndef NOODS_GBA_OBJ_MASK
+#define NOODS_GBA_OBJ_MASK 0
+#endif
 
 #ifndef NOODS_OBJ_WORD_READS
 #define NOODS_OBJ_WORD_READS 0
