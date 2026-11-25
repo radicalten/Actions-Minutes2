@@ -1,4 +1,5 @@
 /*
+    Copyright (C) 2019-2025 Hydr8gon
     Copyright (C) 2026 radicalten
 
     This file is part of NooDS-Wii.
@@ -16,6 +17,7 @@
     You should have received a copy of the GNU General Public License
     along with NooDS-Wii. If not, see <https://www.gnu.org/licenses/>.
 */
+
 
 #include "core.h"
 #ifndef NOODS_DMA_GXFIFO_VERIFY
